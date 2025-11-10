@@ -287,8 +287,7 @@ For linear probe on CIFAR-10, start with: `--epochs 30`, `--base-lr 0.2`, `--wd 
   @software{Kabra_Adaptive_VICReg_TF_2025,
     author = {Nishant Kabra},
     title  = {Adaptive VICReg in TensorFlow and Keras},
-    year   = {2025},
-    url    = {https://arxiv.org/pdf/2105.04906}
+    year   = {2025}
   }
   ```
 
