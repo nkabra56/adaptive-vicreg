@@ -1,315 +1,299 @@
-# Adaptive VICReg (TensorFlow and Keras) CS584 Final Project
+# Adaptive VICReg (TensorFlow/Keras)
 
 **Author:** Nishant Kabra  
-**Date:** 11/8/2025
+**Date:** 11/10/2025
 
-This repository provides a clear TensorFlow and Keras implementation of VICReg (Variance Invariance Covariance Regularization) with two practical additions that are useful in classroom and research settings.
+This repository contains a practical TensorFlow/Keras implementation of **VICReg** — Variance-Invariance-Covariance Regularization — with two enhancements designed for stability and performance on modest hardware:
 
-1. **Adaptive Variance Targeting (AVT)** replaces the fixed variance floor gamma with a data driven target that comes from an exponential moving average of per dimension standard deviations. The median across dimensions is used for robustness.
-2. **Scale Invariant Covariance (SICov)** normalizes the covariance matrix by its trace and penalizes the distance to the scaled identity \((1/d)I\) with squared Frobenius norm. This makes the redundancy term less sensitive to global feature scale.
+1. **Adaptive Variance Targeting (AVT):** replaces the fixed variance floor \(\gamma\) with a data-driven target estimated from an exponential moving average of per-dimension standard deviations (median used for robustness).
+2. **Scale-Invariant Covariance (SICov):** normalizes covariance by its trace and penalizes the Frobenius distance to \((1/d)I\), making the redundancy term less sensitive to global feature scale.
 
-The implementation also includes cosine schedules that smoothly increase the alignment weight lambda and the decorrelation weight nu at the start of training. The goal is stability and simpler tuning.
+The codebase includes **self-supervised pretraining**, **linear probing**, and **k-NN evaluation**, along with quality-of-life features (mixed precision, BN adaptation, robust checkpoint loading, and CPU-friendly defaults).
 
-The code is written with detailed comments. Each function explains inputs, outputs, and the reason for the design. This document shows what each part does and how to run everything on CIFAR, STL10, or a custom folder dataset.
+> **Reference (original method):**  
+> Adrien Bardes, Jean Ponce, Yann LeCun. **VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning.** arXiv:2105.04906. PDF: https://arxiv.org/pdf/2105.04906
 
 ---
 
 ## Table of Contents
 
-1. [Background](#background)  
-2. [Repository Structure](#repository-structure)  
-3. [Installation](#installation)  
-   - [Windows and WSL](#windows-and-wsl)  
-   - [macOS and Linux](#macos-and-linux)  
+1. [What is VICReg?](#what-is-vicreg)  
+2. [What's in this repo](#whats-in-this-repo)  
+3. [Environment Setup](#environment-setup)  
 4. [Datasets](#datasets)  
-5. [Quick Start](#quick-start)  
-6. [How the Code Works](#how-the-code-works)  
-   - [Data and Augmentation](#data-and-augmentation)  
-   - [Model and Projector](#model-and-projector)  
+5. [Self-Supervised Pretraining](#self-supervised-pretraining)  
+6. [Evaluation](#evaluation)  
+   - [Linear Probe](#linear-probe)  
+   - [k-NN Evaluation](#k-nn-evaluation)  
+7. [Key Implementation Details](#key-implementation-details)  
+   - [Data & Augmentations](#data--augmentations)  
+   - [Backbone & Projector](#backbone--projector)  
    - [Losses](#losses)  
    - [Schedules](#schedules)  
-   - [Training Loop](#training-loop)  
-   - [Evaluation](#evaluation)  
-   - [Diagnostics and Plots](#diagnostics-and-plots)  
-7. [Configuration and Hyperparameters](#configuration-and-hyperparameters)  
-8. [Reproducibility and Performance Tips](#reproducibility-and-performance-tips)  
-9. [Extending the Project](#extending-the-project)  
-10. [Troubleshooting](#troubleshooting)  
-11. [FAQ](#faq)  
-12. [Citation and License](#citation-and-license)  
-13. [Acknowledgments](#acknowledgments)
+   - [BN Adaptation](#bn-adaptation)  
+   - [Mixed Precision on CPU/GPU](#mixed-precision-on-cpugpu)  
+8. [Recommended Hyperparameters](#recommended-hyperparameters)  
+9. [Troubleshooting & Gotchas](#troubleshooting--gotchas)  
+10. [Reproducibility Tips](#reproducibility-tips)  
+11. [Citations](#citations)  
+12. [License](#license)  
 
 ---
 
-## Background
+## What is VICReg?
 
-VICReg encourages strong representations using three terms on paired augmented views \(z_1, z_2\).
+VICReg is a self-supervised learning objective defined over two differently augmented “views” of the same image. It encourages:
 
-- **Alignment**: \( \mathcal{L}_{\text{align}} = \frac{1}{B} \sum_i \lVert z_{1,i} - z_{2,i} \rVert_2^2 \).  
-- **Variance floor**: a hinge that keeps each feature dimension standard deviation above \( \gamma \).  
-- **Covariance decorrelation**: a penalty on off diagonal covariance entries to reduce redundancy.
+- **Invariance (Alignment):** matched features for the two views  
+- **Variance:** per-dimension standard deviation above a floor \(\gamma\) to avoid collapse  
+- **Covariance Decorrelation:** penalize off-diagonal covariance entries to reduce redundancy
 
-The project keeps the general setup and adds two simple modifications. AVT adapts the variance target during training. SICov penalizes a scale normalized covariance so the loss is not driven by overall feature amplitude.
+Formally for batch features \(z_1, z_2 \in \mathbb{R}^{B\times d}\):  
+- Alignment: \( \mathcal{L}_{\text{align}} = \frac{1}{B} \sum_i \lVert z_{1,i} - z_{2,i} \rVert_2^2 \)  
+- Variance hinge: encourage \(\text{std}(z_{\cdot,j}) \ge \gamma\) per dimension \(j\)  
+- Covariance: sum of off-diagonal squared entries of the empirical covariance matrix
+
+This repo keeps the spirit of VICReg and adds **AVT** and **SICov** to reduce manual tuning and make the objective less sensitive to global feature scaling.
 
 ---
 
-## Repository Structure
+## What’s in this repo
 
 ```
-ADAPTIVE-VICREG-TF/
-├─ configs/
-│  └─ default.yaml
-├─ src/
-│  ├─ __init__.py
-│  └─ vicreg_tf/
-│     ├─ __init__.py
-│     ├─ augment.py
-│     ├─ data.py
-│     ├─ losses.py
-│     ├─ model.py
-│     ├─ schedules.py
-│     └─ utils.py
-├─ train_vicreg.py
-├─ linear_probe.py
-├─ eval_knn.py
-├─ plots.py
+adaptive-vicreg-tf/
+├─ scripts/
+│  ├─ train_vicreg.py        # self-supervised pretraining (VICReg + AVT + SICov)
+│  ├─ eval_linear.py         # linear probe on frozen encoder
+│  └─ knn_eval.py            # k-NN accuracy using cosine similarity
+├─ src/                      # (if using the packaged API, optional)
+│  └─ vicreg_tf/             # augmentation, losses, schedules, model helpers
+├─ checkpoints_tf/           # saved weights (e.g., vicreg_tf.weights.h5) or SavedModel dirs
+├─ artifacts/                # exported encoder SavedModel for evaluation scripts
+├─ plots.py                  # optional diagnostics/visualization utilities
 ├─ requirements.txt
-├─ README.md
-├─ LICENSE
-├─ CITATION.cff
-└─ .gitignore
+└─ README.md
 ```
 
-Generated directories appear at runtime. Examples include `artifacts`, `checkpoints_tf`, `logs`, and `plots`.
+> You may have only the **scripts/** and top-level files if you’re using the “single-script” workflow. The evaluation scripts handle both **Keras weights (.h5)** and **SavedModel** directories.
 
 ---
 
-## Installation
+## Environment Setup
 
-### Windows and WSL
+> **Python:** 3.9–3.12 are commonly used.  
+> **TensorFlow:** CPU-only works; GPU requires a matching **tensorflow** wheel and **CUDA + cuDNN**.
 
-WSL2 with Ubuntu is recommended for TensorFlow GPU. CPU only also works.
+Create a virtual environment and install requirements:
 
 ```bash
 python -m venv .venv
-# Linux or WSL bash
+# Linux/macOS
 source .venv/bin/activate
-# PowerShell
+# Windows PowerShell
 # .venv\Scripts\Activate.ps1
 
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-If you want GPU on native Windows, install a TensorFlow build that matches your CUDA and cuDNN versions. If you see the message that TensorFlow was not built with CUDA for your GPU, training will run on CPU.
+**CPU performance tips (optional):**  
+- You can disable oneDNN fused ops if you see numerical diffs:
+  ```bash
+  export TF_ENABLE_ONEDNN_OPTS=0
+  ```
+- Restrict threads on noisy laptops:
+  ```bash
+  export TF_NUM_INTRAOP_THREADS=4
+  export TF_NUM_INTEROP_THREADS=4
+  ```
 
-### macOS and Linux
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-For Linux GPU, install CUDA and cuDNN that match your TensorFlow version before installing the wheel.
+**GPU setup (optional):**  
+Install CUDA + cuDNN that match your TensorFlow wheel. If TF cannot find CUDA, the scripts fall back to CPU and print a clear message. Mixed precision will use **float16** on GPUs and **bfloat16** on CPUs that support it.
 
 ---
 
 ## Datasets
 
-The code supports four sources.
+Supported out of the box:
 
-1. **CIFAR 10 and CIFAR 100** using `tf.keras.datasets`. No extra setup is needed.  
-2. **STL10** using `tensorflow_datasets`. The first run downloads to the TFDS cache. You can set `--tfds-data-dir` to control the cache path.  
-3. **Folder dataset** arranged with one subfolder per class:
-   ```
-   data_root/
+1. **CIFAR-10 / CIFAR-100** via `tf.keras.datasets`  
+2. **STL-10** via `tensorflow_datasets` (set `--tfds-data-dir` to a local cache if needed)  
+3. **Folder dataset** structured as:
+   ```text
+   /path/to/data_root/
      class_1/*.jpg
      class_2/*.jpg
      ...
    ```
-   Self supervised pretraining ignores the labels. Supervised evaluation uses them.
+   Self-supervised pretraining ignores labels; supervised probe uses them.
 
-Image size suggestions: CIFAR uses 32. STL10 uses 96. Folder datasets often use 224.
-
----
-
-## Quick Start
-
-### Self supervised pretraining
-
-CIFAR 10:
-
-```bash
-python train_vicreg.py --dataset cifar10 --image-size 32 \
-  --epochs 100 --batch-size 512 --adaptive --mixed
-```
-
-STL10 unlabeled:
-
-```bash
-python train_vicreg.py --dataset stl10 --image-size 96 \
-  --stl10-split unlabeled --epochs 100 --batch-size 256 \
-  --adaptive --mixed --tfds-data-dir ~/.cache/tfds
-```
-
-Folder dataset:
-
-```bash
-python train_vicreg.py --dataset folder --data-root /path/to/data \
-  --image-size 224 --epochs 100 --batch-size 256 --adaptive --mixed
-```
-
-Artifacts created:
-
-- `checkpoints_tf/vicreg_tf` best weights by lowest training loss  
-- `artifacts/encoder_savedmodel` exported encoder for evaluation  
-- `logs/train.csv` per epoch metrics
-
-### Linear probe
-
-```bash
-python linear_probe.py --dataset cifar10 --image-size 32 \
-  --epochs 30 --encoder-path artifacts/encoder_savedmodel
-```
-
-### k NN evaluation
-
-```bash
-python eval_knn.py --dataset cifar10 --image-size 32 --k 10 \
-  --encoder-path artifacts/encoder_savedmodel
-```
-
-### Diagnostics and plots
-
-```bash
-python plots.py --dataset cifar10 --image-size 32 --probe pool --split test \
-  --encoder-path artifacts/encoder_savedmodel --log-csv logs/train.csv
-```
-
-Outputs appear in `plots`. Files include `std_hist.png`, `gamma_curve.png`, `cov_heatmap.png`, and `cov_delta_heatmap.png`.
+**Image sizes**: CIFAR uses **32**, STL-10 uses **96**, generic folders often use **224**. Choose smaller sizes on CPU to avoid OOM.
 
 ---
 
-## How the Code Works
+## Self-Supervised Pretraining
 
-### Data and Augmentation
+Example (CIFAR-10, CPU friendly, mixed bfloat16 on capable CPUs):
 
-`src/vicreg_tf/augment.py` builds two independent augmented views for each input image. The pipeline applies resize, random resized crop, horizontal flip, color jitter, optional grayscale, optional average pool blur, and standardization with ImageNet mean and std. The function `make_two_views` returns a pair `(view1, view2)` of standardized float tensors.
+```bash
+python scripts/train_vicreg.py \
+  --dataset cifar10 --image-size 32 \
+  --epochs 200 --batch-size 512 \
+  --adaptive --use-schedules \
+  --proj-out 8192 --proj-layers 3 \
+  --mixed-bf16
+```
 
-`src/vicreg_tf/data.py` creates data pipelines. CIFAR uses `tf.keras.datasets`. STL10 uses TFDS. The helper `TwoViewsDataset` converts unlabelled streams into `((view1, view2), 0)` which fits Keras input expectations for training. Supervised builders return `(image, label)` for linear probe and k NN.
+Key outputs:
+- **Checkpoints:** `checkpoints_tf/` (Keras weights `.weights.h5` and/or SavedModel directory)  
+- **Exported encoder:** `artifacts/encoder_savedmodel/` (used by eval scripts)
 
-### Model and Projector
+> If you see out-of-memory on CPU, reduce `--batch-size` or `--image-size`, or try `--backbone mobilenetv2`.
 
-`src/vicreg_tf/model.py` builds a backbone with `include_top=False` and adds a global average pooling layer named `feat_pool`. A projector MLP follows. The projector has repeated blocks `[Dense no bias -> BatchNorm -> ReLU]` and ends with a linear output layer of size `proj_out`.
+---
+
+## Evaluation
+
+### Linear Probe
+
+Trains a single Dense layer on frozen features. You can tap features **before** or **after** the projector.
+
+**Using a SavedModel encoder directory (recommended):**
+```bash
+python scripts/eval_linear.py \
+  --dataset cifar10 --image-size 32 \
+  --epochs 30 --batch-size 256 \
+  --encoder-path artifacts/encoder_savedmodel \
+  --feat-layer pool \
+  --bn-adapt-steps 200 \
+  --mixed-bf16
+```
+
+**Using a Keras weights file (.h5) with an internally built backbone:**
+```bash
+python scripts/eval_linear.py \
+  --dataset cifar10 --image-size 32 \
+  --epochs 30 --batch-size 256 \
+  --ckpt checkpoints_tf/vicreg_tf.weights.h5 \
+  --feat-layer pool \
+  --bn-adapt-steps 200 \
+  --mixed-bf16
+```
+
+**Important flags:**
+- `--feat-layer {pool, proj}` chooses pooled backbone features or projector outputs
+- `--bn-adapt-steps N` runs a short forward-only pass to adapt BN stats to the evaluation distribution
+- `--base-lr` and `--wd` control probe optimization (default values are reasonable)
+
+### k-NN Evaluation
+
+Extracts features for train and test, L2-normalizes them, and does a cosine-similarity k-NN vote.
+
+**SavedModel path:**
+```bash
+python scripts/knn_eval.py \
+  --dataset cifar10 --image-size 32 \
+  --k 200 --batch-size 512 \
+  --encoder-path artifacts/encoder_savedmodel \
+  --feat-layer pool \
+  --mixed-bf16
+```
+
+**Keras weights path:**
+```bash
+python scripts/knn_eval.py \
+  --dataset cifar10 --image-size 32 \
+  --k 200 --batch-size 512 \
+  --ckpt checkpoints_tf/vicreg_tf.weights.h5 \
+  --feat-layer pool \
+  --mixed-bf16
+```
+
+**Notes:**
+- On CPU, large `--k` can be slow; try `--k 20..200` and adjust `--batch-size`.
+- If you use `--image-size 224` on CPU with ResNet50, you will likely need `--batch-size 32` or smaller.
+
+---
+
+## Key Implementation Details
+
+### Data & Augmentations
+- Two independent augmented views per image: random resized crop, horizontal flip, color jitter, optional grayscale/blur, and standardization.
+- CIFAR / STL10 builders return tuples suitable for Keras (`((view1, view2), 0)` for SSL; `(image, label)` for supervised).
+
+### Backbone & Projector
+- Default backbone is **ResNet50V2** with `include_top=False` and a global average pooling layer (named e.g. `feat_pool`).
+- The projector is an MLP: `[Dense (no bias) → BatchNorm → ReLU] × (L-1)` then a linear output layer of dimension `proj_out`.
 
 ### Losses
-
-`src/vicreg_tf/losses.py` has two layers.
-
-- `VICRegLoss` computes alignment, a variance hinge with a fixed `gamma`, and an off diagonal covariance penalty.  
-- `AdaptiveVICRegLoss` computes per batch standard deviation for each dimension and updates an EMA container. The median of the EMA vector is clipped to `[gamma_min, gamma_max]` to produce `gamma_t`. The covariance is normalized by its trace and the loss penalizes the distance to `(1/d)I` under Frobenius norm.
-
-Both return `(total_loss, logs)` so training can report `align`, `var`, `cov`, and `gamma_t` when available.
+- **VICRegLoss:** alignment + variance hinge with fixed \(\gamma\) + covariance off-diagonal penalty.  
+- **AdaptiveVICRegLoss:** EMA-based \(\gamma_t\) (median of EMA stds, clipped to \([\gamma_{\min}, \gamma_{\max}]\)); **trace-normalized covariance** with Frobenius penalty to \((1/d)I\).  
+- Loss returns total plus logs: `align`, `var`, `cov`, and `gamma_t` when adaptive is enabled.
 
 ### Schedules
+- Cosine ramp for \(\lambda\) and \(\nu\) early in training; improves stability and removes brittle warmup tuning.
 
-`src/vicreg_tf/schedules.py` provides a cosine scaler from 0 to 1 across the full training budget. The training wrapper multiplies `lambda` and `nu` by this factor when schedules are enabled.
+### BN Adaptation
+- After loading a pretrained encoder, a short forward pass on unlabeled data updates BN running stats without touching weights. Improves linear/k-NN performance when eval distribution differs from pretraining.
 
-### Training Loop
-
-`src/vicreg_tf/model.py` defines `VICRegModel` which overrides `train_step`. The method encodes both views, computes the loss, and applies gradients. It also updates moving average metrics that are visible in logs.
-
-`train_vicreg.py` prepares the dataset and model, compiles with AdamW, and sets callbacks. The encoder SavedModel is exported at the end of training.
-
-### Evaluation
-
-`linear_probe.py` freezes the encoder and trains a single Dense head on top of pooled features or projector outputs.  
-`eval_knn.py` extracts features for train and test, normalizes them to unit length, and computes cosine similarities followed by a majority vote among top k neighbors.
-
-### Diagnostics and Plots
-
-`plots.py` shows three aspects:
-1. Distribution of per dimension standard deviations as a histogram.  
-2. The time series of `gamma_t` if present in `logs/train.csv`.  
-3. A heatmap of the trace normalized covariance and a second heatmap of the deviation from `(1/d)I`.
+### Mixed Precision on CPU/GPU
+- `--mixed-bf16` turns on mixed precision: **bfloat16** on CPUs that support it and **float16** on GPUs (via TF’s policy). This often speeds up training/inference with minimal accuracy impact. Disable if you see numerical issues.
 
 ---
 
-## Configuration and Hyperparameters
+## Recommended Hyperparameters
 
-Use CLI flags or create a small YAML under `configs`. Important flags are listed below. See `train_vicreg.py --help` for the full set.
+- **CIFAR-10 (img=32, ResNet50V2):** `--epochs 200`, `--batch-size 512` (reduce on CPU), `--proj-out 8192`, `--proj-layers 3`, `--lambda0 25`, `--mu0 25`, `--nu0 1`, `--adaptive`, `--use-schedules`.  
+- **STL-10 (img=96):** `--batch-size 256`, similar weights; increase epochs for stronger features.  
+- **Folder dataset (img=224):** consider `--backbone resnet50v2 --batch-size 128` on GPU, or `--backbone mobilenetv2 --batch-size 32` on CPU.
 
-- Data: `--dataset`, `--data-root`, `--image-size`, `--batch-size`, `--stl10-split`, `--tfds-data-dir`  
-- Training: `--epochs`, `--lr`, `--weight-decay`, `--mixed`, `--seed`  
-- Encoder and projector: `--backbone`, `--proj-hidden`, `--proj-out`, `--proj-layers`  
-- Loss weights: `--lambda0`, `--mu0`, `--nu0`  
-- Adaptive settings: `--adaptive` or `--no-adaptive`, `--ema-beta`, `--gamma-min`, `--gamma-max`, `--use-schedules` or `--no-schedules`
-
-Suggestions: CIFAR uses image size 32 and batch size 512 if memory allows. STL10 uses image size 96. Folder datasets often use image size 224 and batch size 256.
+For linear probe on CIFAR-10, start with: `--epochs 30`, `--base-lr 0.2`, `--wd 1e-4`, `--bn-adapt-steps 200`.
 
 ---
 
-## Reproducibility and Performance Tips
+## Troubleshooting & Gotchas
 
-- Set seeds with `set_seed`. Exact determinism is not guaranteed unless you force deterministic kernels.  
-- Mixed precision improves throughput on recent NVIDIA GPUs. Use `--mixed`.  
-- Reduce batch size or image size if you hit out of memory.  
-- ResNet50V2 is a good default backbone. MobileNetV2 speeds up experiments.  
-- Larger batches help covariance estimation during the early epochs.
+- **“Could not find CUDA drivers / GPU will not be used.”**  
+  Your TensorFlow install is CPU-only or CUDA/cuDNN do not match. The scripts continue on CPU.
 
----
+- **KerasTensor cannot be used as input to a TF function.**  
+  This happens when mixing raw `tf.*` ops with symbolic KerasTensors. The provided scripts wrap such ops in Keras layers; if you modify them, use `keras.layers.Lambda` or custom layers.
 
-## Extending the Project
+- **OOM on CPU (especially img=224 + ResNet50):**  
+  Lower `--batch-size` and/or `--image-size`; try `--mixed-bf16`; or switch to `--backbone mobilenetv2`.
 
-- To add a new backbone, modify `_build_backbone` and include a `feat_pool` global pooling layer.  
-- To add a new dataset, follow the pattern used for CIFAR or STL10. Provide both self supervised and supervised builders.  
-- To change projector depth, adjust `--proj-layers`.  
-- To try alternative schedules or optimizers, create a small helper in `schedules.py` or swap the optimizer in `train_vicreg.py`.
+- **`.h5` vs SavedModel loading confusion:**  
+  The eval scripts accept **either** `--encoder-path` (SavedModel dir) **or** `--ckpt` (Keras `.weights.h5`). They auto-handle supported formats and print a clear error if the path is wrong.
 
 ---
 
-## Troubleshooting
+## Reproducibility Tips
 
-- If TensorFlow reports that CUDA kernels are not available, your install is CPU only or your CUDA and cuDNN versions do not match the installed wheel.  
-- If you see out of memory errors, lower `--batch-size` or `--image-size` and consider MobileNetV2.  
-- If k NN accuracy is near random, confirm that pretraining completed and that the probe taps the correct layer.  
-- For slow STL10 downloads, set `--tfds-data-dir` to a local path.
-
----
-
-## FAQ
-
-**Why standardize with ImageNet mean and std on CIFAR**  
-This is a common choice for backbones that target ImageNet like behavior. It helps stabilize optimization even when training from scratch.
-
-**Why choose the median of the EMA vector for `gamma_t`**  
-The median is robust to a few dimensions with unusually high or low variance. It tends to produce a steady target across iterations.
-
-**Can the encoder be fine tuned end to end**  
-Yes. Load the SavedModel, set `trainable=True`, add a small head, and train with a smaller learning rate.
+- Set seeds (`--seed`) but note full determinism is hard due to multi-threading and non-deterministic kernels.  
+- Log everything (CLI flags, commit hash, dataset checksums).  
+- Use the same augmentations and image sizes for fair comparisons.  
+- Run BN adaptation before probing/evaluating, especially if image size changed between pretraining and eval.
 
 ---
 
-## Citation and License
+## Citations
 
-If this project helps your work, please cite:
+- **VICReg original paper:**  
+  Adrien Bardes, Jean Ponce, Yann LeCun. *VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning.* arXiv:2105.04906. https://arxiv.org/pdf/2105.04906
 
-```
-@software{Kabra_Adaptive_VICReg_TF_2025,
-  author = {Nishant Kabra},
-  title  = {Adaptive VICReg in TensorFlow and Keras},
-  year   = {2025}
-}
-```
+- **This repository:**
 
-The repository template uses Apache 2.0. You can change the license to fit your needs. Keep a `CITATION.cff` file in the root to expose preferred citation details.
+  ```bibtex
+  @software{Kabra_Adaptive_VICReg_TF_2025,
+    author = {Nishant Kabra},
+    title  = {Adaptive VICReg in TensorFlow and Keras},
+    year   = {2025},
+    url    = {https://arxiv.org/pdf/2105.04906}
+  }
+  ```
 
 ---
 
-## Acknowledgments
+## License
 
-- VICReg paper by Bardes, Ponce, and LeCun.  
-- TensorFlow and Keras documentation and examples that inspired good practices.  
-- Classmates and teaching staff for feedback on clarity and ease of use.
+Unless stated otherwise in `LICENSE`, this project is released for academic use. Please cite both the original VICReg paper and this repository if it helps your work.
