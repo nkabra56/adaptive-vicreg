@@ -1,349 +1,432 @@
 """
-kNN evaluation for a self-supervised encoder on CIFAR.
--------------------------------------------------------------------------------
-This script builds a **frozen** feature extractor from a Keras Applications
-backbone (e.g., ResNet50V2), optionally loads a checkpoint with `skip_mismatch=True`,
-extracts L2-normalized features for the train/test splits, then evaluates
-with a non-parametric k-Nearest Neighbors classifier (cosine similarity)
-popularized by Wu et al. (2018), SimCLR, and many follow-ups.
+kNN evaluation for VICReg / Adaptive-VICReg checkpoints (cosine-sim kNN).
+
+Overview
+--------
+Compute frozen encoder features for all train and test images, then classify
+test features with a temperature-weighted kNN using cosine similarities.
+This is a common non-parametric probe for SSL encoders.
+
+Why a non-parametric probe?
+---------------------------
+It avoids training any classifier, so you can quickly test the quality of your
+representations. If kNN accuracy is decent, the features likely carry useful
+class information.
+
+Implementation details
+----------------------
+- Device selection happens before TF import (cpu|gpu|auto).
+- We rebuild a tiny loader model with the same encoder/projector names as during
+  pretraining, call `load_weights(h5)`, then keep only the encoder.
+- Features are L2 normalized before cosine similarity.
+- We process test features in blocks (`--block`) to keep memory bounded.
+
+Outputs
+-------
+- Prints Top-1 accuracy.
+- Saves a JSON summary in `results/knn_eval_*.json`.
 
 Author: Nishant Kabra
 Date: 11/10/25
 """
-
 from __future__ import annotations
-
 import os
+import json
+import time
 import argparse
 from typing import Tuple
 
-import numpy as np
+# -------------------- device pre-parse (before TF import!) --------------------
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto")
+_pre_args, _ = _pre.parse_known_args()
+if _pre_args.device == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+
+# -------------------------------- TensorFlow ----------------------------------
 import tensorflow as tf
-import keras
-from keras import mixed_precision
+from tensorflow import keras
 from tensorflow.keras import layers
 
-
-# ----------------------------- Global configuration -----------------------------
-# Enable mixed bfloat16 policy when requested. This is safe on CPU and can
-# speed up matmul/conv kernels on newer Intel/AMD CPUs with AVX512 BFloat16.
-if os.getenv("MIXED_BF16", "0") == "1":
-    mixed_precision.set_global_policy("mixed_bfloat16")
-    print("[knn_eval] mixed_bfloat16 enabled")
-
-# Allow overriding the backbone via environment variable for quick experiments.
-DEFAULT_BACKBONE = os.getenv("BACKBONE", "resnet50v2").lower()
+AUTOTUNE = tf.data.AUTOTUNE
 
 
-# ----------------------------- Utility / Data loading ----------------------------
-def set_seed(seed: int = 42) -> None:
+# ------------------------------- utilities -----------------------------------
+def _enable_mem_growth():
     """
-    Set Python/TensorFlow random seeds for reproducibility.
-
-    Parameters
-    ----------
-    seed : int
-        Seed value used by TF and NumPy.
+    Enable per-GPU memory growth to avoid grabbing all VRAM at start.
     """
-    tf.keras.utils.set_random_seed(seed)
+    try:
+        for g in tf.config.list_physical_devices("GPU"):
+            tf.config.experimental.set_memory_growth(g, True)
+    except Exception as e:
+        print("[knn_eval] set_memory_growth warning:", repr(e))
 
 
-def load_cifar(dataset: str) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], int]:
+def _gpu_probe() -> bool:
     """
-    Load CIFAR-10 or CIFAR-100 from Keras datasets.
-
-    Parameters
-    ----------
-    dataset : {"cifar10", "cifar100"}
-        Which dataset to load.
+    Validate basic GPU kernel launch (catches invalid PTX / driver mismatch).
 
     Returns
     -------
-    (x_train, y_train), (x_test, y_test), num_classes : tuple
-        Numpy arrays of images/labels and the number of classes.
+    bool
+        True if a tiny Conv2D executes on GPU; False otherwise.
     """
-    dataset = dataset.lower()
-    if dataset == "cifar10":
-        (xtr, ytr), (xte, yte) = tf.keras.datasets.cifar10.load_data()
-        ytr, yte = ytr.squeeze(), yte.squeeze()
-        num_classes = 10
-    elif dataset == "cifar100":
-        (xtr, ytr), (xte, yte) = tf.keras.datasets.cifar100.load_data()
-        ytr, yte = ytr.squeeze(), yte.squeeze()
-        num_classes = 100
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset}")
-    return (xtr, ytr), (xte, yte), num_classes
+    try:
+        with tf.device("/GPU:0"):
+            x = tf.random.uniform([1, 8, 8, 3])
+            y = layers.Conv2D(4, 3, padding="same")(x)
+            _ = tf.reduce_sum(y).numpy()
+        print("[knn_eval] GPU probe OK.")
+        return True
+    except Exception as e:
+        print("[knn_eval] GPU probe FAILED:", repr(e))
+        return False
 
 
-def _resize_only(x: tf.Tensor, y: tf.Tensor, image_size: int) -> Tuple[tf.Tensor, tf.Tensor]:
+def decide_device(policy: str) -> str:
     """
-    Pure-resize preprocessing used for kNN feature extraction.
+    Map policy -> TF device string, probing GPU in 'auto' mode.
+    """
+    if policy == "cpu":
+        print("[knn_eval] --device cpu -> using /CPU:0")
+        return "/CPU:0"
+    _enable_mem_growth()
+    if policy == "gpu":
+        print("[knn_eval] --device gpu requested; using /GPU:0 (may error).")
+        return "/GPU:0"
+    return "/GPU:0" if _gpu_probe() else "/CPU:0"
+
+
+# ------------------------ data pipelines (CIFAR) ------------------------------
+def _norm_img(x: tf.Tensor) -> tf.Tensor:
+    """
+    Convert uint8 image to float32 in [0,1].
+    """
+    return tf.image.convert_image_dtype(x, tf.float32)
+
+
+def build_cifar10_sup(image_size: int, batch_size: int):
+    """
+    CIFAR-10 supervised pipes for feature extraction.
+
+    Returns
+    -------
+    train_ds, test_ds, num_classes, n_train, n_test
+    """
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+    train = (
+        tf.data.Dataset.from_tensor_slices((x_train, y_train))
+        .map(lambda x, y: (tf.image.resize(_norm_img(x), [image_size, image_size]), tf.cast(y, tf.int32)),
+             num_parallel_calls=AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    test = (
+        tf.data.Dataset.from_tensor_slices((x_test, y_test))
+        .map(lambda x, y: (tf.image.resize(_norm_img(x), [image_size, image_size]), tf.cast(y, tf.int32)),
+             num_parallel_calls=AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    return train, test, 10, x_train.shape[0], x_test.shape[0]
+
+
+def build_cifar100_sup(image_size: int, batch_size: int):
+    """
+    CIFAR-100 supervised pipes for feature extraction.
+
+    Returns
+    -------
+    train_ds, test_ds, num_classes, n_train, n_test
+    """
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar100.load_data()
+    train = (
+        tf.data.Dataset.from_tensor_slices((x_train, y_train))
+        .map(lambda x, y: (tf.image.resize(_norm_img(x), [image_size, image_size]), tf.cast(y, tf.int32)),
+             num_parallel_calls=AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    test = (
+        tf.data.Dataset.from_tensor_slices((x_test, y_test))
+        .map(lambda x, y: (tf.image.resize(_norm_img(x), [image_size, image_size]), tf.cast(y, tf.int32)),
+             num_parallel_calls=AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    return train, test, 100, x_train.shape[0], x_test.shape[0]
+
+
+# ------------------- encoder / projector (match trainer) ----------------------
+def conv_block(x: tf.Tensor, filters: int, k: int = 3, s: int = 1) -> tf.Tensor:
+    """
+    Conv2D -> BatchNorm -> ReLU block. Keeps everything inside Keras layers.
+    """
+    x = layers.Conv2D(filters, k, strides=s, padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    return x
+
+
+def build_encoder(image_size: int) -> keras.Model:
+    """
+    Tiny CNN encoder -> Dense(2048) with name 'feat'.
+
+    Returns
+    -------
+    keras.Model named 'encoder' whose final 2048-dim output is used for kNN.
+    """
+    inp = keras.Input(shape=(image_size, image_size, 3))
+    x = conv_block(inp, 64)
+    x = conv_block(x, 64, s=2)
+    x = conv_block(x, 128)
+    x = conv_block(x, 128, s=2)
+    x = conv_block(x, 256)
+    x = conv_block(x, 256, s=2)
+    x = conv_block(x, 512)
+    x = layers.GlobalAveragePooling2D()(x)
+    feat = layers.Dense(2048, name="feat")(x)
+    return keras.Model(inp, feat, name="encoder")
+
+
+def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
+    """
+    MLP projector (rebuilt only for loading weights).
 
     Notes
     -----
-    We intentionally avoid heavy augmentation here because the goal is to
-    evaluate the representation as-is. You may layer on stronger augments
-    if you want to study invariances in kNN space.
-
-    Returns
-    -------
-    (x, y) with x in [0, 255] float32 resized to (image_size, image_size, 3).
+    - Variable names must match training so HDF5 `load_weights()` succeeds.
     """
-    # Cast is done by the caller, so here we only resize. Using bilinear for speed.
-    x = tf.image.resize(x, (image_size, image_size), method="bilinear")
-    return x, y
+    assert num_layers >= 1
+    inp = keras.Input(shape=(in_dim,))
+    x = inp
+    hidden = max(2048, out_dim)
+    for i in range(num_layers - 1):
+        x = layers.Dense(hidden, use_bias=False, name=f"proj_dense_{i}")(x)
+        x = layers.BatchNormalization(name=f"proj_bn_{i}")(x)
+        x = layers.ReLU(name=f"proj_relu_{i}")(x)
+    out = layers.Dense(out_dim, name="proj_out")(x)
+    return keras.Model(inp, out, name="projector")
 
 
-def make_datasets(dataset: str, image_size: int, batch_size: int):
+def load_encoder_from_ckpt(ckpt: str, image_size: int, proj_out: int, proj_layers: int) -> keras.Model:
     """
-    Create tf.data pipelines for train and test splits.
-
-    We keep preprocessing minimal and leave normalization to the model
-    (via the keras.applications preprocess function in a Lambda layer).
-
-    Returns
-    -------
-    ds_train, ds_test : tf.data.Dataset
-    """
-    (xtr, ytr), (xte, yte), _ = load_cifar(dataset)
-    # Keep uint8 on host memory; cast to float32 on-the-fly to reduce peak RAM.
-    xtr = tf.convert_to_tensor(xtr, dtype=tf.uint8)
-    xte = tf.convert_to_tensor(xte, dtype=tf.uint8)
-    ytr = tf.convert_to_tensor(ytr, dtype=tf.int32)
-    yte = tf.convert_to_tensor(yte, dtype=tf.int32)
-
-    ds_train = tf.data.Dataset.from_tensor_slices((xtr, ytr))
-    ds_train = ds_train.map(lambda a, b: _resize_only(tf.cast(a, tf.float32), b, image_size),
-                            num_parallel_calls=tf.data.AUTOTUNE)
-    ds_train = ds_train.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    ds_test = tf.data.Dataset.from_tensor_slices((xte, yte))
-    ds_test = ds_test.map(lambda a, b: _resize_only(tf.cast(a, tf.float32), b, image_size),
-                          num_parallel_calls=tf.data.AUTOTUNE)
-    ds_test = ds_test.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    return ds_train, ds_test
-
-
-# ----------------------------- Model / Feature extractor -------------------------
-def build_encoder(backbone: str, image_size: int) -> keras.Model:
-    """
-    Build a convolutional image encoder (no classification head).
-
-    Parameters
-    ----------
-    backbone : str
-        Name of the Keras Applications backbone. Recommended: "resnet50v2".
-    image_size : int
-        Input resolution for the encoder.
+    Restore encoder weights by building a small input->encoder->projector graph.
 
     Returns
     -------
     keras.Model
-        Model mapping (None, image_size, image_size, 3) -> pooled features.
+        Encoder with weights restored.
     """
-    # Choose a backbone from Keras applications. Add more branches as desired.
-    backbone = backbone.lower()
-    if backbone == "resnet50v2":
-        # We use include_top=False to get convolutional features.
-        base = keras.applications.ResNet50V2(include_top=False,
-                                             weights=None,  # external checkpoint will be loaded
-                                             input_shape=(image_size, image_size, 3))
-        preprocess = keras.applications.resnet_v2.preprocess_input
-    elif backbone == "resnet50":
-        base = keras.applications.ResNet50(include_top=False,
-                                           weights=None,
-                                           input_shape=(image_size, image_size, 3))
-        preprocess = keras.applications.resnet.preprocess_input
-    else:
-        raise ValueError(f"Unsupported backbone: '{backbone}'. Try 'resnet50v2'.")
-
-    # Functional graph: Input -> preprocess -> base -> GAP -> features
-    inputs = keras.Input(shape=(image_size, image_size, 3))
-    # Preprocess with a Lambda so we don't call TF ops directly on a KerasTensor
-    x = layers.Lambda(lambda z: preprocess(z))(inputs)
-    x = base(x, training=False)  # features with spatial dims
-    x = layers.GlobalAveragePooling2D()(x)  # pooled features [B, C]
-    model = keras.Model(inputs, x, name=f"{backbone}_encoder")
-    return model
+    encoder = build_encoder(image_size)
+    projector = build_projector(2048, proj_out, proj_layers)
+    inp = keras.Input(shape=(image_size, image_size, 3))
+    z = projector(encoder(inp))
+    tiny = keras.Model(inp, z, name="tiny_pretrain_model")
+    _ = tiny(tf.zeros([1, image_size, image_size, 3]), training=False)
+    print(f"[knn_eval] Loading weights: {ckpt}")
+    tiny.load_weights(ckpt)
+    print("[knn_eval] Weights loaded.")
+    return encoder
 
 
-def load_weights_safely(model: keras.Model, ckpt_path: str) -> None:
+# ------------------------------ kNN helpers -----------------------------------
+def l2_normalize(x: tf.Tensor, axis: int = -1) -> tf.Tensor:
     """
-    Load weights into `model` with `skip_mismatch=True`.
-
-    This survives shape/name differences between the backbone here and a
-    self-supervised checkpoint that may contain extra heads (e.g., VICReg MLP).
-
-    Parameters
-    ----------
-    model : keras.Model
-        The model whose weights should be loaded.
-    ckpt_path : str
-        Path to a `*.h5` / `*.weights.h5` file produced by `model.save_weights`.
-    """
-    if not ckpt_path:
-        print("[knn_eval] No checkpoint provided; using randomly initialized encoder.")
-        return
-    if not os.path.exists(ckpt_path):
-        print(f"[knn_eval] WARNING: checkpoint not found: {ckpt_path}")
-        return
-    try:
-        model.load_weights(ckpt_path, skip_mismatch=True)
-        print(f"[knn_eval] loaded weights with skip_mismatch=True from {ckpt_path}")
-    except Exception as e:
-        print(f"[knn_eval] WARNING: failed to load weights from {ckpt_path}: {e}")
-
-
-def l2_normalize_layer() -> layers.Layer:
-    """
-    Return a layer that L2-normalizes features along the last axis.
-
-    Normalization is standard for cosine kNN.
-    """
-    return layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=-1), name="l2_norm")
-
-
-def build_feature_extractor(ckpt_path: str, image_size: int, backbone: str) -> keras.Model:
-    """
-    Construct the frozen feature extractor, load checkpoint, and append L2 norm.
+    L2-normalize a batch of features along `axis`.
 
     Returns
     -------
-    keras.Model
-        Maps images to L2-normalized features.
+    tf.Tensor
+        Same shape as x, L2 norm = 1 along `axis`.
     """
-    enc = build_encoder(backbone, image_size)
-    load_weights_safely(enc, ckpt_path)
-    enc.trainable = False  # kNN uses frozen features
-
-    inputs = keras.Input(shape=(image_size, image_size, 3))
-    x = enc(inputs, training=False)
-    x = l2_normalize_layer()(x)
-    return keras.Model(inputs, x, name="feature_extractor")
+    return tf.math.l2_normalize(x, axis=axis)
 
 
-# ----------------------------- kNN evaluation ------------------------------------
-def extract_features(model: keras.Model, ds: tf.data.Dataset) -> Tuple[np.ndarray, np.ndarray]:
+def extract_features(encoder: keras.Model, ds: tf.data.Dataset, total: int, device: str) -> tf.Tensor:
     """
-    Run the dataset through `model` and collect features/labels as NumPy.
+    Run encoder over dataset and return a dense [total, dim] tensor.
 
     Parameters
     ----------
-    model : keras.Model
-        The feature extractor (expects float32 images in [0,255] or preprocessed).
+    encoder : keras.Model
+        Frozen feature extractor.
     ds : tf.data.Dataset
-        Batched dataset yielding (images, labels).
+        Batches of (image, label).
+    total : int
+        Total number of items in ds (for logging only).
+    device : str
+        TF device string used in a context manager.
 
     Returns
     -------
-    feats : np.ndarray of shape [N, D]
-    labels : np.ndarray of shape [N]
+    tf.Tensor (float32) of shape [N, D]
+        Concatenated features in input order.
     """
-    feats_list, labels_list = [], []
-    for batch_x, batch_y in ds:
-        # Ensure float32 dtype to match the model's expected input
-        batch_x = tf.cast(batch_x, tf.float32)
-        f = model(batch_x, training=False)
-        # If mixed precision, cast back to float32 before moving to host memory
-        f = tf.cast(f, tf.float32)
-        feats_list.append(f.numpy())
-        labels_list.append(batch_y.numpy())
-    feats = np.concatenate(feats_list, axis=0)
-    labels = np.concatenate(labels_list, axis=0)
-    return feats, labels
+    feats = []
+    with tf.device(device):
+        for xb, _ in ds:
+            # Forward pass (inference mode); cast to float32 for stability.
+            f = encoder(xb, training=False)
+            f = tf.cast(f, tf.float32)
+            feats.append(f)
+    return tf.concat(feats, axis=0)
 
 
-def knn_predict(train_feats: np.ndarray,
-                train_labels: np.ndarray,
-                test_feats: np.ndarray,
-                k: int = 200,
-                T: float = 0.07) -> np.ndarray:
+def knn_predict(
+    feat_train: tf.Tensor,
+    y_train: tf.Tensor,
+    feat_test: tf.Tensor,
+    k: int = 200,
+    T: float = 0.07,
+    block: int = 1000,
+) -> tf.Tensor:
     """
-    Perform kNN classification with cosine similarity and temperature scaling.
+    Temperature-weighted cosine-similarity kNN prediction (Top-1).
 
     Parameters
     ----------
-    train_feats : array [N_train, D] (L2-normalized)
-    train_labels : array [N_train]
-    test_feats : array [N_test, D] (L2-normalized)
+    feat_train : tf.Tensor [N, D]
+        Training features.
+    y_train : tf.Tensor [N, 1]
+        Training labels (integer class ids).
+    feat_test : tf.Tensor [M, D]
+        Test features.
     k : int
-        Number of nearest neighbors.
+        Number of neighbors.
     T : float
-        Softmax temperature used to weight neighbors.
+        Temperature to sharpen similarity scores before softmax.
+    block : int
+        Number of test vectors to handle per block to bound memory.
 
     Returns
     -------
-    pred : array [N_test] of predicted integer labels.
+    tf.Tensor [M]
+        Predicted class ids for each test sample.
+
+    Procedure
+    ---------
+    - L2 normalize both train and test features.
+    - For each block of test features:
+        * Compute cosine sims vs all train features.
+        * Take Top-k, divide by T, softmax to get neighbor weights.
+        * Compute weighted vote in one-hot class space and argmax.
     """
-    # Cosine similarity reduces to dot product because of L2 normalization.
-    sims = test_feats @ train_feats.T  # [N_test, N_train]
+    feat_train = l2_normalize(feat_train)
+    feat_test = l2_normalize(feat_test)
+    n_test = feat_test.shape[0]
+    preds = []
 
-    # Get top-k indices for each test sample
-    idx = np.argpartition(-sims, kth=k-1, axis=1)[:, :k]  # fast partial sort
-    # Gather the top-k similarities and labels
-    topk_sims = np.take_along_axis(sims, idx, axis=1)     # [N_test, k]
-    topk_labels = train_labels[idx]                       # [N_test, k]
+    for start in range(0, n_test, block):
+        end = min(n_test, start + block)
+        ft = feat_test[start:end]  # [B, D]
+        sim = tf.matmul(ft, feat_train, transpose_b=True)  # [B, N]
+        topk = tf.math.top_k(sim, k=k)
+        idx = topk.indices                   # [B, k]
+        val = topk.values / T                # [B, k]
+        w = tf.nn.softmax(val, axis=-1)      # [B, k] (weights per neighbor)
 
-    # Convert similarities into weights via temperature-scaled softmax
-    # subtract max for numerical stability
-    topk_sims = topk_sims - topk_sims.max(axis=1, keepdims=True)
-    weights = np.exp(topk_sims / max(T, 1e-6))
-    # Aggregate votes per class using the weights
-    num_classes = int(train_labels.max()) + 1
-    votes = np.zeros((test_feats.shape[0], num_classes), dtype=np.float32)
-    for i in range(k):
-        lab = topk_labels[:, i]
-        np.add.at(votes, (np.arange(votes.shape[0]), lab), weights[:, i])
+        # gather neighbor labels and do weighted voting
+        y_n = tf.gather(y_train, idx)        # [B, k, 1]
+        y_n = tf.squeeze(y_n, axis=-1)       # [B, k]
+        num_classes = int(tf.reduce_max(y_train)) + 1
+        oh = tf.one_hot(y_n, depth=num_classes)  # [B, k, C]
+        vote = tf.reduce_sum(w[..., None] * oh, axis=1)  # [B, C]
+        pred = tf.argmax(vote, axis=-1)       # [B]
+        preds.append(pred)
 
-    # Final prediction is the class with the highest weighted vote
-    return votes.argmax(axis=1)
+    return tf.concat(preds, axis=0)
 
 
-# ----------------------------- Main ----------------------------------------------
-def main() -> None:
+# ---------------------------------- CLI --------------------------------------
+def parse_args():
     """
-    CLI entry point.
-
-    Examples
-    --------
-    Python:
-        python scripts/knn_eval.py --dataset cifar10 --image-size 224 --batch-size 512 --k 200 \
-            --ckpt checkpoints_tf/vicreg_tf.weights.h5 --backbone resnet50v2
+    Parse configuration flags for kNN evaluation.
     """
-    parser = argparse.ArgumentParser(description="kNN eval for SSL features (cosine kNN).")
-    parser.add_argument("--dataset", type=str, default="cifar10",
-                        choices=["cifar10", "cifar100"], help="Dataset to evaluate on.")
-    parser.add_argument("--image-size", type=int, default=32, help="Input resolution.")
-    parser.add_argument("--batch-size", type=int, default=512, help="Batch size for feature extraction.")
-    parser.add_argument("--k", type=int, default=200, help="k for kNN.")
-    parser.add_argument("--T", type=float, default=0.07, help="Temperature for soft voting.")
-    parser.add_argument("--ckpt", type=str, default="", help="Path to encoder weights (save_weights format).")
-    parser.add_argument("--backbone", type=str, default=DEFAULT_BACKBONE,
-                        help="Backbone name (e.g., resnet50v2).")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(parents=[_pre])
+    p.add_argument("--ckpt", type=str, default="checkpoints_tf/vicreg_tf.weights.h5")
+    p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    p.add_argument("--image-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=512, help="Feature extraction batch size.")
+    p.add_argument("--proj-out", type=int, default=8192)
+    p.add_argument("--proj-layers", type=int, default=3)
+    p.add_argument("--k", type=int, default=200)
+    p.add_argument("--T", type=float, default=0.07)
+    p.add_argument("--block", type=int, default=1000, help="Test block size for memory-friendly scoring.")
+    p.add_argument("--results-dir", type=str, default="results")
+    return p.parse_args()
 
-    set_seed(42)
 
-    print(f"[knn_eval] dataset={args.dataset} img={args.image_size} bs={args.batch_size} "
-          f"k={args.k} T={args.T} ckpt={args.ckpt}")
-    ds_train, ds_test = make_datasets(args.dataset, args.image_size, args.batch_size)
+# ---------------------------------- main --------------------------------------
+def main():
+    """
+    Entrypoint: restore encoder -> extract features -> run kNN -> save results.
 
-    # Build extractor and load checkpoint
-    feat_extractor = build_feature_extractor(args.ckpt, args.image_size, args.backbone)
+    Side Effects
+    ------------
+    - Writes `results/knn_eval_*.json`.
+    - Prints Top-1 accuracy.
+    """
+    args = parse_args()
+    os.makedirs(args.results_dir, exist_ok=True)
+    device = decide_device(_pre_args.device)
+    print(f"[knn_eval] Using device: {device}")
 
-    # Extract features as NumPy arrays
-    train_feats, train_labels = extract_features(feat_extractor, ds_train)
-    test_feats, test_labels = extract_features(feat_extractor, ds_test)
+    with tf.device(device):
+        # 1) Build supervised datasets for feature extraction
+        if args.dataset == "cifar10":
+            train, test, num_classes, n_train, n_test = build_cifar10_sup(args.image_size, args.batch_size)
+        else:
+            train, test, num_classes, n_train, n_test = build_cifar100_sup(args.image_size, args.batch_size)
 
-    # Predict with kNN
-    pred = knn_predict(train_feats, train_labels, test_feats, k=args.k, T=args.T)
+        # Extract ground-truth labels in order matching features
+        y_train_all = [yb for _, yb in train]
+        y_test_all = [yb for _, yb in test]
+        y_train = tf.concat(y_train_all, axis=0)  # [N,1]
+        y_test = tf.concat(y_test_all, axis=0)    # [M,1]
 
-    # Report accuracy
-    acc = (pred == test_labels).mean().item()
-    print(f"Embedded: train {len(train_labels)} / test {len(test_labels)}")
-    print(f"kNN@{args.k} accuracy: {acc:.4f}")
+        # 2) Load encoder from checkpoint
+        encoder = load_encoder_from_ckpt(args.ckpt, args.image_size, args.proj_out, args.proj_layers)
+
+        # 3) Extract features
+        print("[knn_eval] Extracting train features...")
+        feat_train = extract_features(encoder, train, n_train, device)
+        print("[knn_eval] Extracting test features...")
+        feat_test = extract_features(encoder, test, n_test, device)
+
+        # 4) kNN classification
+        print(f"[knn_eval] Running kNN (k={args.k}, T={args.T})...")
+        t0 = time.time()
+        pred = knn_predict(feat_train, y_train, feat_test, k=args.k, T=args.T, block=args.block)
+        dur = time.time() - t0
+
+        # 5) Accuracy
+        acc = tf.reduce_mean(tf.cast(tf.equal(pred[:, None], y_test), tf.float32)).numpy().item()
+        print(f"[knn_eval] Top-1 accuracy: {acc:.4f}  (knn seconds={dur:.1f})")
+
+        # 6) Persist results
+        out = {
+            "task": "knn_eval",
+            "dataset": args.dataset,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "proj_out": args.proj_out,
+            "proj_layers": args.proj_layers,
+            "k": args.k,
+            "T": args.T,
+            "block": args.block,
+            "device": device,
+            "test_acc": acc,
+            "knn_seconds": dur,
+            "ckpt": args.ckpt,
+        }
+        out_path = os.path.join(args.results_dir, f"knn_eval_{args.dataset}_{int(time.time())}.json")
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"[knn_eval] wrote {out_path}")
 
 
 if __name__ == "__main__":

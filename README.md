@@ -136,12 +136,12 @@ Supported out of the box:
 Example (CIFAR-10, CPU friendly, mixed bfloat16 on capable CPUs):
 
 ```bash
-python scripts/train_vicreg.py \
+python3 scripts/train_vicreg.py \
+  --device auto \
   --dataset cifar10 --image-size 32 \
-  --epochs 200 --batch-size 512 \
+  --epochs 100 --batch-size 256 \
   --adaptive --use-schedules \
-  --proj-out 8192 --proj-layers 3 \
-  --mixed-bf16
+  --proj-out 8192 --proj-layers 3
 ```
 
 Key outputs:
@@ -160,13 +160,11 @@ Trains a single Dense layer on frozen features. You can tap features **before** 
 
 **Using a SavedModel encoder directory (recommended):**
 ```bash
-python scripts/eval_linear.py \
+# CPU is fine; add --device cpu if you want to pin to CPU explicitly
+python3 scripts/eval_linear.py \
+  --ckpt checkpoints_tf/vicreg_tf.weights.h5 \
   --dataset cifar10 --image-size 32 \
-  --epochs 30 --batch-size 256 \
-  --encoder-path artifacts/encoder_savedmodel \
-  --feat-layer pool \
-  --bn-adapt-steps 200 \
-  --mixed-bf16
+  --epochs 50 --batch-size 512
 ```
 
 **Using a Keras weights file (.h5) with an internally built backbone:**

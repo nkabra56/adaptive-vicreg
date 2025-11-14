@@ -1,333 +1,516 @@
 """
-Linear probe evaluation on CIFAR using a frozen encoder.
--------------------------------------------------------------------------------
-This script builds a convolutional encoder (Keras Applications), optionally
-loads a self-supervised checkpoint with `skip_mismatch=True`, runs optional
-BatchNorm adaptation on unlabelled training images, then trains a **linear**
-softmax classifier on top while keeping the encoder frozen. This approximates
-the common "linear eval" protocol used in SimCLR, MoCo, BYOL, VICReg, etc.
+Linear evaluation (frozen encoder) for VICReg / Adaptive-VICReg checkpoints.
+
+Overview
+--------
+This script freezes the self-supervised encoder you trained and learns a single
+linear classification head on top of its features. This "linear probe" reflects
+the linearly-separable quality of the learned representation.
+
+Key design choices
+------------------
+1) **Device selection before TF import**:
+   We parse --device early (cpu|gpu|auto) and set CUDA visibility accordingly to
+   avoid creating GPU context accidentally, which would make later switching
+   impossible.
+
+2) **Checkpoint loading via a tiny loader model**:
+   During pretraining, you saved weights with layer names for both "encoder"
+   and "projector". To reliably reload those weights, we rebuild *both*
+   submodules with the *same names* and create a minimal model:
+     input -> encoder -> projector
+   We then call `tiny.load_weights(h5_path)`. After loading, we only keep the
+   `encoder` to extract features for linear probing. This avoids the common
+   KerasTensor / symbolic issues from mixing raw tf.* ops into the Functional
+   graph.
+
+3) **Safety around dtype/mixed-precision**:
+   We run in float32 to remove dtype mismatch surprises. (If you want AMP, make
+   sure your losses and metrics can handle bf16/fp16 cleanly.)
+
+Outputs
+-------
+- Trains a linear head and prints test accuracy.
+- Saves a JSON summary under `results/linear_eval_*.json` for later plotting.
 
 Author: Nishant Kabra
 Date: 11/10/25
 """
-
 from __future__ import annotations
-
 import os
+import json
+import time
 import argparse
 from typing import Tuple
 
-import numpy as np
+# -------------------- device pre-parse (before TF import!) --------------------
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument(
+    "--device",
+    choices=["auto", "cpu", "gpu"],
+    default="auto",
+    help="Where to run the computation. Decided before importing TensorFlow.",
+)
+_pre_args, _ = _pre.parse_known_args()
+if _pre_args.device == "cpu":
+    # Hide all CUDA devices so TF never initializes a GPU context.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Reduce TF verbosity a bit (set to '0' for full logs during debugging).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+
+# ------------------------------- TensorFlow -----------------------------------
 import tensorflow as tf
-import keras
-from keras import mixed_precision
+from tensorflow import keras
 from tensorflow.keras import layers
 
-
-# ----------------------------- Global configuration -----------------------------
-if os.getenv("MIXED_BF16", "0") == "1":
-    mixed_precision.set_global_policy("mixed_bfloat16")
-    print("[eval_linear] mixed_bfloat16 enabled")
-
-DEFAULT_BACKBONE = os.getenv("BACKBONE", "resnet50v2").lower()
+AUTOTUNE = tf.data.AUTOTUNE
 
 
-# ----------------------------- Utils / data -------------------------------------
-def set_seed(seed: int = 42) -> None:
+# ------------------------------- utilities -----------------------------------
+def _enable_mem_growth():
     """
-    Seed Python/TensorFlow RNG for reproducibility.
+    Enable per-GPU memory growth to prevent TF from pre-allocating all VRAM.
+
+    Why: On laptops or shared GPUs this avoids OOM at startup. No-op on CPU.
     """
-    tf.keras.utils.set_random_seed(seed)
+    try:
+        for g in tf.config.list_physical_devices("GPU"):
+            tf.config.experimental.set_memory_growth(g, True)
+    except Exception as e:
+        print("[eval_linear] set_memory_growth warning:", repr(e))
 
 
-def load_cifar(dataset: str) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], int]:
+def _gpu_probe() -> bool:
     """
-    Load CIFAR-10 or CIFAR-100 and return NumPy arrays plus class count.
+    Try a tiny GPU op to verify kernels can be loaded successfully.
+
+    Returns
+    -------
+    bool
+        True if a trivial Conv2D + sum executes on GPU; False otherwise.
+
+    Notes
+    -----
+    - This catches issues like invalid PTX, missing kernels, or driver
+      mismatches early and lets us fall back to CPU automatically.
     """
-    dataset = dataset.lower()
-    if dataset == "cifar10":
-        (xtr, ytr), (xte, yte) = tf.keras.datasets.cifar10.load_data()
-        ytr, yte = ytr.squeeze(), yte.squeeze()
-        num_classes = 10
-    elif dataset == "cifar100":
-        (xtr, ytr), (xte, yte) = tf.keras.datasets.cifar100.load_data()
-        ytr, yte = ytr.squeeze(), yte.squeeze()
-        num_classes = 100
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset}")
-    return (xtr, ytr), (xte, yte), num_classes
+    try:
+        with tf.device("/GPU:0"):
+            x = tf.random.uniform([1, 8, 8, 3])
+            y = layers.Conv2D(4, 3, padding="same")(x)
+            _ = tf.reduce_sum(y).numpy()  # forces execution
+        print("[eval_linear] GPU probe OK.")
+        return True
+    except Exception as e:
+        print("[eval_linear] GPU probe FAILED:", repr(e))
+        return False
 
 
-def _preprocess_for_training(x: tf.Tensor, y: tf.Tensor, image_size: int, aug: bool) -> Tuple[tf.Tensor, tf.Tensor]:
+def decide_device(policy: str) -> str:
     """
-    Resize + light augmentation (optional) for the linear probe.
+    Decide runtime device string from the requested policy.
 
-    We keep augmentations mild to avoid leaking too much invariance from heavy
-    SSL pipelines; the point is to measure the representation quality.
+    Parameters
+    ----------
+    policy : {'cpu','gpu','auto'}
+        'cpu' : force CPU (/CPU:0)
+        'gpu' : force GPU (/GPU:0) — may raise if kernels/driver mismatch
+        'auto': prefer GPU if a small probe succeeds, else CPU
+
+    Returns
+    -------
+    str
+        TensorFlow device string like '/CPU:0' or '/GPU:0'.
     """
-    x = tf.image.resize(x, (image_size, image_size), method="bilinear")
-    if aug:
-        # Random flips are cheap and standard for CIFAR
-        x = tf.image.random_flip_left_right(x)
-    return x, y
+    if policy == "cpu":
+        print("[eval_linear] --device cpu -> using /CPU:0")
+        return "/CPU:0"
+    _enable_mem_growth()
+    if policy == "gpu":
+        print("[eval_linear] --device gpu requested; using /GPU:0 (may error).")
+        return "/GPU:0"
+    # auto
+    return "/GPU:0" if _gpu_probe() else "/CPU:0"
 
 
-def make_datasets(dataset: str, image_size: int, batch_size: int):
+# ------------------------ data pipelines (CIFAR) ------------------------------
+def _norm_img(x: tf.Tensor) -> tf.Tensor:
     """
-    Return (train_ds, val_ds, test_ds) datasets for linear evaluation.
+    Cast uint8 image to float32 in [0,1].
 
-    We use 45k/5k split for train/val from CIFAR train by default.
+    Parameters
+    ----------
+    x : tf.Tensor
+        [H, W, 3] uint8
+
+    Returns
+    -------
+    tf.Tensor
+        float32 in [0,1]
     """
-    (xtr, ytr), (xte, yte), _ = load_cifar(dataset)
-    # Split 45k/5k for tuning LR & early stopping
-    x_tr, y_tr = xtr[:45000], ytr[:45000]
-    x_val, y_val = xtr[45000:], ytr[45000:]
-
-    # Keep uint8 on host, cast per-map to float for smaller memory footprint
-    x_tr = tf.convert_to_tensor(x_tr, dtype=tf.uint8)
-    x_val = tf.convert_to_tensor(x_val, dtype=tf.uint8)
-    x_te = tf.convert_to_tensor(xte, dtype=tf.uint8)
-    y_tr = tf.convert_to_tensor(y_tr, dtype=tf.int32)
-    y_val = tf.convert_to_tensor(y_val, dtype=tf.int32)
-    y_te = tf.convert_to_tensor(yte, dtype=tf.int32)
-
-    # Training pipeline (with light aug)
-    ds_train = tf.data.Dataset.from_tensor_slices((x_tr, y_tr))
-    ds_train = ds_train.shuffle(10000, reshuffle_each_iteration=True)
-    ds_train = ds_train.map(lambda a, b: _preprocess_for_training(tf.cast(a, tf.float32), b, image_size, True),
-                            num_parallel_calls=tf.data.AUTOTUNE)
-    ds_train = ds_train.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    # Validation/Test pipelines (no aug)
-    ds_val = tf.data.Dataset.from_tensor_slices((x_val, y_val))
-    ds_val = ds_val.map(lambda a, b: _preprocess_for_training(tf.cast(a, tf.float32), b, image_size, False),
-                        num_parallel_calls=tf.data.AUTOTUNE)
-    ds_val = ds_val.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    ds_test = tf.data.Dataset.from_tensor_slices((x_te, y_te))
-    ds_test = ds_test.map(lambda a, b: _preprocess_for_training(tf.cast(a, tf.float32), b, image_size, False),
-                          num_parallel_calls=tf.data.AUTOTUNE)
-    ds_test = ds_test.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    return ds_train, ds_val, ds_test
+    return tf.image.convert_image_dtype(x, tf.float32)
 
 
-# ----------------------------- Encoder / Feature model ---------------------------
-def _select_backbone(backbone: str, image_size: int):
+def build_cifar10_sup(image_size: int, batch_size: int) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, int]:
     """
-    Helper to build the Keras Applications backbone and corresponding preprocess fn.
+    Build supervised train/test pipelines for CIFAR-10 (resized to `image_size`).
+
+    Returns
+    -------
+    train_ds : tf.data.Dataset
+        (image, label) batches for training the linear head
+    test_ds : tf.data.Dataset
+        (image, label) batches for evaluation
+    num_classes : int
+        10 for CIFAR-10
+    n_train : int
+        Number of training images
     """
-    backbone = backbone.lower()
-    if backbone == "resnet50v2":
-        base = keras.applications.ResNet50V2(include_top=False,
-                                             weights=None,
-                                             input_shape=(image_size, image_size, 3))
-        preprocess = keras.applications.resnet_v2.preprocess_input
-    elif backbone == "resnet50":
-        base = keras.applications.ResNet50(include_top=False,
-                                           weights=None,
-                                           input_shape=(image_size, image_size, 3))
-        preprocess = keras.applications.resnet.preprocess_input
-    else:
-        raise ValueError(f"Unsupported backbone: '{backbone}'. Try 'resnet50v2'.")
-    return base, preprocess
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+    num_classes = 10
+
+    train = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    test = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+
+    # Resize + cast + pack batches
+    train = (
+        train.shuffle(10_000, reshuffle_each_iteration=True)
+        .map(
+            lambda x, y: (
+                tf.image.resize(_norm_img(x), [image_size, image_size]),
+                tf.cast(y, tf.int32),
+            ),
+            num_parallel_calls=AUTOTUNE,
+        )
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    test = (
+        test.map(
+            lambda x, y: (
+                tf.image.resize(_norm_img(x), [image_size, image_size]),
+                tf.cast(y, tf.int32),
+            ),
+            num_parallel_calls=AUTOTUNE,
+        )
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    return train, test, num_classes, x_train.shape[0]
 
 
-def build_feature_extractor(ckpt_path: str, image_size: int, backbone: str) -> keras.Model:
+def build_cifar100_sup(image_size: int, batch_size: int) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, int]:
     """
-    Build encoder (+ GAP) wrapped with preprocessing and load weights if given.
+    Same as `build_cifar10_sup` but for CIFAR-100.
+
+    Returns
+    -------
+    train_ds, test_ds, num_classes (100), n_train
+    """
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar100.load_data()
+    num_classes = 100
+
+    train = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    test = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+
+    train = (
+        train.shuffle(10_000, reshuffle_each_iteration=True)
+        .map(
+            lambda x, y: (
+                tf.image.resize(_norm_img(x), [image_size, image_size]),
+                tf.cast(y, tf.int32),
+            ),
+            num_parallel_calls=AUTOTUNE,
+        )
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    test = (
+        test.map(
+            lambda x, y: (
+                tf.image.resize(_norm_img(x), [image_size, image_size]),
+                tf.cast(y, tf.int32),
+            ),
+            num_parallel_calls=AUTOTUNE,
+        )
+        .batch(batch_size)
+        .prefetch(AUTOTUNE)
+    )
+    return train, test, num_classes, x_train.shape[0]
+
+
+# ------------------- encoder / projector (match trainer) ----------------------
+def conv_block(x: tf.Tensor, filters: int, k: int = 3, s: int = 1) -> tf.Tensor:
+    """
+    A simple Conv2D -> BatchNorm -> ReLU block.
+
+    Parameters
+    ----------
+    x : tf.Tensor
+        Input feature map.
+    filters : int
+        Number of output channels.
+    k : int
+        Kernel size.
+    s : int
+        Stride.
+
+    Returns
+    -------
+    tf.Tensor
+        Output feature map.
+
+    Notes
+    -----
+    - We avoid using raw tf.* ops on symbolic KerasTensors outside layers.
+    """
+    x = layers.Conv2D(filters, k, strides=s, padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    return x
+
+
+def build_encoder(image_size: int) -> keras.Model:
+    """
+    Tiny CNN encoder producing a 2048-dim feature vector.
+
+    Parameters
+    ----------
+    image_size : int
+        Input resolution (height==width).
 
     Returns
     -------
     keras.Model
-        A frozen model that maps images -> pooled features (float32).
-    """
-    base, preprocess = _select_backbone(backbone, image_size)
+        Keras Functional model named 'encoder' with output Dense(2048) named 'feat'.
 
-    # Inputs and preprocessing live in the Keras graph (avoid raw TF ops on KerasTensor)
-    inputs = keras.Input(shape=(image_size, image_size, 3))
-    x = layers.Lambda(lambda z: preprocess(z))(inputs)
-    x = base(x, training=False)
+    Important
+    ---------
+    The layer names ('encoder', 'feat', etc.) match those used during
+    pretraining so `load_weights()` can locate variables by name.
+    """
+    inp = keras.Input(shape=(image_size, image_size, 3))
+    x = conv_block(inp, 64)
+    x = conv_block(x, 64, s=2)
+    x = conv_block(x, 128)
+    x = conv_block(x, 128, s=2)
+    x = conv_block(x, 256)
+    x = conv_block(x, 256, s=2)
+    x = conv_block(x, 512)
     x = layers.GlobalAveragePooling2D()(x)
-    feat_model = keras.Model(inputs, x, name=f"{backbone}_encoder")
-
-    # Load checkpoint with mismatches skipped (e.g., extra MLP heads in SSL)
-    if ckpt_path:
-        if os.path.exists(ckpt_path):
-            try:
-                feat_model.load_weights(ckpt_path, skip_mismatch=True)
-                print(f"[eval_linear] loaded weights from {ckpt_path} (skip_mismatch=True)")
-            except Exception as e:
-                print(f"[eval_linear] WARNING: failed weight load: {e}")
-        else:
-            print(f"[eval_linear] WARNING: checkpoint not found: {ckpt_path}")
-
-    feat_model.trainable = False  # freeze for linear probe
-    return feat_model
+    feat = layers.Dense(2048, name="feat")(x)  # final embeddings used by the probe
+    return keras.Model(inp, feat, name="encoder")
 
 
-def bn_adapt(feature_extractor: keras.Model,
-             ds: tf.data.Dataset,
-             steps: int = 0) -> None:
+def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
     """
-    Optional BatchNorm adaptation: run a few forward passes with `training=True`
-    to update moving mean/variance on the target data distribution.
+    MLP projector used during pretraining.
 
     Parameters
     ----------
-    feature_extractor : keras.Model
-        Encoder model that contains BN layers.
-    ds : tf.data.Dataset
-        Unlabeled training images (labels unused).
-    steps : int
-        Number of adaptation batches to run. 0 disables adaptation.
-    """
-    if steps <= 0:
-        return
+    in_dim : int
+        Input feature dimension (encoder output), e.g., 2048.
+    out_dim : int
+        Projection output dimension (e.g., 8192).
+    num_layers : int
+        Number of MLP layers (including the output). Must be >= 1.
 
-    print(f"[eval_linear] Running BN adaptation for {steps} steps...")
-    it = iter(ds)  # reuse the same ds pipeline
-    for i in range(steps):
+    Returns
+    -------
+    keras.Model
+        Model named 'projector' with appropriately named Dense/BN/ReLU layers.
+
+    Why rebuild here?
+    -----------------
+    We reconstruct it only so that the tiny loader model has the same variable
+    names as your training graph; that allows `load_weights` to restore all
+    moving statistics in BatchNorm and Dense kernels.
+    """
+    assert num_layers >= 1, "num_layers must be >= 1"
+    inp = keras.Input(shape=(in_dim,))
+    x = inp
+    hidden = max(2048, out_dim)  # reasonable default width
+    # stack L-1 (Dense+BN+ReLU), then final Dense
+    for i in range(num_layers - 1):
+        x = layers.Dense(hidden, use_bias=False, name=f"proj_dense_{i}")(x)
+        x = layers.BatchNormalization(name=f"proj_bn_{i}")(x)
+        x = layers.ReLU(name=f"proj_relu_{i}")(x)
+    out = layers.Dense(out_dim, name="proj_out")(x)
+    return keras.Model(inp, out, name="projector")
+
+
+def load_encoder_from_ckpt(ckpt: str, image_size: int, proj_out: int, proj_layers: int) -> keras.Model:
+    """
+    Load encoder weights by building a tiny model: input -> encoder -> projector.
+
+    Parameters
+    ----------
+    ckpt : str
+        Path to HDF5 weights saved during pretraining (save_weights_only).
+    image_size : int
+        Resolution the encoder expects.
+    proj_out : int
+        Projection size used during pretrain. Must match the checkpoint.
+    proj_layers : int
+        Projector depth used during pretrain. Must match the checkpoint.
+
+    Returns
+    -------
+    keras.Model
+        The encoder model with weights restored.
+
+    Why this approach?
+    ------------------
+    Keras weight loading matches by layer *name* and variable *name*. The
+    pretrainer saved weights from a model that contained *both* encoder and
+    projector. Rebuilding the same structure ensures all variables exist so
+    `load_weights()` can place parameters correctly. After loading, we discard
+    the tiny wrapper and return just the encoder.
+    """
+    encoder = build_encoder(image_size)
+    projector = build_projector(2048, proj_out, proj_layers)
+
+    # Build a tiny wrapper with the same submodule names.
+    inp = keras.Input(shape=(image_size, image_size, 3))
+    z = projector(encoder(inp))
+    tiny = keras.Model(inp, z, name="tiny_pretrain_model")
+
+    # Create variables (build) before loading weights.
+    _ = tiny(tf.zeros([1, image_size, image_size, 3]), training=False)
+    print(f"[eval_linear] Loading weights: {ckpt}")
+    tiny.load_weights(ckpt)
+    print("[eval_linear] Weights loaded into encoder/projector.")
+    return encoder
+
+
+# -------------------------- linear probe head ---------------------------------
+def build_linear_probe(encoder: keras.Model, num_classes: int) -> keras.Model:
+    """
+    Compose a frozen encoder with a trainable single Dense head.
+
+    Parameters
+    ----------
+    encoder : keras.Model
+        Pretrained encoder whose weights will be frozen.
+    num_classes : int
+        Number of classification classes.
+
+    Returns
+    -------
+    keras.Model
+        Model(input=image) -> logits[num_classes]
+
+    Notes
+    -----
+    - We call encoder with `training=False` to make sure its BN layers (if any)
+      run in inference mode during probing, as is standard for linear eval.
+    """
+    encoder.trainable = False  # freeze backbone
+    inp = keras.Input(shape=encoder.input_shape[1:])
+    feat = encoder(inp, training=False)
+    logits = layers.Dense(num_classes, name="linear_head")(feat)
+    return keras.Model(inp, logits, name="linear_eval_model")
+
+
+# ---------------------------------- CLI --------------------------------------
+def parse_args():
+    """
+    Parse command-line arguments for linear evaluation.
+
+    Returns
+    -------
+    argparse.Namespace
+        All runtime options needed by `main()`.
+    """
+    p = argparse.ArgumentParser(parents=[_pre])
+    p.add_argument("--ckpt", type=str, default="checkpoints_tf/vicreg_tf.weights.h5",
+                   help="Path to weights saved by trainer (HDF5).")
+    p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    p.add_argument("--image-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--proj-out", type=int, default=8192)
+    p.add_argument("--proj-layers", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=50, help="Linear head training epochs.")
+    p.add_argument("--lr", type=float, default=0.1)
+    p.add_argument("--wd", type=float, default=0.0)
+    p.add_argument("--results-dir", type=str, default="results")
+    return p.parse_args()
+
+
+# ---------------------------------- main --------------------------------------
+def main():
+    """
+    Entrypoint: load data, restore encoder, train linear head, evaluate, save JSON.
+
+    Side Effects
+    ------------
+    - Creates `results/linear_eval_*.json`.
+    - Prints progress + final accuracy to stdout.
+    """
+    args = parse_args()
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    device = decide_device(_pre_args.device)
+    print(f"[eval_linear] Using device: {device}")
+
+    with tf.device(device):
+        # 1) Build supervised dataset
+        if args.dataset == "cifar10":
+            train, test, num_classes, n_train = build_cifar10_sup(args.image_size, args.batch_size)
+        else:
+            train, test, num_classes, n_train = build_cifar100_sup(args.image_size, args.batch_size)
+        steps_per_epoch = max(1, n_train // args.batch_size)
+
+        # 2) Load encoder from checkpoint
+        encoder = load_encoder_from_ckpt(args.ckpt, args.image_size, args.proj_out, args.proj_layers)
+
+        # 3) Build linear probe and optimizer
+        model = build_linear_probe(encoder, num_classes)
         try:
-            batch_x, _ = next(it)
-        except StopIteration:
-            # If we exhaust ds before completing, recreate iterator
-            it = iter(ds)
-            batch_x, _ = next(it)
-        # Important: call with training=True so BN updates its moving stats
-        _ = feature_extractor(batch_x, training=True)
+            # AdamW if available; otherwise SGD with momentum is fine for a linear head.
+            import tensorflow_addons as tfa
+            opt = tfa.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.wd)
+        except Exception:
+            opt = keras.optimizers.SGD(learning_rate=args.lr, momentum=0.9)
 
+        model.compile(
+            optimizer=opt,
+            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
+        )
 
-def build_linear_probe(feature_extractor: keras.Model,
-                       num_classes: int,
-                       weight_decay: float = 1e-4) -> keras.Model:
-    """
-    Construct the linear classifier on top of the frozen encoder.
+        # 4) Train linear head
+        print(f"[eval_linear] Training linear head for {args.epochs} epochs "
+              f"({steps_per_epoch} steps/epoch)...")
+        t0 = time.time()
+        model.fit(train, epochs=args.epochs, steps_per_epoch=steps_per_epoch, verbose=1)
+        dur = time.time() - t0
 
-    We use a single Dense layer producing logits. The encoder stays frozen.
-    """
-    inputs = feature_extractor.inputs[0]
-    x = feature_extractor(inputs, training=False)  # pooled features
-    # Optionally normalize features to stabilize the head; not strictly required.
-    # x = layers.LayerNormalization(epsilon=1e-6, name="feat_ln")(x)
+        # 5) Evaluate
+        test_metrics = model.evaluate(test, verbose=0)
+        acc = float(test_metrics[1])  # index 1 = 'acc' metric
 
-    logits = layers.Dense(num_classes,
-                          use_bias=True,
-                          kernel_initializer="lecun_normal",
-                          bias_initializer="zeros",
-                          kernel_regularizer=keras.regularizers.l2(weight_decay),
-                          name="linear_head")(x)
-    model = keras.Model(inputs, logits, name="linear_probe")
-    return model
-
-
-# ----------------------------- Training / Evaluation -----------------------------
-def linear_eval(dataset: str,
-                image_size: int,
-                batch_size: int,
-                epochs: int,
-                patience: int,
-                base_lr: float,
-                weight_decay: float,
-                ckpt: str,
-                backbone: str) -> None:
-    """
-    Perform linear probe training and report test accuracy.
-    """
-    ds_train, ds_val, ds_test = make_datasets(dataset, image_size, batch_size)
-    _, _, num_classes = load_cifar(dataset)
-
-    feat_extractor = build_feature_extractor(ckpt, image_size, backbone)
-
-    # Optional BN adaptation before training (use the unaugmented validation stream)
-    adapt_steps = int(os.getenv("BN_ADAPT_STEPS", "0"))
-    if adapt_steps > 0:
-        # ds_val has no augmentations; suitable for BN stats
-        bn_adapt(feat_extractor, ds_val, steps=adapt_steps)
-
-    # Build linear head and compile
-    model = build_linear_probe(feat_extractor, num_classes, weight_decay)
-
-    # Scale LR by batch size as commonly done in linear eval
-    lr = base_lr * (batch_size / 256.0)
-    try:
-        opt = keras.optimizers.SGD(learning_rate=lr, momentum=0.9, weight_decay=weight_decay, nesterov=False)
-    except TypeError:
-        # Fallback for older Keras versions without `weight_decay` on the optimizer
-        opt = keras.optimizers.SGD(learning_rate=lr, momentum=0.9, nesterov=False)
-
-    # Use integer labels and from_logits=True to avoid one-hot issues
-    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    top1 = keras.metrics.SparseCategoricalAccuracy(name="accuracy")
-
-    model.compile(optimizer=opt, loss=loss, metrics=[top1])
-
-    # Callbacks: early stopping and LR reduction on plateau
-    callbacks = [
-        keras.callbacks.EarlyStopping(monitor="val_accuracy",
-                                      patience=patience,
-                                      restore_best_weights=True,
-                                      verbose=1),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy",
-                                          factor=0.2,
-                                          patience=max(1, patience // 2),
-                                          min_lr=1e-5,
-                                          verbose=1),
-    ]
-
-    print(f"[eval_linear] dataset={dataset} img={image_size} bs={batch_size} epochs={epochs} ckpt={ckpt}")
-    hist = model.fit(ds_train,
-                     validation_data=ds_val,
-                     epochs=epochs,
-                     callbacks=callbacks,
-                     verbose=2)
-
-    # Final evaluation on the held-out test set
-    test_loss, test_acc = model.evaluate(ds_test, verbose=2)
-    print(f"Final eval:\naccuracy: {test_acc:.4f} - loss: {test_loss:.4f}")
-
-
-# ----------------------------- CLI ------------------------------------------------
-def main() -> None:
-    """
-    Script entry point.
-
-    Examples
-    --------
-    python scripts/eval_linear.py --dataset cifar10 --image-size 224 --batch-size 32 \
-        --epochs 50 --patience 20 --ckpt checkpoints_tf/vicreg_tf.weights.h5 --backbone resnet50v2
-    """
-    parser = argparse.ArgumentParser(description="Linear probe on CIFAR with a frozen encoder.")
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
-    parser.add_argument("--image-size", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--base-lr", type=float, default=0.1, help="Base LR scaled by (batch/256).")
-    parser.add_argument("--wd", type=float, default=1e-4, help="Weight decay (L2 reg) for the head.")
-    parser.add_argument("--ckpt", type=str, default="", help="Path to encoder weights (save_weights format).")
-    parser.add_argument("--backbone", type=str, default=DEFAULT_BACKBONE, help="Backbone (e.g., resnet50v2).")
-    # Keep a flag for parity with your previous args; real BN-adapt is via env BN_ADAPT_STEPS
-    parser.add_argument("--bn-adapt-steps", type=int, default=0,
-                        help="Deprecated: use env BN_ADAPT_STEPS instead.")
-
-    args = parser.parse_args()
-
-    # If user still passes --bn-adapt-steps, mirror it into the env for this run
-    if args.bn_adapt_steps and int(os.getenv("BN_ADAPT_STEPS", "0")) == 0:
-        os.environ["BN_ADAPT_STEPS"] = str(args.bn_adapt_steps)
-
-    set_seed(42)
-
-    linear_eval(dataset=args.dataset,
-                image_size=args.image_size,
-                batch_size=args.batch_size,
-                epochs=args.epochs,
-                patience=args.patience,
-                base_lr=args.base_lr,
-                weight_decay=args.wd,
-                ckpt=args.ckpt,
-                backbone=args.backbone)
+        # 6) Persist results
+        out = {
+            "task": "linear_eval",
+            "dataset": args.dataset,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "proj_out": args.proj_out,
+            "proj_layers": args.proj_layers,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "wd": args.wd,
+            "device": device,
+            "test_acc": acc,
+            "train_seconds": dur,
+            "ckpt": args.ckpt,
+        }
+        out_path = os.path.join(args.results_dir, f"linear_eval_{args.dataset}_{int(time.time())}.json")
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"[eval_linear] Test acc: {acc:.4f}  |  wrote {out_path}")
 
 
 if __name__ == "__main__":
