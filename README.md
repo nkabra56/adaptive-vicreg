@@ -5,8 +5,8 @@
 
 This repository contains a practical TensorFlow/Keras implementation of **VICReg** — Variance-Invariance-Covariance Regularization — with two enhancements designed for stability and performance on modest hardware:
 
-1. **Adaptive Variance Targeting (AVT):** replaces the fixed variance floor \(\gamma\) with a data-driven target estimated from an exponential moving average of per-dimension standard deviations (median used for robustness).
-2. **Scale-Invariant Covariance (SICov):** normalizes covariance by its trace and penalizes the Frobenius distance to \((1/d)I\), making the redundancy term less sensitive to global feature scale.
+1. **Adaptive Variance Targeting (AVT):** replaces the fixed variance floor $\gamma$ with a data-driven target estimated from an exponential moving average of per-dimension standard deviations (median used for robustness).
+2. **Scale-Invariant Covariance (SICov):** normalizes covariance by its trace and penalizes the Frobenius distance to $(1/d)I$, making the redundancy term less sensitive to global feature scale.
 
 The codebase includes **self-supervised pretraining**, **linear probing**, and **k-NN evaluation**, along with quality-of-life features (mixed precision, BN adaptation, robust checkpoint loading, and CPU-friendly defaults).
 
@@ -48,9 +48,9 @@ VICReg is a self-supervised learning objective defined over two differently augm
 - **Variance:** per-dimension standard deviation above a floor \(\gamma\) to avoid collapse  
 - **Covariance Decorrelation:** penalize off-diagonal covariance entries to reduce redundancy
 
-Formally for batch features \(z_1, z_2 \in \mathbb{R}^{B\times d}\):  
-- Alignment: \( \mathcal{L}_{\text{align}} = \frac{1}{B} \sum_i \lVert z_{1,i} - z_{2,i} \rVert_2^2 \)  
-- Variance hinge: encourage \(\text{std}(z_{\cdot,j}) \ge \gamma\) per dimension \(j\)  
+Formally for batch features $z_1, z_2 \in \mathbb{R}^{B\times d}$:  
+- Alignment: $\mathcal{L}_{\text{align}} = \frac{1}{B} \sum_i \lVert z_{1,i} - z_{2,i} \rVert_2^2$  
+- Variance hinge: encourage $\text{std}(z_{\cdot,j}) \ge \gamma$ per dimension $j$  
 - Covariance: sum of off-diagonal squared entries of the empirical covariance matrix
 
 This repo keeps the spirit of VICReg and adds **AVT** and **SICov** to reduce manual tuning and make the objective less sensitive to global feature scaling.
@@ -227,11 +227,11 @@ python scripts/knn_eval.py \
 
 ### Losses
 - **VICRegLoss:** alignment + variance hinge with fixed \(\gamma\) + covariance off-diagonal penalty.  
-- **AdaptiveVICRegLoss:** EMA-based \(\gamma_t\) (median of EMA stds, clipped to \([\gamma_{\min}, \gamma_{\max}]\)); **trace-normalized covariance** with Frobenius penalty to \((1/d)I\).  
+- **AdaptiveVICRegLoss:** EMA-based $\gamma_t$ (median of EMA stds, clipped to $[\gamma_{\min}, \gamma_{\max}]$); **trace-normalized covariance** with Frobenius penalty to $(1/d)I$.  
 - Loss returns total plus logs: `align`, `var`, `cov`, and `gamma_t` when adaptive is enabled.
 
 ### Schedules
-- Cosine ramp for \(\lambda\) and \(\nu\) early in training; improves stability and removes brittle warmup tuning.
+- Cosine ramp for $\lambda$ and $\nu$ early in training; improves stability and removes brittle warmup tuning.
 
 ### BN Adaptation
 - After loading a pretrained encoder, a short forward pass on unlabeled data updates BN running stats without touching weights. Improves linear/k-NN performance when eval distribution differs from pretraining.
@@ -291,8 +291,3 @@ For linear probe on CIFAR-10, start with: `--epochs 30`, `--base-lr 0.2`, `--wd 
   }
   ```
 
----
-
-## License
-
-Unless stated otherwise in `LICENSE`, this project is released for academic use. Please cite both the original VICReg paper and this repository if it helps your work.
