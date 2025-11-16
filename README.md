@@ -6,7 +6,7 @@
 This repository contains a practical TensorFlow/Keras implementation of **VICReg** — Variance-Invariance-Covariance Regularization — with two enhancements designed for stability and performance on modest hardware:
 
 1. **Adaptive Variance Targeting (AVT):** replaces the fixed variance floor $\gamma$ with a data-driven target estimated from an exponential moving average of per-dimension standard deviations (median used for robustness).
-2. **Scale-Invariant Covariance (SICov):** normalizes covariance by its trace and penalizes the Frobenius distance to $(1/d)I$, making the redundancy term less sensitive to global feature scale.
+2. **Scale-Invariant Covariance (SICov):** normalizes covariance by its trace and penalizes the Frobenius distance to $(1/d)I$ , making the redundancy term less sensitive to global feature scale.
 
 The codebase includes **self-supervised pretraining**, **linear probing**, and **k-NN evaluation**, along with quality-of-life features (mixed precision, BN adaptation, robust checkpoint loading, and CPU-friendly defaults).
 
@@ -36,7 +36,6 @@ The codebase includes **self-supervised pretraining**, **linear probing**, and *
 9. [Troubleshooting & Gotchas](#troubleshooting--gotchas)  
 10. [Reproducibility Tips](#reproducibility-tips)  
 11. [Citations](#citations)  
-12. [License](#license)  
 
 ---
 
@@ -45,7 +44,7 @@ The codebase includes **self-supervised pretraining**, **linear probing**, and *
 VICReg is a self-supervised learning objective defined over two differently augmented “views” of the same image. It encourages:
 
 - **Invariance (Alignment):** matched features for the two views  
-- **Variance:** per-dimension standard deviation above a floor \(\gamma\) to avoid collapse  
+- **Variance:** per-dimension standard deviation above a floor $\gamma$ to avoid collapse  
 - **Covariance Decorrelation:** penalize off-diagonal covariance entries to reduce redundancy
 
 Formally for batch features $z_1, z_2 \in \mathbb{R}^{B\times d}$:  
@@ -63,13 +62,14 @@ This repo keeps the spirit of VICReg and adds **AVT** and **SICov** to reduce ma
 adaptive-vicreg-tf/
 ├─ scripts/
 │  ├─ train_vicreg.py        # self-supervised pretraining (VICReg + AVT + SICov)
+|  ├─ resume_pretrain.py     # resume training from a previous training run using saved model weights
 │  ├─ eval_linear.py         # linear probe on frozen encoder
+|  ├─ plots.py               # optional diagnostics/visualization utilities
 │  └─ knn_eval.py            # k-NN accuracy using cosine similarity
 ├─ src/                      # (if using the packaged API, optional)
 │  └─ vicreg_tf/             # augmentation, losses, schedules, model helpers
-├─ checkpoints_tf/           # saved weights (e.g., vicreg_tf.weights.h5) or SavedModel dirs
+├─ checkpoints_tf/           # saved weights (e.g., vicreg_tf.weights.h5)
 ├─ artifacts/                # exported encoder SavedModel for evaluation scripts
-├─ plots.py                  # optional diagnostics/visualization utilities
 ├─ requirements.txt
 └─ README.md
 ```
@@ -189,22 +189,20 @@ Extracts features for train and test, L2-normalizes them, and does a cosine-simi
 
 **SavedModel path:**
 ```bash
-python scripts/knn_eval.py \
+python3 scripts/knn_eval.py \
   --dataset cifar10 --image-size 32 \
-  --k 200 --batch-size 512 \
-  --encoder-path artifacts/encoder_savedmodel \
-  --feat-layer pool \
-  --mixed-bf16
+  --batch-size 512 \
+  --k 200 --temperature 0.07 \
+  --ckpt checkpoints_tf/vicreg_tf.weights.h5
 ```
 
 **Keras weights path:**
 ```bash
-python scripts/knn_eval.py \
+python3 scripts/eval_linear.py \
   --dataset cifar10 --image-size 32 \
-  --k 200 --batch-size 512 \
-  --ckpt checkpoints_tf/vicreg_tf.weights.h5 \
-  --feat-layer pool \
-  --mixed-bf16
+  --batch-size 256 --epochs 100 \
+  --lr 0.1 --wd 1e-4 \
+  --ckpt checkpoints_tf/vicreg_tf.weights.h5
 ```
 
 **Notes:**
@@ -224,7 +222,7 @@ python scripts/knn_eval.py \
 - The projector is an MLP: `[Dense (no bias) → BatchNorm → ReLU] × (L-1)` then a linear output layer of dimension `proj_out`.
 
 ### Losses
-- **VICRegLoss:** alignment + variance hinge with fixed \(\gamma\) + covariance off-diagonal penalty.  
+- **VICRegLoss:** alignment + variance hinge with fixed $\gamma$ + covariance off-diagonal penalty.  
 - **AdaptiveVICRegLoss:** EMA-based $\gamma_t$ (median of EMA stds, clipped to $[\gamma_{\min}, \gamma_{\max}]$); **trace-normalized covariance** with Frobenius penalty to $(1/d)I$.  
 - Loss returns total plus logs: `align`, `var`, `cov`, and `gamma_t` when adaptive is enabled.
 
