@@ -196,22 +196,27 @@ def batched_features(model: keras.Model, x: np.ndarray, batch_size: int) -> np.n
 
 # ============================== k-NN (cosine soft voting) ======================
 def knn_predict(train_feats, train_labels, test_feats, k: int, T: float) -> np.ndarray:
-    # Normalize
+    # L2-normalize
     train = train_feats / (np.linalg.norm(train_feats, axis=1, keepdims=True) + 1e-9)
     test = test_feats / (np.linalg.norm(test_feats, axis=1, keepdims=True) + 1e-9)
-    # Cosine similarity
-    sims = test @ train.T  # [Nt, Ntr]
-    # Top-k indices per row
-    idx = np.argpartition(-sims, kth=k-1, axis=1)[:, :k]
-    part = np.take_along_axis(sims, idx, axis=1)  # [Nt, k]
-    weights = np.exp(part / max(T, 1e-6))
-    # Gather labels and vote
-    yk = train_labels[idx]  # [Nt, k]
+
+    # Cosine similarity (Nt x Ntr)
+    sims = test @ train.T
+
+    # Top-k neighbors per test row
+    idx = np.argpartition(-sims, kth=k-1, axis=1)[:, :k]         # (Nt, k)
+    topk = np.take_along_axis(sims, idx, axis=1)                 # (Nt, k)
+    weights = np.exp(topk / max(T, 1e-6))                        # (Nt, k)
+
+    # Labels for those neighbors
+    yk = train_labels[idx]                                       # (Nt, k)
+
+    # Soft voting over classes
     num_classes = int(train_labels.max()) + 1
     votes = np.zeros((test.shape[0], num_classes), dtype=np.float32)
     for c in range(num_classes):
-        votes[:, c] = weights * (yk == c)
-        votes[:, c] = votes[:, c].sum(axis=1)
+        votes[:, c] = (weights * (yk == c)).sum(axis=1)          # <-- sum over k
+
     return votes.argmax(axis=1)
 
 # =================================== CLI ======================================
