@@ -1,0 +1,18 @@
+{
+  "run": "knn-gap_c10_e80_btch370",
+  "dataset": "cifar10",
+  "n_classes": 10,
+  "accuracy": 0.2583,
+  "precision_macro": 0.24982033689038122,
+  "recall_macro": 0.25830000000000003,
+  "f1_macro": 0.24631044648851425,
+  "precision_weighted": 0.24982033689038127,
+  "recall_weighted": 0.2583,
+  "f1_weighted": 0.24631044648851422,
+  "precision_micro": 0.2583,
+  "recall_micro": 0.2583,
+  "f1_micro": 0.2583,
+  "roc_auc_macro_ovr": 0.7288442055555555,
+  "roc_auc_micro_ovr": 0.7366800794444444,
+  "pr_ap_macro": 0.2376070854298827
+}
