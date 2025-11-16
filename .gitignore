@@ -10,3 +10,5 @@ checkpoints_tf/
 artifacts/
 logs/
 results/
+.venv-ngc/
+.config/
