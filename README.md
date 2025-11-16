@@ -1,7 +1,7 @@
 # Adaptive VICReg (TensorFlow/Keras)
 
 **Author:** Nishant Kabra  
-**Date:** 11/10/2025
+**Date:** 11/16/2025
 
 This repository contains a practical TensorFlow/Keras implementation of **VICReg** — Variance-Invariance-Covariance Regularization — with two enhancements designed for stability and performance on modest hardware:
 
