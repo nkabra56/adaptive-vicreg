@@ -3,25 +3,29 @@ k-NN evaluation on top of a frozen encoder trained via (Adaptive) VICReg.
 
 What this script does
 ---------------------
-1) Rebuilds the SAME encoder + projector graph and a minimal
-   VICRegTrainer skeleton (name='vicreg_trainer') to match the object
-   paths used during pretraining. **Builds variables** on dummy data,
-   then loads weights from --ckpt (exact structural match).
-2) Extracts frozen features using either:
-   - feature-layer "feat": Dense(2048, name='feat') output, or
-   - feature-layer "gap": GlobalAveragePooling2D output named 'gap'.
-3) Runs cosine k-NN with temperature T and reports accuracy.
+1) Rebuilds the SAME encoder (and projector skeleton) you used at train time.
+   We **build** variables on dummy data, then load weights from `--ckpt`.
+2) Extracts features from CIFAR train/test using either:
+      --feature-layer feat  (Dense->feat identity; 2048-d)
+      --feature-layer gap   (named 'gap' GlobalAveragePooling2D)
+3) Runs cosine k-NN with temperature scaling (SimCLR-style soft voting).
 
 Typical usage
 -------------
 python3 scripts/knn_eval.py \
   --device cpu \
-  --ckpt checkpoints_tf/pretrain-c10_model1/pretrain_YYYYMMDD-HHMM/vicreg_full.weights.h5 \
+  --ckpt checkpoints_tf/pretrain-c10_model1/pretrain_YYYYMMDD-HHMM/vicreg_encoder.weights.h5 \
   --dataset cifar10 --image-size 32 \
   --batch-size 1024 --k 200 --T 0.07 \
   --feature-layer feat \
-  --proj-out 8192 --proj-layers 3 \
-  --out-dir results --run-name knn-feat --save-probs
+  --out-dir results --run-name knn-feat_c10 --save-probs
+
+Notes
+-----
+- If you pass an encoder-only checkpoint, we load directly into the encoder.
+- If you pass a full-trainer checkpoint, we create a tiny wrapper with
+  sublayers named exactly as in training: 'encoder' and 'proj'.
+- Projector is **not used** for k-NN; it is only there to satisfy loaders.
 
 Author: Nishant Kabra
 Date: 11/16/2025
@@ -30,9 +34,10 @@ from __future__ import annotations
 
 import os
 import argparse
-import numpy as np
+import time
+from typing import Tuple
 
-# -------------------- device BEFORE importing TF --------------------
+# -------- device flag first (to let you pin CPU cleanly) ----------
 _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
 _pre_args, _ = _pre.parse_known_args()
@@ -40,67 +45,19 @@ if _pre_args.device == "cpu":
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
-# -------------------- import TF/Keras --------------------
-import tensorflow as tf  # noqa: E402
-from tensorflow import keras  # noqa: E402
-from tensorflow.keras import layers  # noqa: E402
+import h5py
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
-AUTOTUNE = tf.data.AUTOTUNE
-_PIN_CPU = (_pre_args.device == "cpu")
-
-
-def _gpu_probe() -> bool:
-    try:
-        with tf.device("/GPU:0"):
-            x = tf.random.uniform([1, 16, 16, 3])
-            y = layers.Conv2D(4, 3, padding="same")(x)
-            _ = tf.reduce_sum(y).numpy()
-        print("[knn_eval] GPU probe OK.")
-        return True
-    except Exception as e:
-        print("[knn_eval] GPU probe FAILED:", repr(e))
-        return False
-
-
-if _pre_args.device != "cpu":
-    if _pre_args.device == "gpu":
-        print("[knn_eval] --device gpu requested; not falling back.")
-        _PIN_CPU = False
-    else:
-        _PIN_CPU = not _gpu_probe()
-        if _PIN_CPU:
-            print("[knn_eval] Pinning to CPU due to probe failure.")
-else:
-    print("[knn_eval] Forcing CPU.")
-    _PIN_CPU = True
-
-
-# -------------------- data --------------------
-def load_dataset(name: str, image_size: int):
-    name = name.lower()
-    if name in {"cifar10", "cifar-10"}:
-        (xtr, ytr), (xte, yte) = keras.datasets.cifar10.load_data()
-        n_classes = 10
-    elif name in {"cifar100", "cifar-100"}:
-        (xtr, ytr), (xte, yte) = keras.datasets.cifar100.load_data()
-        n_classes = 100
-    else:
-        raise ValueError("dataset must be cifar10 or cifar100")
-    xtr = tf.image.resize(tf.cast(xtr, tf.float32) / 255.0, (image_size, image_size)).numpy()
-    xte = tf.image.resize(tf.cast(xte, tf.float32) / 255.0, (image_size, image_size)).numpy()
-    ytr = ytr.reshape(-1).astype(np.int32)
-    yte = yte.reshape(-1).astype(np.int32)
-    return (xtr, ytr), (xte, yte), n_classes
-
-
-# -------------------- encoder/projector (match training) --------------------
+# ===================== Model builders (from train_vicreg.py) =====================
 def _named_conv_block(x: tf.Tensor, filters: int, conv_name: str, bn_name: str) -> tf.Tensor:
     """Conv2D -> BatchNorm -> ReLU block with explicit names (stable for loading)."""
     x = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=conv_name)(x)
     x = layers.BatchNormalization(name=bn_name)(x)
     x = layers.ReLU()(x)
     return x
-
 
 def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
     """
@@ -128,13 +85,13 @@ def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
     feat = layers.Lambda(lambda t: t, name="feat")(f)
     return keras.Model(inp, feat, name="encoder")
 
-
 def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
     """
     VICReg projector MLP with 1/2/3 layers and stable names:
       L=1: dense
       L=2: dense -> bn -> relu -> dense_1
       L=3: dense -> bn -> relu -> dense_1 -> bn_1 -> relu -> dense_2
+    Model name is 'proj' to match training runs that used this naming.
     """
     assert num_layers >= 1, "proj-layers must be >= 1"
     inp = keras.Input(shape=(in_dim,), name="proj_in")
@@ -156,127 +113,166 @@ def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
         out = layers.Dense(out_dim, use_bias=False, name="dense_2")(x)
     return keras.Model(inp, out, name="proj")
 
-
+# ============================== Loader helpers =================================
 class VICRegTrainerSkeleton(keras.Model):
-    """Minimal container matching training object paths."""
-    def __init__(self, encoder: keras.Model, projector: keras.Model):
+    """Minimal wrapper so we can load a *full* trainer checkpoint if needed."""
+    def __init__(self, encoder: keras.Model, proj: keras.Model):
         super().__init__(name="vicreg_trainer")
-        self.encoder = encoder
-        self.projector = projector
+        self.encoder = encoder   # must be literally named 'encoder'
+        self.proj = proj         # must be named 'proj' (matches your training)
 
     def call(self, inputs, training=None):
         x1, x2 = inputs
-        f1 = self.encoder(x1, training=training)
-        f2 = self.encoder(x2, training=training)
-        z1 = self.projector(f1, training=training)
-        z2 = self.projector(f2, training=training)
+        f1 = self.encoder(x1, training=False)
+        f2 = self.encoder(x2, training=False)
+        z1 = self.proj(f1, training=False)
+        z2 = self.proj(f2, training=False)
         return z1, z2
 
+def _force_build(encoder: keras.Model, proj: keras.Model, image_size: int):
+    _ = encoder(tf.zeros([1, image_size, image_size, 3], tf.float32), training=False)
+    _ = proj(tf.zeros([1, 2048], tf.float32), training=False)
 
-def load_ckpt_into_skeleton(encoder, projector, ckpt_path: str, image_size: int):
+def _is_encoder_only_h5(path: str) -> bool:
+    """Heuristic: if filename says 'encoder' or H5 lacks any 'proj' group."""
+    if "encoder" in os.path.basename(path):
+        return True
+    try:
+        with h5py.File(path, "r") as f:
+            keys = list(f.keys())
+            # Keras v3 stores nested 'layers/...'; scan text for 'proj'
+            txt = "|".join(keys + ["/".join(f[k].keys()) for k in keys if isinstance(f[k], h5py.Group)])
+            return ("proj" not in txt) and ("projector" not in txt)
+    except Exception:
+        return False
+
+def load_ckpt_flex(encoder: keras.Model, proj: keras.Model, ckpt_path: str, image_size: int):
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(ckpt_path)
-    trainer = VICRegTrainerSkeleton(encoder, projector)
-    # Force variable creation (same as training data shapes)
+    _force_build(encoder, proj, image_size)
+
+    if _is_encoder_only_h5(ckpt_path):
+        print(f"[loader] encoder-only checkpoint → {ckpt_path}")
+        encoder.load_weights(ckpt_path)
+        print("[loader] encoder weights loaded.")
+        return
+
+    print(f"[loader] full-trainer checkpoint → {ckpt_path}")
+    # Build a tiny trainer to let Keras map 'encoder/...' and 'proj/...'
+    trainer = VICRegTrainerSkeleton(encoder, proj)
     dummy = tf.zeros([1, image_size, image_size, 3], tf.float32)
     _ = trainer((dummy, dummy), training=False)
-    print(f"[knn_eval] Loading weights: {ckpt_path}")
-    trainer.load_weights(ckpt_path)
-    print("[knn_eval] Weights loaded into trainer skeleton.")
+    try:
+        trainer.load_weights(ckpt_path)
+        print("[loader] full weights loaded.")
+    except Exception as e:
+        print("[loader] full load failed → fallback to encoder-only:", repr(e))
+        encoder.load_weights(ckpt_path)
+        print("[loader] encoder-only load succeeded.")
 
-
-# -------------------- features & k-NN --------------------
-def build_feature_fn(encoder: keras.Model, feature_layer: str):
-    if feature_layer == "feat":
-        fwd = keras.Model(encoder.input, encoder.output)
-    elif feature_layer == "gap":
-        fwd = keras.Model(encoder.input, encoder.get_layer("gap").output)
+# ============================== Data utilities =================================
+def load_dataset(name: str, image_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    name = name.lower()
+    if name in {"cifar10", "cifar-10"}:
+        (xtr, ytr), (xte, yte) = keras.datasets.cifar10.load_data()
+    elif name in {"cifar100", "cifar-100"}:
+        (xtr, ytr), (xte, yte) = keras.datasets.cifar100.load_data()
     else:
-        raise ValueError("--feature-layer must be 'feat' or 'gap'")
+        raise ValueError("dataset must be cifar10 or cifar100")
+    xtr = tf.image.resize(tf.convert_to_tensor(xtr), [image_size, image_size]).numpy()
+    xte = tf.image.resize(tf.convert_to_tensor(xte), [image_size, image_size]).numpy()
+    xtr = (xtr.astype("float32") / 255.0)
+    xte = (xte.astype("float32") / 255.0)
+    ytr = ytr.astype("int32").squeeze()
+    yte = yte.astype("int32").squeeze()
+    return xtr, ytr, xte, yte
 
-    @tf.function
-    def _feat_fn(x):
-        z = fwd(x, training=False)
-        z = tf.nn.l2_normalize(z, axis=-1)
-        return z
-    return _feat_fn
+def batched_features(model: keras.Model, x: np.ndarray, batch_size: int) -> np.ndarray:
+    ds = tf.data.Dataset.from_tensor_slices(x).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    outs = []
+    for xb in ds:
+        outs.append(model(xb, training=False).numpy())
+    return np.concatenate(outs, axis=0)
 
+# ============================== k-NN (cosine soft voting) ======================
+def knn_predict(train_feats, train_labels, test_feats, k: int, T: float) -> np.ndarray:
+    # Normalize
+    train = train_feats / (np.linalg.norm(train_feats, axis=1, keepdims=True) + 1e-9)
+    test = test_feats / (np.linalg.norm(test_feats, axis=1, keepdims=True) + 1e-9)
+    # Cosine similarity
+    sims = test @ train.T  # [Nt, Ntr]
+    # Top-k indices per row
+    idx = np.argpartition(-sims, kth=k-1, axis=1)[:, :k]
+    part = np.take_along_axis(sims, idx, axis=1)  # [Nt, k]
+    weights = np.exp(part / max(T, 1e-6))
+    # Gather labels and vote
+    yk = train_labels[idx]  # [Nt, k]
+    num_classes = int(train_labels.max()) + 1
+    votes = np.zeros((test.shape[0], num_classes), dtype=np.float32)
+    for c in range(num_classes):
+        votes[:, c] = weights * (yk == c)
+        votes[:, c] = votes[:, c].sum(axis=1)
+    return votes.argmax(axis=1)
 
-def extract_in_batches(x: np.ndarray, batch_size: int, fn):
-    feats = []
-    for i in range(0, len(x), batch_size):
-        xb = x[i:i + batch_size]
-        z = fn(tf.convert_to_tensor(xb, dtype=tf.float32))
-        feats.append(z.numpy())
-    return np.concatenate(feats, axis=0)
-
-
-def knn_predict(train_feats, train_labels, test_feats, k: int, T: float, n_classes: int):
-    preds = np.empty((test_feats.shape[0],), dtype=np.int32)
-    probs = np.empty((test_feats.shape[0], n_classes), dtype=np.float32)
-    train_t = train_feats.T
-    chunk = 2048
-    for i in range(0, test_feats.shape[0], chunk):
-        te = test_feats[i:i + chunk]
-        sims = te @ train_t
-        idx = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
-        topk = np.take_along_axis(sims, idx, axis=1)
-        w = np.exp(topk / float(T))
-        cls = train_labels[idx]
-        out = np.zeros((te.shape[0], n_classes), dtype=np.float32)
-        for b in range(te.shape[0]):
-            np.add.at(out[b], cls[b], w[b])
-        preds[i:i + chunk] = out.argmax(axis=1)
-        probs[i:i + chunk] = out / (out.sum(axis=1, keepdims=True) + 1e-12)
-    return preds, probs
-
-
-# -------------------- CLI --------------------
+# =================================== CLI ======================================
 def parse_args():
     p = argparse.ArgumentParser(parents=[_pre])
     p.add_argument("--ckpt", required=True, type=str)
     p.add_argument("--dataset", type=str, default="cifar10")
     p.add_argument("--image-size", type=int, default=32)
     p.add_argument("--batch-size", type=int, default=1024)
-    p.add_argument("--proj-out", type=int, default=8192)
-    p.add_argument("--proj-layers", type=int, default=3)
-    p.add_argument("--feature-layer", choices=["feat", "gap"], default="feat")
     p.add_argument("--k", type=int, default=200)
     p.add_argument("--T", type=float, default=0.07)
+    p.add_argument("--feature-layer", choices=["feat", "gap"], default="feat")
+    p.add_argument("--proj-out", type=int, default=8192)
+    p.add_argument("--proj-layers", type=int, default=3)
     p.add_argument("--out-dir", type=str, default="results")
     p.add_argument("--run-name", type=str, default="knn")
     p.add_argument("--save-probs", action="store_true")
     return p.parse_args()
 
-
+# ================================== main ======================================
 def main():
     args = parse_args()
+    if _pre_args.device == "cpu":
+        print("[knn_eval] Forcing CPU.")
+    print(f"[knn_eval] Using device {'/CPU:0' if _pre_args.device=='cpu' else 'auto'}")
+
+    # Build models
+    encoder = build_encoder(args.image_size, feat_dim=2048)
+    proj = build_projector(2048, args.proj_out, args.proj_layers)
+
+    # Load weights
+    print(f"[knn_eval] Loading weights: {args.ckpt}")
+    load_ckpt_flex(encoder, proj, args.ckpt, args.image_size)
+
+    # Feature extractors
+    if args.feature_layer == "feat":
+        feat_model = encoder  # output is the 'feat' identity (2048-d)
+    else:
+        # tap the named GAP layer
+        feat_model = keras.Model(encoder.input, encoder.get_layer("gap").output)
+
+    # Data
+    xtr, ytr, xte, yte = load_dataset(args.dataset, args.image_size)
+
+    t0 = time.time()
+    ftr = batched_features(feat_model, xtr, args.batch_size)
+    fte = batched_features(feat_model, xte, args.batch_size)
+    preds = knn_predict(ftr, ytr, fte, k=args.k, T=args.T)
+    acc = float((preds == yte).mean())
+    elapsed = time.time() - t0
+
+    # Save + print
     os.makedirs(args.out_dir, exist_ok=True)
-    device = "/CPU:0" if _PIN_CPU else "/GPU:0"
-    print(f"[knn_eval] Using device {device}")
-
-    (xtr, ytr), (xte, yte), n_classes = load_dataset(args.dataset, args.image_size)
-
-    with tf.device(device):
-        encoder = build_encoder(args.image_size)
-        projector = build_projector(2048, args.proj_out, args.proj_layers)
-        load_ckpt_into_skeleton(encoder, projector, args.ckpt, args.image_size)
-        feat_fn = build_feature_fn(encoder, args.feature_layer)
-        print("[knn_eval] Extracting train features...")
-        ztr = extract_in_batches(xtr, args.batch_size, feat_fn)
-        print("[knn_eval] Extracting test features...")
-        zte = extract_in_batches(xte, args.batch_size, feat_fn)
-
-    print("[knn_eval] Running k-NN...")
-    pred, prob = knn_predict(ztr, ytr, zte, k=args.k, T=args.T, n_classes=n_classes)
-    acc = (pred == yte).mean()
-    print(f"[knn_eval] Done. Acc={acc:.4f}")
-
-    base = os.path.join(args.out_dir, f"knn_{args.run_name}_{args.feature_layer}")
-    np.savez_compressed(base + "_preds.npz", preds=pred, y_true=yte)
+    tag = f"{time.strftime('%Y%m%d-%H%M%S')}__knn-{args.run_name}"
+    np.savez_compressed(os.path.join(args.out_dir, f"{tag}.npz"),
+                        preds=preds, y=yte, k=args.k, T=args.T, acc=acc)
     if args.save_probs:
-        np.savez_compressed(base + "_probs.npz", probs=prob)
-
+        # Optionally save raw features for downstream analysis
+        np.savez_compressed(os.path.join(args.out_dir, f"{tag}_feats.npz"),
+                            train=ftr, test=fte, ytr=ytr, yte=yte)
+    print(f"[knn_eval] Done. Acc={acc:.4f}. Outputs -> {os.path.join(args.out_dir, tag)}  (elapsed {elapsed:.1f}s)")
 
 if __name__ == "__main__":
     main()
