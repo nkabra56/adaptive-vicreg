@@ -1,108 +1,104 @@
 """
-Utility helpers used across the project.
-
-Contents:
-- set_seed():  basic reproducibility for Python + TensorFlow RNG.
-- enable_mixed_precision(): one-liner to turn on mixed_float16 policy.
-- EMA:  tiny exponential moving average over a 1D vector; used to track std.
-- median_1d(): dependency-free median (via sort) for a 1D tensor.
-
-Design goals:
-- Zero external deps; keep tools tiny, explicit, and easily testable.
-
-Author: Nishant Kabra
-Date: 11/8/2025
+General helpers shared by training and evaluation scripts.
 """
 
 from __future__ import annotations
-import random
+import os
 import tensorflow as tf
+from tensorflow import keras
 
-def set_seed(s: int = 42) -> None:
+
+def set_mixed_precision(enable: bool) -> None:
     """
-    Set Python and TensorFlow RNG seeds for reproducibility.
-
-    Note:
-    - This is "good enough" for course projects/ablations.
-    - Perfect determinism across GPUs/CuDNN kernels requires extra flags.
+    Optionally enable mixed_bfloat16. Default is float32 for stability.
 
     Args:
-        s: seed value to apply to Python and TF.
+        enable: True to set mixed_bfloat16, else float32.
     """
-    random.seed(s)            # Python RNG (affects random.* calls)
-    tf.random.set_seed(s)     # TensorFlow RNG (ops that respect TF seeds)
+    try:
+        from tensorflow.keras import mixed_precision as mp
+    except Exception:
+        mp = None
+    if mp is None:
+        print("[utils] Mixed precision is not available in this TF build.")
+        return
+    mp.set_global_policy("mixed_bfloat16" if enable else "float32")
+    print(f"[utils] Global policy set to: {mp.global_policy()}")
 
-def enable_mixed_precision(enabled: bool) -> None:
+
+def print_devices() -> None:
+    """Print visible physical GPU devices for quick sanity checking."""
+    print("[utils] Visible GPUs:", tf.config.list_physical_devices("GPU"))
+
+
+def enable_memory_growth() -> None:
+    """Enable per-GPU memory growth to avoid grabbing all VRAM up front."""
+    try:
+        for gpu in tf.config.list_physical_devices("GPU"):
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception as e:
+        print("[utils] set_memory_growth warning:", repr(e))
+
+
+def gpu_probe_ok() -> bool:
     """
-    Enable mixed precision (float16 compute, float32 variables) if requested.
-
-    Pros:
-    - Reduces memory footprint and often speeds up training on recent GPUs.
-
-    Caveats:
-    - Numerically sensitive ops still run in float32 automatically.
-    - Ensure your GPU supports Tensor Cores (Volta+) for best results.
-
-    Args:
-        enabled: if True, activates policy; otherwise does nothing.
-    """
-    if enabled:
-        tf.keras.mixed_precision.set_global_policy("mixed_float16")
-
-class EMA(tf.Module):
-    """
-    Exponential Moving Average (EMA) for a 1D vector.
-
-    Usage:
-        ema = EMA((256,), beta=0.99)
-        ema.update(new_values)      # one TF op, in-graph friendly
-        current = ema.value         # tf.Variable with the current EMA
-
-    Internals:
-    - `_value` is a non-trainable tf.Variable living under this Module.
-    - We cast inputs to float32 to be robust to mixed precision.
-    """
-    def __init__(self, shape, beta: float = 0.99, name: str = "ema"):
-        super().__init__(name=name)
-        self.beta = tf.constant(beta, dtype=tf.float32)                     # decay factor
-        self._value = tf.Variable(tf.zeros(shape, dtype=tf.float32),        # initial vector
-                                  trainable=False)
-
-    @property
-    def value(self) -> tf.Tensor:
-        """Return the current EMA vector (tf.Variable)."""
-        return self._value
-
-    @tf.function
-    def update(self, x: tf.Tensor) -> None:
-        """
-        Perform: value = beta * value + (1 - beta) * x
-
-        Args:
-            x: new sample (must broadcast to the EMA shape).
-        """
-        x = tf.cast(x, tf.float32)                                          # ensure fp32 math
-        self._value.assign(self.beta * self._value + (1.0 - self.beta) * x) # in-place update
-
-def median_1d(x: tf.Tensor) -> tf.Tensor:
-    """
-    Deterministic 1D median via sort (no TFP dependency).
-
-    Args:
-        x: any shape; we flatten to 1D and cast to float32.
+    Run a tiny Conv2D on /GPU:0 to validate kernels and drivers.
 
     Returns:
-        scalar float32 median.
+        True if a kernel executed on GPU, False otherwise.
     """
-    x = tf.reshape(tf.cast(x, tf.float32), [-1])  # flatten to 1D
-    x_sorted = tf.sort(x)                         # ascending sort
-    n = tf.shape(x_sorted)[0]
-    mid = n // 2                                  # middle index
-    is_odd = tf.equal(n % 2, 1)
-    # If odd:    return middle element
-    # If even:   return average of two middle elements
-    return tf.cond(
-        is_odd,
-        lambda: x_sorted[mid],
-        lambda: 0.5 * (x_sorted[mid - 1] + x_sorted[mid])
-    )
+    try:
+        with tf.device("/GPU:0"):
+            x = tf.random.uniform([1, 16, 16, 3])
+            y = tf.keras.layers.Conv2D(4, 3, padding="same")(x)
+            _ = tf.reduce_sum(y).numpy()
+        print("[utils] GPU probe OK.")
+        return True
+    except Exception as e:
+        print("[utils] GPU probe FAILED:", repr(e))
+        return False
+
+
+def force_build_for_saving(
+    trainer: keras.Model, encoder: keras.Model, projector: keras.Model, image_size: int
+) -> None:
+    """
+    Make sure variables exist so `save_weights` works on subclassed models.
+
+    Args:
+        trainer: VICRegTrainer instance.
+        encoder: Encoder model.
+        projector: Projector model.
+        image_size: Input image size used during build.
+    """
+    _ = encoder(tf.zeros([1, image_size, image_size, 3]), training=False)
+    _ = projector(tf.zeros([1, encoder.output_shape[-1]]), training=False)
+    trainer.built = True  # mark as built for Keras Checkpoint
+    print("[utils] Forced variable creation; trainer.built = True")
+
+
+def safe_load_trainer_weights(trainer: keras.Model, ckpt_path: str) -> None:
+    """
+    Robust loader that first tries full structural match, then falls back.
+
+    Args:
+        trainer: Model wrapper that holds encoder and projector.
+        ckpt_path: Path to `.weights.h5`.
+
+    Behavior:
+        - Exact load first.
+        - If shape/name mismatches occur, try by_name with skip_mismatch=True.
+    """
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    print(f"[utils] Loading weights: {ckpt_path}")
+    try:
+        trainer.load_weights(ckpt_path)
+        print("[utils] Weights loaded (full structural match).")
+        return
+    except Exception as e:
+        print("[utils] Exact load failed; trying partial by_name:", repr(e))
+
+    trainer.load_weights(ckpt_path, by_name=True, skip_mismatch=True)
+    print("[utils] Weights restored by_name with skip_mismatch=True.")

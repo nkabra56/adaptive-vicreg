@@ -1,163 +1,251 @@
 """
-Encoder + projector builder and Keras training model for VICReg.
+Models for VICReg: encoder, projector, and the trainer wrapper.
 
-This module provides:
-  - build_encoder(): backbone with global-average-pool and an MLP projector
-  - VICRegModel: a custom tf.keras.Model that implements train_step for
-    self-supervised learning with VICReg-style losses.
-
-The model is written for Keras 3. Custom args like `loss_layer` are not passed
-to super().__init__, which avoids "Unrecognized keyword arguments" errors.
-
-Author: Nishant Kabra
-Date: 11/8/2025
+The trainer is a subclassed Keras.Model with a custom train_step. It implements
+`get_config()` and `from_config()` to keep Keras 3 quiet when saving, even
+though we typically save **weights only** for this project.
 """
+
 from __future__ import annotations
-
-from typing import Optional, Tuple
+from typing import Dict, Any
 import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from .losses import VICRegWeights, vicreg_total
+from .schedules import AdaptiveTargets, WeightSchedules
 
 
-# -------------------------
-# Backbone + Projector MLP
-# -------------------------
+def _named_conv_block(x: tf.Tensor, filters: int, conv_name: str, bn_name: str) -> tf.Tensor:
+    """Conv2D -> BatchNorm -> ReLU with explicit layer names."""
+    x = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=conv_name)(x)
+    x = layers.BatchNormalization(name=bn_name)(x)
+    x = layers.ReLU()(x)
+    return x
 
-def _build_backbone(name: str, image_size: int) -> tf.keras.Model:
+
+def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
     """
-    Create a convolutional backbone with no classification head.
+    Tiny CIFAR-friendly encoder with stable layer names.
 
     Args:
-        name: one of {"resnet50", "resnet50v2", "mobilenetv2"}
-        image_size: input side length (square)
+        image_size: Input height/width.
+        feat_dim: Final feature width before the projector.
 
     Returns:
-        Keras Model that maps [B, H, W, 3] -> [B, H', W', C]
+        Keras Model mapping images -> feature vectors.
     """
-    input_shape = (image_size, image_size, 3)
-    if name == "resnet50":
-        base = tf.keras.applications.ResNet50(
-            include_top=False, weights=None, input_shape=input_shape
-        )
-    elif name == "resnet50v2":
-        base = tf.keras.applications.ResNet50V2(
-            include_top=False, weights=None, input_shape=input_shape
-        )
-    elif name == "mobilenetv2":
-        base = tf.keras.applications.MobileNetV2(
-            include_top=False, weights=None, input_shape=input_shape
-        )
+    inp = layers.Input(shape=(image_size, image_size, 3), name="image")
+    x = _named_conv_block(inp, 64,  "conv2d",   "batch_normalization")
+    x = _named_conv_block(x,   64,  "conv2d_1", "batch_normalization_1")
+    x = layers.MaxPool2D()(x)
+
+    x = _named_conv_block(x,   128, "conv2d_2", "batch_normalization_2")
+    x = _named_conv_block(x,   128, "conv2d_3", "batch_normalization_3")
+    x = layers.MaxPool2D()(x)
+
+    x = _named_conv_block(x,   256, "conv2d_4", "batch_normalization_4")
+    x = _named_conv_block(x,   256, "conv2d_5", "batch_normalization_5")
+    x = _named_conv_block(x,   256, "conv2d_6", "batch_normalization_6")
+
+    gap = layers.GlobalAveragePooling2D(name="gap")(x)
+    f = layers.Dense(feat_dim, use_bias=True, name="dense")(gap)
+    feat = layers.Lambda(lambda t: t, name="feat")(f)  # identity to expose name
+    return keras.Model(inp, feat, name="encoder")
+
+
+def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
+    """
+    MLP projector with fixed, evaluation-friendly names.
+
+    Args:
+        in_dim: Input width (encoder feature dim).
+        out_dim: Projection width.
+        num_layers: 1, 2, or 3 layers.
+
+    Returns:
+        Keras Model mapping features -> projections.
+    """
+    assert num_layers >= 1, "proj-layers must be >= 1"
+    inp = keras.Input(shape=(in_dim,), name="proj_in")
+    x = inp
+    if num_layers <= 1:
+        out = layers.Dense(out_dim, use_bias=False, name="dense")(x)
+    elif num_layers == 2:
+        x = layers.Dense(out_dim, use_bias=False, name="dense")(x)
+        x = layers.BatchNormalization(name="batch_normalization")(x)
+        x = layers.ReLU()(x)
+        out = layers.Dense(out_dim, use_bias=False, name="dense_1")(x)
     else:
-        raise ValueError(f"Unknown backbone: {name}")
-    return base
+        x = layers.Dense(out_dim, use_bias=False, name="dense")(x)
+        x = layers.BatchNormalization(name="batch_normalization")(x)
+        x = layers.ReLU()(x)
+        x = layers.Dense(out_dim, use_bias=False, name="dense_1")(x)
+        x = layers.BatchNormalization(name="batch_normalization_1")(x)
+        x = layers.ReLU()(x)
+        out = layers.Dense(out_dim, use_bias=False, name="dense_2")(x)
+    return keras.Model(inp, out, name="proj")
 
 
-def build_encoder(
-    backbone: str = "resnet50v2",
-    image_size: int = 32,
-    proj_hidden: int = 2048,
-    proj_out: int = 2048,
-    proj_layers: int = 2,
-) -> tf.keras.Model:
+class VICRegTrainer(keras.Model):
     """
-    Build an encoder that outputs projector features z of size proj_out.
+    Wrap encoder + projector and implement a custom train_step.
 
-    Architecture:
-      input -> Backbone(include_top=False) -> GlobalAveragePooling("feat_pool")
-            -> [Dense(no bias)->BatchNorm->ReLU] x (proj_layers - 1)
-            -> Dense(no bias, units=proj_out, name="projector_out")
-
-    Returns:
-        Keras Model mapping image -> z
-        The model contains a named pooling layer "feat_pool" that can be used
-        later for linear probing if you load the Keras model.
+    Notes
+    -----
+    - We only save **weights** in this project. `get_config` exists to avoid
+      Keras warnings and to record training hyperparameters in checkpoints.
+    - `encoder` and `projector` are held as submodules and are not serialized
+      by config; their weights are part of `save_weights`.
     """
-    inputs = tf.keras.Input(shape=(image_size, image_size, 3))
-    base = _build_backbone(backbone, image_size)
-    x = base(inputs, training=False)  # backbone frozen behavior is controlled by train_step
-    x = tf.keras.layers.GlobalAveragePooling2D(name="feat_pool")(x)
-
-    # Projector MLP
-    for i in range(max(0, proj_layers - 1)):
-        x = tf.keras.layers.Dense(proj_hidden, use_bias=False, name=f"proj_dense_{i}")(x)
-        x = tf.keras.layers.BatchNormalization(name=f"proj_bn_{i}")(x)
-        x = tf.keras.layers.Activation("relu", name=f"proj_relu_{i}")(x)
-
-    z = tf.keras.layers.Dense(proj_out, use_bias=False, name="projector_out")(x)
-    model = tf.keras.Model(inputs=inputs, outputs=z, name="encoder_projector")
-    return model
-
-
-# ---------------
-# Training model
-# ---------------
-
-class VICRegModel(tf.keras.Model):
-    """
-    Keras Model wrapper that:
-      - holds an `encoder` (backbone + projector)
-      - holds a `loss_layer` (VICRegLoss or AdaptiveVICRegLoss)
-      - implements train_step on two-view self-supervised batches
-
-    Inputs from the dataset should be of the form:
-      ((view1, view2), dummy_label)
-    where each view is shaped [B, H, W, 3] float32.
-    """
+    
     def __init__(
         self,
-        encoder: tf.keras.Model,
-        loss_layer: tf.keras.layers.Layer,
-        use_schedules: bool = True,
-        name: str = "vicreg_model",
+        encoder: keras.Model,
+        projector: keras.Model,
+        w0: VICRegWeights = VICRegWeights(sim=25.0, var=25.0, cov=1.0),
+        adaptive: bool = False,
+        use_schedules: bool = False,
+        steps_per_epoch: int = 1000,
+        epochs: int = 100,
+        base_lr: float = 0.1,
+        base_wd: float = 1e-6,
         **kwargs,
     ):
-        # Do NOT pass custom args to super().__init__
-        super().__init__(name=name, **kwargs)
+        super().__init__(**kwargs)
         self.encoder = encoder
-        self.loss_layer = loss_layer
+        self.projector = projector
+        self.adaptive = bool(adaptive)
         self.use_schedules = bool(use_schedules)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.total_steps = int(steps_per_epoch) * int(epochs)
 
-        # Simple scalars for optional scheduling (ramp from 0 -> 1)
-        # If you want to wire a cosine schedule, you can update these from a callback.
-        self.lambda_scale = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="lambda_scale")
-        self.nu_scale = tf.Variable(1.0, trainable=False, dtype=tf.float32, name="nu_scale")
+        # --- schedules / targets
+        self.schedules = WeightSchedules(
+            w0=w0,
+            use=self.use_schedules,
+            base_lr=float(base_lr),
+            base_wd=float(base_wd),
+            total_steps=self.total_steps,
+        )
+        self.targets = AdaptiveTargets(use=self.adaptive)
+
+        # book-keeping
+        self.curr_step = tf.Variable(0, dtype=tf.int64, trainable=False)
+
+        # metrics that I expose to the Keras logs
+        self.loss_tracker = keras.metrics.Mean(name="loss")
+        self.align_tracker = keras.metrics.Mean(name="l_align")
+        self.var_tracker = keras.metrics.Mean(name="l_var")
+        self.cov_tracker = keras.metrics.Mean(name="l_cov")
+
+
+    # ---- Keras bookkeeping ----
+    @property
+    def metrics(self):
+        # Keras 3 will reset and log these automatically each epoch/step.
+        return [self.loss_tracker, self.align_tracker, self.var_tracker, self.cov_tracker]
+    
+    def get_config(self) -> Dict[str, Any]:
+        """
+        Return a JSON-serializable dict describing training hyperparameters.
+
+        This avoids the Keras warning about non-serializable __init__ args and
+        helps future runs verify that the trainer was built with the expected
+        settings. Submodels are intentionally omitted from the config.
+        """
+        return {
+            "w0": {"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov},
+            "adaptive": self.adaptive,
+            "use_schedules": isinstance(self.schedules, WeightSchedules),
+            "total_steps": int(self.total_steps),
+            "bn_freeze_steps": int(self.bn_freeze_steps),
+            "base_lr": float(self.schedules.base_lr),
+            "base_wd": float(self.schedules.base_wd),
+        }
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "VICRegTrainer":
+        """
+        Recreate with placeholder submodules.
+
+        The encoder and projector must be set by the caller before use. This is
+        sufficient for our use case because we always rebuild modules and then
+        call `load_weights`.
+        """
+        # Build minimal placeholders; caller should replace them.
+        dummy_in = keras.Input(shape=(32, 32, 3))
+        enc = keras.Model(dummy_in, dummy_in, name="encoder_placeholder")
+        prj = keras.Model(keras.Input(shape=(32, 32, 3)), keras.Input(shape=(32, 32, 3)), name="proj_placeholder")
+        w = VICRegWeights(**config.get("w0", {"sim": 25.0, "var": 25.0, "cov": 1.0}))
+        return cls(
+            encoder=enc,
+            projector=prj,
+            w0=w,
+            adaptive=config.get("adaptive", False),
+            use_schedules=config.get("use_schedules", False),
+            steps_per_epoch=max(1, config.get("total_steps", 1)),
+            epochs=1,
+            base_lr=config.get("base_lr", 0.001),
+            base_wd=config.get("base_wd", 0.0),
+            bn_freeze_steps=config.get("bn_freeze_steps", 0),
+        )
+
+    # ---- Forward + train step ----
+    def call(self, inputs, training=None):
+        """
+        Forward pass for two-view batches.
+
+        Args:
+            inputs: Tuple (x1, x2) of augmented image batches.
+            training: Whether to run in training mode.
+
+        Returns:
+            Tuple (z1, z2) of projected features.
+        """
+        x1, x2 = inputs
+        # Optionally "freeze" BN updates for a warm start
+        bn_train = (self.curr_step >= self.bn_freeze_steps)
+        f1 = self.encoder(x1, training=bn_train if training is None else training)
+        f2 = self.encoder(x2, training=bn_train if training is None else training)
+        z1 = self.projector(f1, training=training)
+        z2 = self.projector(f2, training=training)
+        return z1, z2
 
     def train_step(self, data):
-        # Unpack ((view1, view2), _)
-        (v1, v2), _ = data
+        # Expect two augmented views (x1, x2)
+        (x1, x2) = data if isinstance(data, (tuple, list)) else (data, data)
 
         with tf.GradientTape() as tape:
-            z1 = self.encoder(v1, training=True)
-            z2 = self.encoder(v2, training=True)
+            h1 = self.encoder(x1, training=True)
+            h2 = self.encoder(x2, training=True)
+            z1 = self.projector(h1, training=True)
+            z2 = self.projector(h2, training=True)
 
-            total_loss, logs = self.loss_layer(
-                [z1, z2],
-                lambda_scale=self.lambda_scale,
-                nu_scale=self.nu_scale,
-                training=True,
-            )
+            # progress fraction in [0,1] as a Tensor (works in graph mode)
+            frac = tf.cast(self.curr_step, tf.float32) / tf.cast(self.total_steps, tf.float32)
 
-        grads = tape.gradient(total_loss, self.encoder.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.encoder.trainable_variables))
+            # weights + adaptive targets (gamma/nu may be Tensors)
+            w = self.schedules.weights(frac)                  # dict with sim/var/cov
+            gamma = self.targets.gamma(frac) if self.adaptive else tf.constant(1.0, tf.float32)
+            nu    = self.targets.nu(frac)    if self.adaptive else tf.constant(0.0, tf.float32)
 
-        # Keras will log anything returned in this dict
-        out_logs = {"loss": total_loss}
-        # Make sure values are tensors
-        for k, v in logs.items():
-            out_logs[k] = tf.convert_to_tensor(v)
-        return out_logs
+            total, parts = vicreg_total(z1, z2, w, gamma=gamma, nu=nu)
 
-    def call(self, inputs, training: Optional[bool] = None):
-        # Pass-through for inference: encode a single view
-        return self.encoder(inputs, training=training)
-    
-    def build(self, input_shape=None):
-        """Mark the model as built without touching shapes.
+        grads = tape.gradient(total, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-        We create variables during the first forward call elsewhere.
-        Keeping this no-op avoids fragile shape parsing.
-        """
-        try:
-            super().build(input_shape)
-        except TypeError:
-            # Some Keras internals may pass an int; ignore and mark built.
-            super().build(None)
+        # update trackers
+        self.loss_tracker.update_state(total)
+        self.align_tracker.update_state(parts["l_align"])
+        self.var_tracker.update_state(parts["l_var"])
+        self.cov_tracker.update_state(parts["l_cov"])
+
+        # step++
+        self.curr_step.assign_add(1)
+
+        return {
+            "loss": self.loss_tracker.result(),
+            "l_align": self.align_tracker.result(),
+            "l_var": self.var_tracker.result(),
+            "l_cov": self.cov_tracker.result(),
+        }

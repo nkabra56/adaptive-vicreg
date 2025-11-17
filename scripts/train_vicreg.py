@@ -1,554 +1,615 @@
 """
-VICReg / Adaptive VICReg trainer (TensorFlow + Keras)
+Script Title: VICReg / Adaptive VICReg Pretraining (TensorFlow + Keras)
 
-Overview
---------
-- Decides device BEFORE importing TensorFlow:
-    --device cpu  -> disables GPU entirely (sets CUDA_VISIBLE_DEVICES="")
-    --device gpu  -> forces GPU, errors if kernels aren't compatible
-    --device auto -> tries a tiny GPU probe; on failure, pins training to CPU
+What this script does
+---------------------
+Builds an encoder and a projector, wraps them in a subclassed Keras Model
+(`VICRegTrainer`) that implements the VICReg loss (invariance/variance/
+covariance), and trains with `model.fit`. The script writes:
+  • `vicreg_full.weights.h5`    (trainer weights: encoder + projector)
+  • `vicreg_encoder.weights.h5` (encoder-only weights for downstream eval)
+  • `train_config.json`         (training configuration snapshot)
+  • `metrics/history.jsonl`     (per-epoch JSONL records for plots/tables)
 
-- If GPU probe fails (common on very new GPUs with older TF builds), we DO NOT
-  try to "hide" GPUs after TF has initialized. Instead we place the whole
-  model/training under tf.device('/CPU:0') so the run proceeds reliably.
+It also attaches a metrics-logging callback that:
+  • computes average embedding standard deviation (variance control),
+  • computes mean squared off-diagonal correlation (redundancy control),
+  • picks up loss component scalars (if your trainer exposes them as Keras metrics),
+  • appends everything to `<run_dir>/metrics/history.jsonl`.
 
-- Loss is computed in float32 internally (safe if you later turn on bf16), and
-  all schedules are implemented in pure Python (no .numpy()) so they work in
-  graph mode.
+Typical usage
+-------------
+python3 scripts/train_vicreg.py \
+  --dataset cifar10 \
+  --image-size 32 \
+  --epochs 100 \
+  --batch-size 256 \
+  --feat-dim 2048 \
+  --proj-out 8192 \
+  --proj-layers 3 \
+  --lr 0.1 \
+  --wd 1e-6 \
+  --adaptive \
+  --use-schedules \
+  --model-dir checkpoints_tf \
+  --run-name pretrain-c10_model6_e100 \
+  --device auto
 
-- IMPORTANT: We *force-build* the sublayers and mark the subclassed Keras Model
-  as built (trainer.built = True) before training so ModelCheckpoint with
-  save_weights_only=True will work.
-
-What you get
-------------
-- The classic Keras `.fit()` progress bar (per-batch, per-epoch) you asked for.
-- Stable, evaluation-friendly layer names:
-  encoder: conv2d, conv2d_1, ..., gap, dense, feat
-  proj   : dense, batch_normalization, dense_1, batch_normalization_1, dense_2
-- Flexible output:
-  * --ckpt-out  : write a single full-model weights file here (plus encoder-only)
-  * --model-dir : otherwise, create a timestamped run folder (optionally --run-name)
+Notes
+-----
+• Use `--device cpu` if CUDA kernels are unavailable; `auto` will probe GPU
+  once and fall back to CPU if needed.
+• We save **weights only**. The subclassed trainer should implement `get_config()`
+  to silence Keras’ non-serializable args warning. If you still see the warning,
+  add a minimal `get_config()` to your trainer and projector (see `vicreg_tf.model`).
+• The encoder exposes a named `feat` tensor; downstream eval scripts load
+  `vicreg_encoder.weights.h5` and use that `feat` vector.
+• Metrics logger records the internal stats for your plots in `report_metrics.py`.
+  If your trainer doesn’t add `l_align`, `l_var`, `l_cov` to logs, the callback
+  still records embedding stats; add:
+      self.add_metric(l_align, name="l_align", aggregation="mean")
+      self.add_metric(l_var,   name="l_var",   aggregation="mean")
+      self.add_metric(l_cov,   name="l_cov",   aggregation="mean")
+  inside your trainer’s `train_step` to get the loss curves too.
 
 Author: Nishant Kabra
-Date: 11/15/2025
+Date: 11/16/2025
 """
 from __future__ import annotations
 
-import os
-import math
-import json
+# --- Make sure local package "vicreg_tf" (under <repo>/src) is importable. -----
+from pathlib import Path
+import sys
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]   # <repo>
+_SRC_DIR = _REPO_ROOT / "src"                      # <repo>/src
+
+# Prepend to sys.path so your local code wins over any installed modules.
+if not _SRC_DIR.exists():
+    raise RuntimeError(f"Could not find expected source directory: {_SRC_DIR}")
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+# ------------------------------------------------------------------------------
+
 import argparse
 import datetime as _dt
-from dataclasses import dataclass
-from typing import Tuple
+import json
+import os
+import typing as _t
+import numpy as np
 
-# -----------------------------------------------------------------------------
-# 1) Parse only the device flag BEFORE importing TensorFlow
-# -----------------------------------------------------------------------------
+import tensorflow as tf
+from tensorflow import keras
+
+from vicreg_tf import (
+    VICRegTrainer,
+    VICRegWeights,
+    build_dataset,
+    build_encoder,
+    build_projector,
+    force_build_for_saving,
+    gpu_probe_ok,
+    print_devices,
+    set_mixed_precision,
+    steps_for_dataset,
+    enable_memory_growth,
+)
+
+# ------------------------------------------------------------------------------
+# Metrics helpers imported from my vicreg_tf.report_metrics module.
+# If I move the functions, I will update these imports accordingly.
+# ------------------------------------------------------------------------------
+from vicreg_tf import report_metrics as rm
+
+# ------------------------------------------------------------------------------
+# Cosine schedules are taken from my vicreg_tf.schedules module.
+# I apply them per step using a lightweight callback below.
+# ------------------------------------------------------------------------------
+from vicreg_tf import schedules as sched
+
+
+class VicRegMetricsLogger(keras.callbacks.Callback):
+    """
+    Logs VICReg / Adaptive-VICReg internal metrics during training.
+
+    Purpose
+    -------
+    On each epoch end (optionally every N epochs), this callback:
+      • reads loss components from Keras logs (if trainer exposes them),
+      • computes embedding statistics on a fixed probe batch:
+           - stats/avg_std: average standard deviation across embedding dims
+           - stats/avg_offdiag_corr_sq: mean squared off-diagonal correlation
+      • appends a JSON object to `<run_dir>/metrics/history.jsonl`.
+
+    Parameters
+    ----------
+    run_dir : str
+        The run folder created by this script (contains weights + config).
+        I create `<run_dir>/metrics/history.jsonl` to store per-epoch rows.
+    encoder : tf.keras.Model
+        My backbone encoder. Used to compute features on the probe batch.
+    projector : tf.keras.Model or None
+        My projection head. If `compute_on='projector'`, embeddings are
+        computed as `projector(encoder(x))`; else they are `encoder(x)`.
+    sample_images : tf.Tensor
+        A small single-view batch `[N, H, W, C]` used only for metrics.
+        I keep N modest (e.g., 256) so this callback is cheap.
+    compute_on : {'encoder','projector'}
+        Where to compute the stats. 'projector' is recommended for variance/cov.
+    loss_keys : dict[str, str]
+        Mapping from pretty names to keys in `logs` (Keras on_epoch_end logs).
+        Defaults: {'total':'loss','align':'l_align','var':'l_var','cov':'l_cov'}.
+    record_every : int
+        Record every N epochs. Use >1 to reduce overhead if needed.
+    """
+
+    def __init__(
+        self,
+        run_dir: str,
+        encoder: tf.keras.Model,
+        projector: tf.keras.Model | None,
+        sample_images: tf.Tensor | None,
+        compute_on: str = "projector",
+        loss_keys: dict[str, str] | None = None,
+        record_every: int = 1,
+    ) -> None:
+        super().__init__()
+        self.run_dir = run_dir
+        self.encoder = encoder
+        self.projector = projector
+        self.sample_images = sample_images
+        self.compute_on = compute_on
+        self.loss_keys = loss_keys or {
+            "total": "loss",
+            "align": "l_align",
+            "var": "l_var",
+            "cov": "l_cov",
+        }
+        self.record_every = int(record_every)
+
+        # Ensure metrics directory exists and pick the history file path
+        self.metrics_dir = os.path.join(self.run_dir, "metrics")
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        self.history_path = os.path.join(self.metrics_dir, "history.jsonl")
+
+    def _get_embeddings(self, x: tf.Tensor) -> tf.Tensor:
+        """Compute embeddings on the chosen stage without gradient tracking."""
+        z = self.encoder(x, training=False)  # encoder forward pass
+        if self.compute_on == "projector" and self.projector is not None:
+            z = self.projector(z, training=False)  # projector forward pass
+        return z
+
+    def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
+        """Collect metrics at epoch end and append to the JSONL file.
+
+        I use helpers in `vicreg_tf.report_metrics`:
+          - stats/avg_std:              rm.compute_embedding_avg_std(z)
+          - stats/avg_offdiag_corr_sq:  rm.compute_avg_offdiag_corr_sq(z)
+        """
+        logs = logs or {}
+
+        # Respect record_every to reduce overhead if requested
+        if (epoch + 1) % self.record_every != 0:
+            return
+
+        record: dict[str, float | int] = {"epoch": int(epoch + 1)}
+
+        # 1) Copy loss components from Keras logs if present
+        for pretty, key in self.loss_keys.items():
+            if key in logs and logs[key] is not None:
+                try:
+                    record[f"loss/{pretty}"] = float(logs[key])
+                except Exception:
+                    pass
+
+        # 2) Embedding-level statistics on the fixed probe batch
+        if getattr(self, "sample_images", None) is not None:
+            x = self.sample_images
+            z = self._get_embeddings(x)
+
+            try:
+                avg_std_raw = rm.compute_embedding_avg_std(z)
+                avg_std = float(avg_std_raw.numpy() if hasattr(avg_std_raw, "numpy") else float(avg_std_raw))
+                record["stats/avg_std"] = avg_std
+            except Exception:
+                record["stats/avg_std"] = float("nan")
+
+            try:
+                avg_corr_sq_raw = rm.compute_avg_offdiag_corr_sq(z)
+                avg_corr_sq = float(avg_corr_sq_raw.numpy() if hasattr(avg_corr_sq_raw, "numpy") else float(avg_corr_sq))
+                record["stats/avg_offdiag_corr_sq"] = avg_corr_sq
+            except Exception:
+                record["stats/avg_offdiag_corr_sq"] = float("nan")
+
+        # 3) Append one JSON object per line to the history file
+        with open(self.history_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
+class CosineScheduleCallback(keras.callbacks.Callback):
+    """
+    Per-step cosine scheduling for my optimizer using `vicreg_tf.schedules`.
+
+    What I scale
+    ------------
+    • optimizer.learning_rate  := base_lr * cosine_scaler(step, total_steps)
+    • optimizer.weight_decay   := base_wd * cosine_scaler(step, total_steps)  (if optimizer exposes it)
+
+    How I count steps
+    -----------------
+    I count optimizer steps inside `on_train_batch_begin`. Total steps is
+    `steps_per_epoch * epochs`, so the schedule spans the entire run.
+
+    Notes
+    -----
+    • This uses the same math as my `vicreg_tf.schedules.cosine_scaler`.
+    • If my optimizer does not have a `weight_decay` attribute (e.g., plain Adam),
+      only the learning rate is scaled.
+    """
+
+    def __init__(
+        self,
+        optimizer: keras.optimizers.Optimizer,
+        total_steps: int,
+        base_lr: float,
+        base_wd: float | None,
+        verbose: int = 1,
+    ) -> None:
+        super().__init__()
+        self.opt = optimizer
+        self.total_steps = int(total_steps)
+        self.base_lr = float(base_lr)
+        self.base_wd = None if base_wd is None else float(base_wd)
+        self.verbose = int(verbose)
+        self._step = 0
+        if self.total_steps <= 0:
+            raise ValueError("total_steps must be a positive integer")
+        if self.verbose:
+            print(f"[schedules] total_steps={self.total_steps} base_lr={self.base_lr} base_wd={self.base_wd}")
+
+    def on_train_batch_begin(self, batch: int, logs: dict | None = None) -> None:
+        # Convert to a clamped global step in [0, total_steps]
+        step = min(self._step, self.total_steps)
+        scale = float(sched.cosine_scaler(step=step, total_steps=self.total_steps))
+
+        # Scale learning rate (prefer assign if it's a tf.Variable)
+        lr = self.base_lr * scale
+        try:
+            self.opt.learning_rate.assign(lr)
+        except Exception:
+            self.opt.learning_rate = lr
+
+        # Scale weight decay if the optimizer exposes it
+        if self.base_wd is not None and hasattr(self.opt, "weight_decay"):
+            wd = self.base_wd * scale
+            try:
+                self.opt.weight_decay.assign(wd)
+            except Exception:
+                try:
+                    self.opt.weight_decay = wd
+                except Exception:
+                    pass
+
+        self._step += 1
+
+    def on_epoch_begin(self, epoch: int, logs: dict | None = None) -> None:
+        if not self.verbose:
+            return
+        try:
+            cur_lr = float(tf.keras.backend.get_value(self.opt.learning_rate))
+        except Exception:
+            cur_lr = float(self.opt.learning_rate)
+        msg = f"[schedules] epoch {epoch+1:03d} | lr={cur_lr:.6f}"
+        if self.base_wd is not None and hasattr(self.opt, "weight_decay"):
+            try:
+                cur_wd = float(tf.keras.backend.get_value(self.opt.weight_decay))
+            except Exception:
+                cur_wd = float(self.opt.weight_decay)
+            msg += f" wd={cur_wd:.6f}"
+        print(msg)
+
+
+# ------------------------------------------------------------------------------
+# Early parse for device flag (so I can set CUDA visibility prior to TF init).
+# ------------------------------------------------------------------------------
 _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument(
-    "--device", choices=["auto", "gpu", "cpu"], default="auto",
-    help="Device placement: auto|gpu|cpu (default: auto)"
+    "--device",
+    choices=["auto", "gpu", "cpu"],
+    default="auto",
+    help="Device placement: try GPU, force GPU, or force CPU.",
 )
 _pre_args, _ = _pre.parse_known_args()
 
-# If user forced CPU, hide GPUs before TF import so TF never touches CUDA
+# Hide GPUs if I explicitly asked for CPU (must be set before TF loads).
 if _pre_args.device == "cpu":
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-# Reduce TF info spam a little (set 0 for full logs)
+# Reduce TF logging noise unless there is an error.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
-# -----------------------------------------------------------------------------
-# 2) Now import TensorFlow & friends
-# -----------------------------------------------------------------------------
-import tensorflow as tf  # noqa: E402
-from tensorflow import keras  # noqa: E402
-from tensorflow.keras import layers  # noqa: E402
 
-AUTOTUNE = tf.data.AUTOTUNE
-
-# Global flag: if True, we wrap build/fit inside CPU device scope
-PIN_CPU = (_pre_args.device == "cpu")
-
-
-def _print_devices() -> None:
-    """Log visible physical GPU devices (or empty on CPU-only)."""
-    gpus = tf.config.list_physical_devices("GPU")
-    print(f"[train_vicreg] Visible GPUs: {gpus}")
-
-
-def _enable_memory_growth() -> None:
-    """Enable per-GPU memory growth to avoid pre-allocating all VRAM."""
-    try:
-        for gpu in tf.config.list_physical_devices("GPU"):
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except Exception as e:
-        print("[train_vicreg] set_memory_growth warning:", repr(e))
-
-
-def _gpu_probe() -> bool:
-    """
-    Run a tiny Conv2D once on /GPU:0 to validate kernels/driver.
-    Returns True if OK, else False (invalid PTX / mismatch etc.).
-    """
-    try:
-        with tf.device("/GPU:0"):
-            x = tf.random.uniform([1, 16, 16, 3])
-            y = layers.Conv2D(4, 3, padding="same")(x)
-            _ = tf.reduce_sum(y).numpy()  # materialize a kernel launch
-        print("[train_vicreg] GPU probe OK.")
-        return True
-    except Exception as e:
-        print("[train_vicreg] GPU probe FAILED:", repr(e))
-        return False
-
-
-# Decide device policy now
-if _pre_args.device != "cpu":
-    _print_devices()
-    _enable_memory_growth()
-    if _pre_args.device == "gpu":
-        # Force GPU usage; if it fails later, it will error out (by request)
-        print("[train_vicreg] --device gpu requested; not falling back.")
-        PIN_CPU = False
-    else:
-        # auto: try GPU once, otherwise pin CPU
-        PIN_CPU = not _gpu_probe()
-        if PIN_CPU:
-            print("[train_vicreg] Pinning to CPU due to probe failure.")
-else:
-    print("[train_vicreg] --device cpu -> GPU disabled before TF import.")
-    PIN_CPU = True
-
-
-# -----------------------------------------------------------------------------
-# Mixed precision helper (kept OFF by default for stability)
-# -----------------------------------------------------------------------------
-def set_mixed_precision(enable: bool) -> None:
-    """
-    Optionally enable mixed_bfloat16; OFF by default to avoid dtype mismatches.
-    """
-    try:
-        from tensorflow.keras import mixed_precision as mp
-    except Exception:
-        mp = None
-    if mp is None:
-        print("[train_vicreg] Mixed precision not available in this TF build.")
-        return
-    mp.set_global_policy("mixed_bfloat16" if enable else "float32")
-    print(f"[train_vicreg] Policy set to: {mp.global_policy()}")
-
-
-# -----------------------------------------------------------------------------
-# Data pipeline (CIFAR-10/100 with two-view augmentation)
-# -----------------------------------------------------------------------------
-def steps_for_dataset(name: str, batch_size: int) -> Tuple[int, int]:
-    """Return (num_train_images, steps_per_epoch) for the dataset."""
-    name = name.lower()
-    if name in {"cifar10", "cifar-10"}:
-        n = 50_000
-    elif name in {"cifar100", "cifar-100"}:
-        n = 50_000
-    else:
-        raise ValueError(f"Unsupported dataset '{name}'. Use cifar10 or cifar100.")
-    return n, max(1, n // batch_size)
-
-
-def color_jitter(x: tf.Tensor, s: float = 0.5) -> tf.Tensor:
-    """Light color jitter: brightness, contrast, saturation; clip to [0,1]."""
-    x = tf.image.random_brightness(x, max_delta=0.8 * s)
-    x = tf.image.random_contrast(x, lower=1 - 0.8 * s, upper=1 + 0.8 * s)
-    x = tf.image.random_saturation(x, lower=1 - 0.8 * s, upper=1 + 0.8 * s)
-    return tf.clip_by_value(x, 0.0, 1.0)
-
-
-def random_augment(image: tf.Tensor, image_size: int) -> tf.Tensor:
-    """Basic SSL-style spatial + color augmentation for a single view."""
-    image = tf.image.convert_image_dtype(image, tf.float32)
-    image = tf.image.resize_with_crop_or_pad(image, image_size + 8, image_size + 8)
-    image = tf.image.random_crop(image, size=[image_size, image_size, 3])
-    image = tf.image.random_flip_left_right(image)
-    image = color_jitter(image, s=0.5)
-    return image
-
-
-def two_view_map(image: tf.Tensor, image_size: int) -> tuple[tf.Tensor, tf.Tensor]:
-    """Return two independently augmented views of the same input image."""
-    return random_augment(image, image_size), random_augment(image, image_size)
-
-
-def build_cifar10(image_size: int, batch_size: int) -> tf.data.Dataset:
-    """Two-view pipeline over CIFAR-10 training set (50k images)."""
-    (x_train, _), _ = keras.datasets.cifar10.load_data()
-    ds = tf.data.Dataset.from_tensor_slices(x_train)
-    ds = ds.shuffle(10_000, reshuffle_each_iteration=True)
-    ds = ds.map(lambda x: two_view_map(x, image_size), num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=True).prefetch(AUTOTUNE)
-    return ds
-
-
-def build_cifar100(image_size: int, batch_size: int) -> tf.data.Dataset:
-    """Two-view pipeline over CIFAR-100 training set (50k images)."""
-    (x_train, _), _ = keras.datasets.cifar100.load_data()
-    ds = tf.data.Dataset.from_tensor_slices(x_train)
-    ds = ds.shuffle(10_000, reshuffle_each_iteration=True)
-    ds = ds.map(lambda x: two_view_map(x, image_size), num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=True).prefetch(AUTOTUNE)
-    return ds
-
-
-def build_dataset(name: str, image_size: int, batch_size: int) -> tf.data.Dataset:
-    """Return an **infinite** dataset of (x1, x2) two-view batches for training."""
-    name = name.lower()
-    if name in {"cifar10", "cifar-10"}:
-        ds = build_cifar10(image_size, batch_size)
-    elif name in {"cifar100", "cifar-100"}:
-        ds = build_cifar100(image_size, batch_size)
-    else:
-        raise ValueError(f"Unsupported dataset '{name}'. Use cifar10 or cifar100.")
-    return ds.repeat()  # infinite stream for fit(steps_per_epoch=...)
-
-
-# -----------------------------------------------------------------------------
-# Encoder + projector with stable, eval-friendly names
-# -----------------------------------------------------------------------------
-def _named_conv_block(x: tf.Tensor, filters: int, conv_name: str, bn_name: str) -> tf.Tensor:
-    """Conv2D -> BatchNorm -> ReLU block with explicit names (stable for loading)."""
-    x = layers.Conv2D(filters, 3, padding="same", use_bias=False, name=conv_name)(x)
-    x = layers.BatchNormalization(name=bn_name)(x)
-    x = layers.ReLU()(x)
-    return x
-
-
-def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
-    """
-    CIFAR encoder. Key named layers for eval/weight loading:
-      - conv2d ... conv2d_6: conv blocks
-      - gap                : GlobalAveragePooling2D
-      - dense              : final feature FC
-      - feat               : identity exposing the feature vector
-    """
-    inp = layers.Input(shape=(image_size, image_size, 3), name="image")
-    x = _named_conv_block(inp, 64,  "conv2d",   "batch_normalization")
-    x = _named_conv_block(x,   64,  "conv2d_1", "batch_normalization_1")
-    x = layers.MaxPool2D()(x)
-
-    x = _named_conv_block(x,   128, "conv2d_2", "batch_normalization_2")
-    x = _named_conv_block(x,   128, "conv2d_3", "batch_normalization_3")
-    x = layers.MaxPool2D()(x)
-
-    x = _named_conv_block(x,   256, "conv2d_4", "batch_normalization_4")
-    x = _named_conv_block(x,   256, "conv2d_5", "batch_normalization_5")
-    x = _named_conv_block(x,   256, "conv2d_6", "batch_normalization_6")
-
-    gap = layers.GlobalAveragePooling2D(name="gap")(x)
-    f = layers.Dense(feat_dim, use_bias=True, name="dense")(gap)
-    feat = layers.Lambda(lambda t: t, name="feat")(f)
-    return keras.Model(inp, feat, name="encoder")
-
-
-def build_projector(in_dim: int, out_dim: int, num_layers: int) -> keras.Model:
-    """
-    VICReg projector MLP with 1/2/3 layers and stable names:
-      L=1: dense
-      L=2: dense -> bn -> relu -> dense_1
-      L=3: dense -> bn -> relu -> dense_1 -> bn_1 -> relu -> dense_2
-    """
-    assert num_layers >= 1, "proj-layers must be >= 1"
-    inp = keras.Input(shape=(in_dim,), name="proj_in")
-    x = inp
-    if num_layers <= 1:
-        out = layers.Dense(out_dim, use_bias=False, name="dense")(x)
-    elif num_layers == 2:
-        x = layers.Dense(out_dim, use_bias=False, name="dense")(x)
-        x = layers.BatchNormalization(name="batch_normalization")(x)
-        x = layers.ReLU()(x)
-        out = layers.Dense(out_dim, use_bias=False, name="dense_1")(x)
-    else:
-        x = layers.Dense(out_dim, use_bias=False, name="dense")(x)
-        x = layers.BatchNormalization(name="batch_normalization")(x)
-        x = layers.ReLU()(x)
-        x = layers.Dense(out_dim, use_bias=False, name="dense_1")(x)
-        x = layers.BatchNormalization(name="batch_normalization_1")(x)
-        x = layers.ReLU()(x)
-        out = layers.Dense(out_dim, use_bias=False, name="dense_2")(x)
-    return keras.Model(inp, out, name="proj")
-
-
-# -----------------------------------------------------------------------------
-# VICReg loss (computed in float32)
-# -----------------------------------------------------------------------------
-@dataclass
-class VICRegWeights:
-    """Weights for the three VICReg terms."""
-    sim: float = 25.0
-    var: float = 25.0
-    cov: float = 1.0
-
-
-def invariance_loss(z1: tf.Tensor, z2: tf.Tensor) -> tf.Tensor:
-    """L2 distance between paired projections z1 and z2."""
-    z1 = tf.cast(z1, tf.float32)
-    z2 = tf.cast(z2, tf.float32)
-    return tf.reduce_mean(tf.square(z1 - z2))
-
-
-def variance_loss(z: tf.Tensor, gamma: float = 1.0) -> tf.Tensor:
-    """Penalize per-dimension stddev lower than gamma (prevents collapse)."""
-    z = tf.cast(z, tf.float32)
-    std = tf.math.reduce_std(z, axis=0)
-    return tf.reduce_mean(tf.nn.relu(float(gamma) - std))
-
-
-def covariance_loss(z: tf.Tensor, nu: float = 0.0) -> tf.Tensor:
-    """Reduce off-diagonal covariance (decorrelation term)."""
-    z = tf.cast(z, tf.float32)
-    z = z - tf.reduce_mean(z, axis=0, keepdims=True)
-    n = tf.cast(tf.shape(z)[0], tf.float32)
-    cov = (tf.transpose(z) @ z) / (n - 1.0)
-    diag = tf.linalg.tensor_diag_part(cov)
-    off = cov - tf.linalg.diag(diag)
-    return tf.reduce_mean(tf.square(off - float(nu)))
-
-
-def vicreg_total(z1: tf.Tensor, z2: tf.Tensor, w: VICRegWeights, gamma: float, nu: float):
-    """Combine the three VICReg terms into a total loss and component logs."""
-    inv = invariance_loss(z1, z2)
-    var = variance_loss(z1, gamma) + variance_loss(z2, gamma)
-    cov = covariance_loss(z1, nu) + covariance_loss(z2, nu)
-    total = w.sim * inv + w.var * var + w.cov * cov
-    return total, {"inv": inv, "var": var, "cov": cov, "total": total}
-
-
-# -----------------------------------------------------------------------------
-# Schedules (PURE PYTHON — SAFE UNDER tf.function)
-# -----------------------------------------------------------------------------
-def cosine_schedule(start: float, end: float, t: float) -> float:
-    """Cosine interpolation between start and end for t in [0,1]."""
-    t = float(max(0.0, min(1.0, t)))
-    return float(end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * t)))
-
-
-class AdaptiveTargets:
-    """Produce adaptive targets gamma_t and nu_t over training progress."""
-    def __init__(self, use_schedules: bool):
-        self.use_schedules = use_schedules
-
-    def gamma(self, f: float) -> float:
-        return cosine_schedule(0.8, 1.0, f) if self.use_schedules else 1.0
-
-    def nu(self, f: float) -> float:
-        return cosine_schedule(0.1, 0.0, f) if self.use_schedules else 0.0
-
-
-class WeightSchedules:
-    """Optionally schedule the invariance weight (sim); others constant."""
-    def __init__(self, w0: VICRegWeights, use_schedules: bool):
-        self.w0 = w0
-        self.use_schedules = use_schedules
-
-    def weights(self, f: float) -> VICRegWeights:
-        if not self.use_schedules:
-            return self.w0
-        sim = cosine_schedule(self.w0.sim * 0.5, self.w0.sim, f)
-        return VICRegWeights(sim=sim, var=self.w0.var, cov=self.w0.cov)
-
-
-# -----------------------------------------------------------------------------
-# Trainer (subclassed Keras.Model with custom train_step) — uses KERAS .fit()
-# -----------------------------------------------------------------------------
-class VICRegTrainer(keras.Model):
-    """
-    Wrap encoder+projector and implement custom train_step.
-
-    Note
-    ----
-    We don't implement call(...), because training is entirely in train_step.
-    We'll force-build once so ModelCheckpoint(save_weights_only=True) works.
-    """
-    def __init__(
-        self, encoder: keras.Model, projector: keras.Model,
-        w0: VICRegWeights, adaptive: bool, sched: bool,
-        steps_per_epoch: int, epochs: int
-    ):
-        super().__init__(name="vicreg_trainer")
-        self.encoder = encoder
-        self.projector = projector
-        self.w0 = w0
-        self.adaptive = adaptive
-        self.targets = AdaptiveTargets(sched)
-        self.schedules = WeightSchedules(w0, sched)
-        self.total_steps = max(1, steps_per_epoch * epochs)
-        self.curr_step = 0
-
-        # Trackers -> appear in the Keras progress bar
-        self.loss_tracker = keras.metrics.Mean(name="loss")
-        self.inv_tracker = keras.metrics.Mean(name="inv")
-        self.var_tracker = keras.metrics.Mean(name="var")
-        self.cov_tracker = keras.metrics.Mean(name="cov")
-
-    @property
-    def metrics(self):
-        return [self.loss_tracker, self.inv_tracker, self.var_tracker, self.cov_tracker]
-
-    def train_step(self, data):
-        """data: tuple(x1, x2) — two augmented views from the dataset."""
-        x1, x2 = data
-        frac = self.curr_step / float(self.total_steps)
-        self.curr_step += 1
-
-        gamma = self.targets.gamma(frac) if self.adaptive else 1.0
-        nu = self.targets.nu(frac) if self.adaptive else 0.0
-        w = self.schedules.weights(frac)
-
-        with tf.GradientTape() as tape:
-            f1 = self.encoder(x1, training=True)
-            f2 = self.encoder(x2, training=True)
-            z1 = self.projector(f1, training=True)
-            z2 = self.projector(f2, training=True)
-            total, logs = vicreg_total(z1, z2, w, gamma=gamma, nu=nu)
-
-        grads = tape.gradient(total, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
-
-        self.loss_tracker.update_state(logs["total"])
-        self.inv_tracker.update_state(logs["inv"])
-        self.var_tracker.update_state(logs["var"])
-        self.cov_tracker.update_state(logs["cov"])
-        return {m.name: m.result() for m in self.metrics}
-
-
-# -----------------------------------------------------------------------------
-# Argparse & helpers
-# -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
+    """
+    Parse all CLI arguments for pretraining.
+
+    Returns
+    -------
+    argparse.Namespace
+        Holds all CLI options as attributes.
+    """
     p = argparse.ArgumentParser(parents=[_pre])
-    p.add_argument("--dataset", type=str, default="cifar10", help="cifar10|cifar100")
-    p.add_argument("--image-size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--feat-dim", type=int, default=2048)
-    p.add_argument("--proj-out", type=int, default=8192)
-    p.add_argument("--proj-layers", type=int, default=3)
-    p.add_argument("--lr", type=float, default=0.2)
-    p.add_argument("--wd", type=float, default=1e-6)
-    p.add_argument("--adaptive", action="store_true")
-    p.add_argument("--use-schedules", action="store_true")
-    p.add_argument("--model-dir", type=str, default="checkpoints_tf",
-                   help="If --ckpt-out not set, write to a timestamped folder here.")
-    p.add_argument("--run-name", type=str, default=None,
-                   help="Optional run name prefix for the timestamped folder.")
-    p.add_argument("--ckpt-out", type=str, default=None,
-                   help="Optional explicit .h5 weights path (full model).")
+    # --- Data & schedule ------------------------------------------------------
+    p.add_argument("--dataset", type=str, default="cifar10", help="cifar10 or cifar100.")
+    p.add_argument("--image-size", type=int, default=32, help="Square crop size.")
+    p.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    p.add_argument("--batch-size", type=int, default=256, help="Global batch size.")
+    # --- Model widths ---------------------------------------------------------
+    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width.")
+    p.add_argument("--proj-out", type=int, default=8192, help="Projector output width.")
+    p.add_argument(
+        "--proj-layers",
+        type=int,
+        default=3,
+        help="Number of MLP layers in the projector (1, 2, or 3).",
+    )
+    # --- Optimizer ------------------------------------------------------------
+    p.add_argument("--lr", type=float, default=0.2, help="Base learning rate.")
+    p.add_argument("--wd", type=float, default=1e-6, help="Weight decay (if supported).")
+    # --- Adaptive & schedules -------------------------------------------------
+    p.add_argument("--adaptive", action="store_true", help="Enable adaptive gamma/nu targets.")
+    p.add_argument("--use-schedules", action="store_true", help="Apply cosine schedules.")
+    # --- Output layout --------------------------------------------------------
+    p.add_argument("--model-dir", type=str, default="checkpoints_tf", help="Root output dir.")
+    p.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional subfolder prefix; if omitted, a timestamp is used.",
+    )
+    p.add_argument(
+        "--ckpt-out",
+        type=str,
+        default=None,
+        help="Optional explicit path for full weights (overrides model-dir).",
+    )
+    # --- Metrics logger knobs -------------------------------------------------
+    p.add_argument(
+        "--metrics-probe-batch",
+        type=int,
+        default=256,
+        help="Size of the probe batch for internal metrics (single view).",
+    )
+    p.add_argument(
+        "--metrics-compute-on",
+        choices=["projector", "encoder"],
+        default="projector",
+        help="Where to compute embedding stats.",
+    )
+    p.add_argument(
+        "--record-every",
+        type=int,
+        default=1,
+        help="Record internal metrics every N epochs (to reduce overhead).",
+    )
     return p.parse_args()
 
 
-def force_build_for_saving(
-    trainer: keras.Model, encoder: keras.Model, projector: keras.Model, image_size: int
-) -> None:
+def decide_device(device_flag: str) -> str:
     """
-    Ensure variables exist and mark the subclassed model as built so that
-    `ModelCheckpoint(save_weights_only=True)` can save weights safely.
+    Choose a TF device string based on my preference and a quick GPU sanity probe.
+
+    Parameters
+    ----------
+    device_flag : str
+        One of {"auto","gpu","cpu"} from the CLI.
+
+    Returns
+    -------
+    str
+        A TensorFlow device string, e.g. "/GPU:0" or "/CPU:0".
     """
-    _ = encoder(tf.zeros([1, image_size, image_size, 3]), training=False)
-    _ = projector(tf.zeros([1, encoder.output_shape[-1]]), training=False)
-    trainer.built = True
-    print("[train_vicreg] Forced build complete; trainer.built = True.")
+    if device_flag == "cpu":
+        print("[train] Forcing CPU mode per flag.")
+        return "/CPU:0"
+
+    # Print visible devices and enable memory growth to avoid pre-allocating all VRAM.
+    print_devices()
+    enable_memory_growth()
+
+    if device_flag == "gpu":
+        print("[train] Requested GPU; will not fall back.")
+        return "/GPU:0"
+
+    # device_flag == "auto": try fast probe; fall back to CPU if kernels unavailable.
+    ok = gpu_probe_ok()
+    if not ok:
+        print("[train] GPU probe failed; falling back to CPU.")
+    return "/GPU:0" if ok else "/CPU:0"
+
+
+def _take_single_view_batch(
+    ds: tf.data.Dataset, size_limit: int | None
+) -> tf.Tensor | None:
+    """
+    Take one small, single-view batch from a possibly two-view SSL dataset.
+
+    Parameters
+    ----------
+    ds : tf.data.Dataset
+        The same dataset I pass to `fit()`. Often yields `(view1, view2)`.
+    size_limit : int or None
+        Optionally slice the batch to this many samples to keep metrics cheap.
+
+    Returns
+    -------
+    tf.Tensor or None
+        A tensor `[N, H, W, C]` if available; otherwise None (metrics will skip).
+    """
+    try:
+        batch = next(iter(ds))
+    except Exception:
+        return None
+
+    # If dataset yields (view1, view2), I take the first view for probing.
+    if isinstance(batch, (tuple, list)) and len(batch) >= 1:
+        x = batch[0]
+    else:
+        x = batch
+
+    # Optionally slice to keep metrics lightweight.
+    if size_limit is not None:
+        x = x[: int(size_limit)]
+
+    return x
 
 
 def main() -> None:
+    """
+    Entry point: builds models, prepares data, runs training, and writes checkpoints.
+
+    This function orchestrates:
+      1) argparse + recording a JSON config,
+      2) dataset building (two-view pipeline),
+      3) model construction (encoder + projector + VICRegTrainer),
+      4) optimizer and callbacks (including optional cosine schedules),
+      5) training with `.fit()`,
+      6) saving both full and encoder-only weights.
+    """
     args = parse_args()
-    set_mixed_precision(enable=False)
 
-    # Dataset + steps
+    # Use float32 by default. I can flip to bfloat16 via set_mixed_precision(True) if desired.
+    set_mixed_precision(False)
+
+    # Build infinite two-view dataset and report steps/epoch.
     ds = build_dataset(args.dataset, args.image_size, args.batch_size)
-    nimg, steps_per_epoch = steps_for_dataset(args.dataset, args.batch_size)
-    print(f"[train_vicreg] dataset={args.dataset} img={args.image_size} "
-          f"bs={args.batch_size} epochs={args.epochs} steps/epoch={steps_per_epoch}")
+    _, steps_per_epoch = steps_for_dataset(args.dataset, args.batch_size)
+    print(
+        f"[train] dataset={args.dataset} img={args.image_size} "
+        f"bs={args.batch_size} epochs={args.epochs} steps/epoch={steps_per_epoch}"
+    )
 
-    # Output layout
+    # Decide where to write artifacts (weights/config/metrics).
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M")
     if args.ckpt_out:
+        # If an explicit weights path is provided, I co-locate side artifacts next to it.
         os.makedirs(os.path.dirname(args.ckpt_out), exist_ok=True)
         out_dir = os.path.dirname(args.ckpt_out)
-        full_ckpt_path = args.ckpt_out
-        enc_ckpt_path = (full_ckpt_path.replace(".weights.h5", ".encoder.weights.h5")
-                         if full_ckpt_path.endswith(".weights.h5")
-                         else os.path.join(out_dir, "vicreg_encoder.weights.h5"))
+        full_ckpt = args.ckpt_out
+        enc_ckpt = full_ckpt.replace(".weights.h5", ".encoder.weights.h5")
     else:
-        base = args.model_dir or "checkpoints_tf"
-        run_prefix = args.run_name if args.run_name else "pretrain"
+        base = args.model_dir
+        run_prefix = args.run_name or "pretrain"
         out_dir = os.path.join(base, f"{run_prefix}_{ts}")
         os.makedirs(out_dir, exist_ok=True)
-        full_ckpt_path = os.path.join(out_dir, "vicreg_full.weights.h5")
-        enc_ckpt_path = os.path.join(out_dir, "vicreg_encoder.weights.h5")
+        full_ckpt = os.path.join(out_dir, "vicreg_full.weights.h5")
+        enc_ckpt = os.path.join(out_dir, "vicreg_encoder.weights.h5")
 
-    # Save minimal config for traceability
-    run_info = {
-        "timestamp": ts, "device": _pre_args.device, "pinned_cpu": PIN_CPU,
-        "dataset": args.dataset, "n_images": nimg, "image_size": args.image_size,
-        "batch_size": args.batch_size, "epochs": args.epochs,
-        "feat_dim": args.feat_dim, "proj_out": args.proj_out, "proj_layers": args.proj_layers,
-        "lr": args.lr, "wd": args.wd, "adaptive": args.adaptive, "use_schedules": args.use_schedules,
-        "full_ckpt_path": full_ckpt_path, "enc_ckpt_path": enc_ckpt_path,
-    }
+    # Persist the config for reproducibility.
     with open(os.path.join(out_dir, "train_config.json"), "w") as f:
-        json.dump(run_info, f, indent=2)
+        json.dump(
+            {
+                "timestamp": ts,
+                "dataset": args.dataset,
+                "image_size": args.image_size,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "feat_dim": args.feat_dim,
+                "proj_out": args.proj_out,
+                "proj_layers": args.proj_layers,
+                "lr": args.lr,
+                "wd": args.wd,
+                "adaptive": args.adaptive,
+                "use_schedules": args.use_schedules,
+            },
+            f,
+            indent=2,
+        )
 
-    device_str = "/CPU:0" if PIN_CPU else "/GPU:0"
-    print(f"[train_vicreg] Using device scope: {device_str}")
+    device_str = decide_device(_pre_args.device)
+    print(f"[train] Using device scope: {device_str}")
 
     with tf.device(device_str):
-        # Build modules with stable names that match eval
+        # 1) Build the encoder and projector.
         encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
         projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
 
-        # Optimizer: AdamW if available, else Adam
+        # 2) Optimizer: prefer AdamW (tfa) if available, else Adam.
         try:
-            import tensorflow_addons as tfa  # type: ignore
+            import tensorflow_addons as tfa
             opt = tfa.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.wd)
         except Exception:
             opt = keras.optimizers.Adam(learning_rate=args.lr)
 
+        # 3) Wrap encoder+projector into VICRegTrainer (my subclassed Model).
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
             w0=VICRegWeights(sim=25.0, var=25.0, cov=1.0),
             adaptive=args.adaptive,
-            sched=args.use_schedules,
+            use_schedules=args.use_schedules,
             steps_per_epoch=steps_per_epoch,
             epochs=args.epochs,
+            base_lr=args.lr,           # <-- NEW
+            base_wd=args.wd,           # <-- NEW
         )
         trainer.compile(optimizer=opt)
 
-        # *** CRITICAL: force-build so save_weights works on a subclassed model ***
+        # 4) Build variables so save_weights works for subclassed models.
         force_build_for_saving(trainer, encoder, projector, args.image_size)
 
-        # Keras progress bar + best checkpoint on loss (full model weights)
+        # 5) Keras callbacks: save best weights by total loss, stop on NaN.
         ckpt_cb = keras.callbacks.ModelCheckpoint(
-            filepath=full_ckpt_path,
+            filepath=full_ckpt,
             save_weights_only=True,
             monitor="loss",
             mode="min",
             save_best_only=True,
             verbose=1,
         )
-        term_nan = keras.callbacks.TerminateOnNaN()
+        ton_cb = keras.callbacks.TerminateOnNaN()
 
+        # 6) Internal metrics callback (this powers my report_metrics plots/tables).
+        sample_images = _take_single_view_batch(ds, size_limit=args.metrics_probe_batch)
+        metrics_cb = VicRegMetricsLogger(
+            run_dir=out_dir,
+            encoder=encoder,
+            projector=projector,
+            sample_images=sample_images,
+            compute_on=args.metrics_compute_on,
+            loss_keys={"total": "loss", "align": "l_align", "var": "l_var", "cov": "l_cov"},
+            record_every=args.record_every,
+        )
+
+        # 7) Optional cosine schedule (applied per optimizer step).
+        cbs: list[keras.callbacks.Callback] = [ckpt_cb, ton_cb, metrics_cb]
+        if args.use_schedules:
+            total_steps = steps_per_epoch * args.epochs
+            cbs.insert(0, CosineScheduleCallback(optimizer=opt,
+                                                 total_steps=total_steps,
+                                                 base_lr=args.lr,
+                                                 base_wd=args.wd,
+                                                 verbose=1))
+
+        # 8) Train. The dataset repeats; steps_per_epoch bounds each epoch.
         trainer.fit(
             ds,
             epochs=args.epochs,
             steps_per_epoch=steps_per_epoch,
-            callbacks=[ckpt_cb, term_nan],
-            verbose=1,  # <- the classic Keras bar you wanted
+            callbacks=cbs,
+            verbose=1,
         )
 
-        # Always (re)save encoder-only weights at the end for eval convenience
-        encoder.save_weights(enc_ckpt_path)
+        # 9) Always save encoder-only snapshot for downstream evaluation.
+        encoder.save_weights(enc_ckpt)
 
-    print(f"[train_vicreg] Done.\n  Encoder -> {enc_ckpt_path}\n  Full -> {full_ckpt_path}\n  Logs -> {out_dir}")
+    print(
+        f"[train] Done.\n"
+        f"  Encoder -> {enc_ckpt}\n"
+        f"  Full    -> {full_ckpt}\n"
+        f"  Config  -> {os.path.join(out_dir, 'train_config.json')}\n"
+        f"  Metrics -> {os.path.join(out_dir, 'metrics', 'history.jsonl')}"
+    )
 
 
 if __name__ == "__main__":
