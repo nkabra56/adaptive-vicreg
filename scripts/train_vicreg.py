@@ -181,11 +181,13 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
         """Collect metrics at epoch end and append to the JSONL file.
-
-        I use helpers in `vicreg_tf.report_metrics`:
-          - stats/avg_std:              rm.compute_embedding_avg_std(z)
-          - stats/avg_offdiag_corr_sq:  rm.compute_avg_offdiag_corr_sq(z)
+        Local implementations are used for:
+        - stats/avg_std: mean of per-dimension std(z) across the batch
+        - stats/avg_offdiag_corr_sq: mean squared off-diagonal entries of the dim-by-dim correlation matrix
         """
+        import json
+        import tensorflow as tf
+
         logs = logs or {}
 
         # Respect record_every to reduce overhead if requested
@@ -202,23 +204,78 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
                 except Exception:
                     pass
 
+        # ---------------- TF helpers (robust to eager/graph) ----------------
+        def _tf_avg_std(z: tf.Tensor) -> tf.Tensor:
+            """Average per-dimension std across the batch using TF ops."""
+            z2 = z
+            # Flatten all non-batch dims into one embedding dim
+            z2 = tf.reshape(z2, [tf.shape(z2)[0], -1])
+            # If batch is empty, return NaN tensor
+            def _nan():
+                return tf.constant(float("nan"), dtype=z2.dtype)
+            def _ok():
+                std = tf.math.reduce_std(z2, axis=0)         # [D]
+                return tf.reduce_mean(std)                   # scalar
+            return tf.cond(tf.equal(tf.shape(z2)[0], 0), _nan, _ok)
+
+        def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
+            """Mean squared off-diagonal correlation using TF ops with guards."""
+            z2 = tf.reshape(z, [tf.shape(z)[0], -1])         # [N, D]
+            n = tf.shape(z2)[0]
+            d = tf.shape(z2)[1]
+
+            def _nan():
+                return tf.constant(float("nan"), dtype=z2.dtype)
+
+            def _compute():
+                # standardize per-dimension
+                mean = tf.reduce_mean(z2, axis=0, keepdims=True)     # [1, D]
+                zc   = z2 - mean                                     # [N, D]
+                std  = tf.math.reduce_std(zc, axis=0, keepdims=True) # [1, D]
+                std  = tf.where(std < eps, tf.ones_like(std), std)
+                zn   = zc / std                                      # [N, D]
+
+                # corr ≈ (zn^T zn) / N
+                znT = tf.transpose(zn)                                # [D, N]
+                corr = tf.matmul(znT, zn) / tf.cast(n, zn.dtype)      # [D, D]
+
+                # mask off-diagonal
+                eye = tf.eye(d, dtype=tf.bool)
+                off = tf.boolean_mask(corr, ~eye)
+                return tf.reduce_mean(tf.square(off))
+
+            # if n==0 or d<=1 => NaN
+            cond_bad = tf.logical_or(tf.equal(n, 0), tf.less_equal(d, 1))
+            return tf.cond(cond_bad, _nan, _compute)
+
         # 2) Embedding-level statistics on the fixed probe batch
         if getattr(self, "sample_images", None) is not None:
-            x = self.sample_images
-            z = self._get_embeddings(x)
-
             try:
-                avg_std_raw = rm.compute_embedding_avg_std(z)
-                avg_std = float(avg_std_raw.numpy() if hasattr(avg_std_raw, "numpy") else float(avg_std_raw))
-                record["stats/avg_std"] = avg_std
+                # Make sure the probe images are float32 and in a safe range
+                x = self.sample_images
+                if not tf.is_tensor(x):
+                    x = tf.convert_to_tensor(x)
+                if x.dtype != tf.float32:
+                    x = tf.cast(x, tf.float32)
+
+                # Forward once to get embeddings (encoder or projector)
+                # Important: training=False so BN/Dropout use inference behavior.
+                z = self._get_embeddings(x)
+
+                # Ensure tensor dtype is float32 for numerics
+                if z.dtype != tf.float32 and z.dtype != tf.float64:
+                    z = tf.cast(z, tf.float32)
+
+                # Compute both stats in TF, then detach to Python floats
+                avg_std_t = _tf_avg_std(z)  # scalar tensor
+                avg_off_t = _tf_avg_offdiag_corr_sq(z)
+
+                # Convert safely to Python floats (eager context here)
+                record["stats/avg_std"] = float(avg_std_t.numpy().item())
+                record["stats/avg_offdiag_corr_sq"] = float(avg_off_t.numpy().item())
             except Exception:
+                # If anything goes wrong, keep training and mark as NaN
                 record["stats/avg_std"] = float("nan")
-
-            try:
-                avg_corr_sq_raw = rm.compute_avg_offdiag_corr_sq(z)
-                avg_corr_sq = float(avg_corr_sq_raw.numpy() if hasattr(avg_corr_sq_raw, "numpy") else float(avg_corr_sq))
-                record["stats/avg_offdiag_corr_sq"] = avg_corr_sq
-            except Exception:
                 record["stats/avg_offdiag_corr_sq"] = float("nan")
 
         # 3) Append one JSON object per line to the history file

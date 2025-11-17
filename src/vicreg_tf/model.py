@@ -176,7 +176,7 @@ class VICRegTrainer(keras.Model):
         dummy_in = keras.Input(shape=(32, 32, 3))
         enc = keras.Model(dummy_in, dummy_in, name="encoder_placeholder")
         prj = keras.Model(keras.Input(shape=(32, 32, 3)), keras.Input(shape=(32, 32, 3)), name="proj_placeholder")
-        w = VICRegWeights(**config.get("w0", {"sim": 25.0, "var": 25.0, "cov": 1.0}))
+        w = VICRegWeights(**config.get("w0", {"sim": 25.0, "var": 25.0, "cov": 1.5}))
         return cls(
             encoder=enc,
             projector=prj,

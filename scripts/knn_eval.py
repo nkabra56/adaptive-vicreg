@@ -12,7 +12,7 @@ Author: Nishant Kabra
 """
 
 from __future__ import annotations
-import argparse, csv, os
+import argparse, csv, os, sys, glob
 from pathlib import Path
 import numpy as np
 import tensorflow as tf
@@ -21,12 +21,12 @@ from tensorflow import keras
 # Make local src/ importable
 _REPO = Path(__file__).resolve().parents[1]
 _SRC = _REPO / "src"
-import sys
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from vicreg_tf import build_encoder
 from vicreg_tf import enable_memory_growth
+
 
 def _load_cifar(name: str):
     if name == "cifar10":
@@ -39,6 +39,7 @@ def _load_cifar(name: str):
         raise ValueError(f"Unsupported dataset: {name}")
     return (xtr, ytr.squeeze()), (xte, yte.squeeze()), K
 
+
 def _make_ds_images(x, image_size: int, batch: int, shuffle: bool):
     x = tf.convert_to_tensor(x, tf.float32) / 255.0
     ds = tf.data.Dataset.from_tensor_slices(x)
@@ -50,10 +51,60 @@ def _make_ds_images(x, image_size: int, batch: int, shuffle: bool):
     ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
     return ds
 
+
 def _l2_normalize(feat: np.ndarray, eps=1e-12) -> np.ndarray:
     n = np.linalg.norm(feat, axis=1, keepdims=True)
     n = np.maximum(n, eps)
     return feat / n
+
+
+def _resolve_ckpt(user_path: str) -> str:
+    """
+    Make loading robust:
+      • If user_path is a file, use it.
+      • If it's a directory, look for 'vicreg_encoder.weights.h5' inside.
+      • If empty or not found, search common checkpoints dirs and pick newest.
+    """
+    if user_path and os.path.isfile(user_path):
+        return user_path
+
+    # If a directory was passed, try the standard filename inside it.
+    if user_path and os.path.isdir(user_path):
+        candidate = os.path.join(user_path, "vicreg_encoder.weights.h5")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Fall back to glob search (newest). Search typical roots.
+    roots = []
+    if user_path:
+        roots.append(user_path)
+    roots.extend([
+        str(_REPO / "checkpoints_tf"),
+        str(_REPO / "checkpoints"),
+    ])
+    candidates: list[tuple[float, str]] = []
+    for r in roots:
+        for p in glob.glob(os.path.join(r, "**", "vicreg_encoder.weights.h5"), recursive=True):
+            try:
+                candidates.append((os.path.getmtime(p), p))
+            except Exception:
+                pass
+
+    if candidates:
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        return candidates[0][1]
+
+    # Helpful error with tips, including showing the path that was attempted
+    attempted = user_path or "<empty>"
+    raise FileNotFoundError(
+        "Could not locate encoder weights.\n"
+        f"  • received --encoder-ckpt = {attempted}\n"
+        "  • tried: <encoder-ckpt>, <encoder-ckpt>/vicreg_encoder.weights.h5,\n"
+        "           and a recursive search under 'checkpoints_tf' / 'checkpoints'.\n"
+        "Fix: pass the full file path to 'vicreg_encoder.weights.h5' or point\n"
+        "      --encoder-ckpt to the run directory that contains it."
+    )
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -68,19 +119,30 @@ def parse_args():
     p.add_argument("--method-name", type=str, default="VICReg")
     return p.parse_args()
 
+
 def main():
     args = parse_args()
     enable_memory_growth()
 
+    # Load data
     (xtr, ytr), (xte, yte), K = _load_cifar(args.dataset)
     ds_train = _make_ds_images(xtr, args.image_size, args.batch_size, shuffle=False)
     ds_test  = _make_ds_images(xte, args.image_size, args.batch_size, shuffle=False)
 
+    # Build and load encoder (robustly resolve the checkpoint path)
+    ckpt_path = _resolve_ckpt(args.encoder_ckpt)
     enc = build_encoder(args.image_size, feat_dim=args.feat_dim)
-    enc.load_weights(args.encoder_ckpt)
+    try:
+        enc.load_weights(ckpt_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load encoder weights from: {ckpt_path}\n"
+            "Make sure this is the *encoder* snapshot ('vicreg_encoder.weights.h5')."
+        ) from e
     enc.trainable = False
+    print(f"[knn-eval] Loaded encoder weights -> {ckpt_path}")
 
-    # Build feature bank
+    # Build feature bank (train set)
     bank = []
     for xb in ds_train:
         fb = enc(xb, training=False)
@@ -96,28 +158,27 @@ def main():
     test_feats = np.concatenate(test_feats, axis=0).astype(np.float32)
     test_feats = _l2_normalize(test_feats)
 
-    # kNN classification (soft voting with temperature)
+    # kNN classification (soft voting with temperature).
+    # Note: to avoid large memory spikes, compute similarities in chunks of test features.
     k = min(args.k, bank.shape[0])
-    logits = []
-    # cosine similarity = dot since both are l2-normalized
-    sims = test_feats @ bank.T  # [Nt, Ntrain]
-
-    # For memory safety with large matrices, work in chunks
-    Nt = sims.shape[0]
-    chunk = 2048
+    Nt = test_feats.shape[0]
     preds = np.empty(Nt, dtype=np.int32)
+    chunk = 1024  # chunk size for test features
+
     for i in range(0, Nt, chunk):
         j = min(Nt, i + chunk)
-        S = sims[i:j]  # [B, Ntrain]
-        idx = np.argpartition(S, -k, axis=1)[:, -k:]               # top-k indices (unordered)
-        topk = np.take_along_axis(S, idx, axis=1)                  # [B, k] similarities
-        # softmax over temperature
+        Q = test_feats[i:j]                     # [B, d]
+        S = Q @ bank.T                          # [B, Ntrain]  (cosine since both L2-normalized)
+
+        idx = np.argpartition(S, -k, axis=1)[:, -k:]         # top-k indices (unordered)
+        topk = np.take_along_axis(S, idx, axis=1)            # [B, k] similarities
         w = np.exp(topk / max(1e-12, args.temperature))
         w /= np.sum(w, axis=1, keepdims=True)
-        # gather labels and vote
-        neigh_labels = ytr[idx]                                    # [B, k]
+
+        neigh_labels = ytr[idx]                                # [B, k]
         scores = np.zeros((j - i, K), dtype=np.float32)
         for b in range(j - i):
+            # Accumulate soft votes for the k neighbors of this sample.
             np.add.at(scores[b], neigh_labels[b], w[b])
         preds[i:j] = np.argmax(scores, axis=1)
 
