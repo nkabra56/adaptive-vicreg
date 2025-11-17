@@ -1,59 +1,46 @@
 """
 Script Title: VICReg / Adaptive VICReg Pretraining (TensorFlow + Keras)
 
-What this script does
----------------------
-Builds an encoder and a projector, wraps them in a subclassed Keras Model
-(`VICRegTrainer`) that implements the VICReg loss (invariance/variance/
-covariance), and trains with `model.fit`. The script writes:
-  • `vicreg_full.weights.h5`    (trainer weights: encoder + projector)
-  • `vicreg_encoder.weights.h5` (encoder-only weights for downstream eval)
-  • `train_config.json`         (training configuration snapshot)
-  • `metrics/history.jsonl`     (per-epoch JSONL records for plots/tables)
+Purpose
+-------
+I use this script to pretrain an encoder+projector with the VICReg objective.
+It builds my models, sets up the optimizer, trains with `model.fit`, and logs:
+  • vicreg_full.weights.h5        (trainer weights: encoder+projector)
+  • vicreg_encoder.weights.h5     (encoder-only snapshot for downstream eval)
+  • train_config.json             (exact hyperparameters for reproducibility)
+  • metrics/history.jsonl         (JSONL lines for plots and tables)
 
-It also attaches a metrics-logging callback that:
-  • computes average embedding standard deviation (variance control),
-  • computes mean squared off-diagonal correlation (redundancy control),
-  • picks up loss component scalars (if your trainer exposes them as Keras metrics),
-  • appends everything to `<run_dir>/metrics/history.jsonl`.
-
-Typical usage
+Example usage
 -------------
 python3 scripts/train_vicreg.py \
   --dataset cifar10 \
   --image-size 32 \
   --epochs 100 \
-  --batch-size 256 \
+  --batch-size 512 \
   --feat-dim 2048 \
   --proj-out 8192 \
   --proj-layers 3 \
-  --lr 0.1 \
+  --lr 0.01 \
   --wd 1e-6 \
   --adaptive \
   --use-schedules \
+  --metrics-compute-on projector \
+  --metrics-probe-batch 256 \
+  --record-every 1 \
   --model-dir checkpoints_tf \
-  --run-name pretrain-c10_model6_e100 \
-  --device auto
+  --run-name pretrain-c10_checktrainer \
+  --device gpu
 
-Notes
------
-• Use `--device cpu` if CUDA kernels are unavailable; `auto` will probe GPU
-  once and fall back to CPU if needed.
-• We save **weights only**. The subclassed trainer should implement `get_config()`
-  to silence Keras’ non-serializable args warning. If you still see the warning,
-  add a minimal `get_config()` to your trainer and projector (see `vicreg_tf.model`).
-• The encoder exposes a named `feat` tensor; downstream eval scripts load
-  `vicreg_encoder.weights.h5` and use that `feat` vector.
-• Metrics logger records the internal stats for your plots in `report_metrics.py`.
-  If your trainer doesn’t add `l_align`, `l_var`, `l_cov` to logs, the callback
-  still records embedding stats; add:
-      self.add_metric(l_align, name="l_align", aggregation="mean")
-      self.add_metric(l_var,   name="l_var",   aggregation="mean")
-      self.add_metric(l_cov,   name="l_cov",   aggregation="mean")
-  inside your trainer’s `train_step` to get the loss curves too.
+How it works (high level)
+-------------------------
+1) Build CIFAR two-view pipeline via my `vicreg_tf.data` helpers.
+2) Build `build_encoder()` and `build_projector()` and wrap in `VICRegTrainer`.
+3) If `--use-schedules`, a cosine scheduler scales LR/WD per step.
+4) I log both losses and embedding stats every epoch to `metrics/history.jsonl`.
+5) Save the best full weights and always save an encoder-only snapshot at the end.
 
 Author: Nishant Kabra
-Date: 11/16/2025
+Date: 11/17/2025
 """
 from __future__ import annotations
 
@@ -62,9 +49,7 @@ from pathlib import Path
 import sys
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]   # <repo>
-_SRC_DIR = _REPO_ROOT / "src"                      # <repo>/src
-
-# Prepend to sys.path so your local code wins over any installed modules.
+_SRC_DIR = _REPO_ROOT / "src"
 if not _SRC_DIR.exists():
     raise RuntimeError(f"Could not find expected source directory: {_SRC_DIR}")
 if str(_SRC_DIR) not in sys.path:
@@ -75,9 +60,9 @@ import argparse
 import datetime as _dt
 import json
 import os
-import typing as _t
-import numpy as np
+from typing import Optional, List
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
@@ -94,194 +79,10 @@ from vicreg_tf import (
     steps_for_dataset,
     enable_memory_growth,
 )
-
-# ------------------------------------------------------------------------------
-# Metrics helpers imported from my vicreg_tf.report_metrics module.
-# If I move the functions, I will update these imports accordingly.
-# ------------------------------------------------------------------------------
-from vicreg_tf import report_metrics as rm
-
-# ------------------------------------------------------------------------------
-# Cosine schedules are taken from my vicreg_tf.schedules module.
-# I apply them per step using a lightweight callback below.
-# ------------------------------------------------------------------------------
-from vicreg_tf import schedules as sched
+from vicreg_tf import schedules as sched  # cosine scaler
 
 
-class VicRegMetricsLogger(keras.callbacks.Callback):
-    """
-    Logs VICReg / Adaptive-VICReg internal metrics during training.
-
-    Purpose
-    -------
-    On each epoch end (optionally every N epochs), this callback:
-      • reads loss components from Keras logs (if trainer exposes them),
-      • computes embedding statistics on a fixed probe batch:
-           - stats/avg_std: average standard deviation across embedding dims
-           - stats/avg_offdiag_corr_sq: mean squared off-diagonal correlation
-      • appends a JSON object to `<run_dir>/metrics/history.jsonl`.
-
-    Parameters
-    ----------
-    run_dir : str
-        The run folder created by this script (contains weights + config).
-        I create `<run_dir>/metrics/history.jsonl` to store per-epoch rows.
-    encoder : tf.keras.Model
-        My backbone encoder. Used to compute features on the probe batch.
-    projector : tf.keras.Model or None
-        My projection head. If `compute_on='projector'`, embeddings are
-        computed as `projector(encoder(x))`; else they are `encoder(x)`.
-    sample_images : tf.Tensor
-        A small single-view batch `[N, H, W, C]` used only for metrics.
-        I keep N modest (e.g., 256) so this callback is cheap.
-    compute_on : {'encoder','projector'}
-        Where to compute the stats. 'projector' is recommended for variance/cov.
-    loss_keys : dict[str, str]
-        Mapping from pretty names to keys in `logs` (Keras on_epoch_end logs).
-        Defaults: {'total':'loss','align':'l_align','var':'l_var','cov':'l_cov'}.
-    record_every : int
-        Record every N epochs. Use >1 to reduce overhead if needed.
-    """
-
-    def __init__(
-        self,
-        run_dir: str,
-        encoder: tf.keras.Model,
-        projector: tf.keras.Model | None,
-        sample_images: tf.Tensor | None,
-        compute_on: str = "projector",
-        loss_keys: dict[str, str] | None = None,
-        record_every: int = 1,
-    ) -> None:
-        super().__init__()
-        self.run_dir = run_dir
-        self.encoder = encoder
-        self.projector = projector
-        self.sample_images = sample_images
-        self.compute_on = compute_on
-        self.loss_keys = loss_keys or {
-            "total": "loss",
-            "align": "l_align",
-            "var": "l_var",
-            "cov": "l_cov",
-        }
-        self.record_every = int(record_every)
-
-        # Ensure metrics directory exists and pick the history file path
-        self.metrics_dir = os.path.join(self.run_dir, "metrics")
-        os.makedirs(self.metrics_dir, exist_ok=True)
-        self.history_path = os.path.join(self.metrics_dir, "history.jsonl")
-
-    def _get_embeddings(self, x: tf.Tensor) -> tf.Tensor:
-        """Compute embeddings on the chosen stage without gradient tracking."""
-        z = self.encoder(x, training=False)  # encoder forward pass
-        if self.compute_on == "projector" and self.projector is not None:
-            z = self.projector(z, training=False)  # projector forward pass
-        return z
-
-    def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
-        """Collect metrics at epoch end and append to the JSONL file.
-        Local implementations are used for:
-        - stats/avg_std: mean of per-dimension std(z) across the batch
-        - stats/avg_offdiag_corr_sq: mean squared off-diagonal entries of the dim-by-dim correlation matrix
-        """
-        import json
-        import tensorflow as tf
-
-        logs = logs or {}
-
-        # Respect record_every to reduce overhead if requested
-        if (epoch + 1) % self.record_every != 0:
-            return
-
-        record: dict[str, float | int] = {"epoch": int(epoch + 1)}
-
-        # 1) Copy loss components from Keras logs if present
-        for pretty, key in self.loss_keys.items():
-            if key in logs and logs[key] is not None:
-                try:
-                    record[f"loss/{pretty}"] = float(logs[key])
-                except Exception:
-                    pass
-
-        # ---------------- TF helpers (robust to eager/graph) ----------------
-        def _tf_avg_std(z: tf.Tensor) -> tf.Tensor:
-            """Average per-dimension std across the batch using TF ops."""
-            z2 = z
-            # Flatten all non-batch dims into one embedding dim
-            z2 = tf.reshape(z2, [tf.shape(z2)[0], -1])
-            # If batch is empty, return NaN tensor
-            def _nan():
-                return tf.constant(float("nan"), dtype=z2.dtype)
-            def _ok():
-                std = tf.math.reduce_std(z2, axis=0)         # [D]
-                return tf.reduce_mean(std)                   # scalar
-            return tf.cond(tf.equal(tf.shape(z2)[0], 0), _nan, _ok)
-
-        def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
-            """Mean squared off-diagonal correlation using TF ops with guards."""
-            z2 = tf.reshape(z, [tf.shape(z)[0], -1])         # [N, D]
-            n = tf.shape(z2)[0]
-            d = tf.shape(z2)[1]
-
-            def _nan():
-                return tf.constant(float("nan"), dtype=z2.dtype)
-
-            def _compute():
-                # standardize per-dimension
-                mean = tf.reduce_mean(z2, axis=0, keepdims=True)     # [1, D]
-                zc   = z2 - mean                                     # [N, D]
-                std  = tf.math.reduce_std(zc, axis=0, keepdims=True) # [1, D]
-                std  = tf.where(std < eps, tf.ones_like(std), std)
-                zn   = zc / std                                      # [N, D]
-
-                # corr ≈ (zn^T zn) / N
-                znT = tf.transpose(zn)                                # [D, N]
-                corr = tf.matmul(znT, zn) / tf.cast(n, zn.dtype)      # [D, D]
-
-                # mask off-diagonal
-                eye = tf.eye(d, dtype=tf.bool)
-                off = tf.boolean_mask(corr, ~eye)
-                return tf.reduce_mean(tf.square(off))
-
-            # if n==0 or d<=1 => NaN
-            cond_bad = tf.logical_or(tf.equal(n, 0), tf.less_equal(d, 1))
-            return tf.cond(cond_bad, _nan, _compute)
-
-        # 2) Embedding-level statistics on the fixed probe batch
-        if getattr(self, "sample_images", None) is not None:
-            try:
-                # Make sure the probe images are float32 and in a safe range
-                x = self.sample_images
-                if not tf.is_tensor(x):
-                    x = tf.convert_to_tensor(x)
-                if x.dtype != tf.float32:
-                    x = tf.cast(x, tf.float32)
-
-                # Forward once to get embeddings (encoder or projector)
-                # Important: training=False so BN/Dropout use inference behavior.
-                z = self._get_embeddings(x)
-
-                # Ensure tensor dtype is float32 for numerics
-                if z.dtype != tf.float32 and z.dtype != tf.float64:
-                    z = tf.cast(z, tf.float32)
-
-                # Compute both stats in TF, then detach to Python floats
-                avg_std_t = _tf_avg_std(z)  # scalar tensor
-                avg_off_t = _tf_avg_offdiag_corr_sq(z)
-
-                # Convert safely to Python floats (eager context here)
-                record["stats/avg_std"] = float(avg_std_t.numpy().item())
-                record["stats/avg_offdiag_corr_sq"] = float(avg_off_t.numpy().item())
-            except Exception:
-                # If anything goes wrong, keep training and mark as NaN
-                record["stats/avg_std"] = float("nan")
-                record["stats/avg_offdiag_corr_sq"] = float("nan")
-
-        # 3) Append one JSON object per line to the history file
-        with open(self.history_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
+# ============================ Cosine LR/WD scheduler ============================
 
 class CosineScheduleCallback(keras.callbacks.Callback):
     """
@@ -289,29 +90,29 @@ class CosineScheduleCallback(keras.callbacks.Callback):
 
     What I scale
     ------------
-    • optimizer.learning_rate  := base_lr * cosine_scaler(step, total_steps)
-    • optimizer.weight_decay   := base_wd * cosine_scaler(step, total_steps)  (if optimizer exposes it)
+    • optimizer.learning_rate := base_lr * cosine_scaler(step, total_steps)
+    • optimizer.weight_decay  := base_wd * cosine_scaler(step, total_steps)  (if available)
 
-    How I count steps
-    -----------------
-    I count optimizer steps inside `on_train_batch_begin`. Total steps is
-    `steps_per_epoch * epochs`, so the schedule spans the entire run.
+    Why I do this
+    -------------
+    I want a smooth LR/WD schedule over the entire run without coupling to
+    epoch count. Counting global steps makes this easy.
 
-    Notes
-    -----
-    • This uses the same math as my `vicreg_tf.schedules.cosine_scaler`.
-    • If my optimizer does not have a `weight_decay` attribute (e.g., plain Adam),
-      only the learning rate is scaled.
+    Parameters
+    ----------
+    optimizer : keras.optimizers.Optimizer
+        The optimizer whose LR (and optional WD) I scale.
+    total_steps : int
+        Steps across the full run (steps_per_epoch * epochs).
+    base_lr : float
+        Initial learning rate before scaling.
+    base_wd : float or None
+        Initial weight decay before scaling (if optimizer supports).
+    verbose : int
+        If >0, I log current LR (and WD) each epoch.
     """
-
-    def __init__(
-        self,
-        optimizer: keras.optimizers.Optimizer,
-        total_steps: int,
-        base_lr: float,
-        base_wd: float | None,
-        verbose: int = 1,
-    ) -> None:
+    def __init__(self, optimizer: keras.optimizers.Optimizer, total_steps: int,
+                 base_lr: float, base_wd: Optional[float], verbose: int = 1) -> None:
         super().__init__()
         self.opt = optimizer
         self.total_steps = int(total_steps)
@@ -320,23 +121,22 @@ class CosineScheduleCallback(keras.callbacks.Callback):
         self.verbose = int(verbose)
         self._step = 0
         if self.total_steps <= 0:
-            raise ValueError("total_steps must be a positive integer")
+            raise ValueError("total_steps must be positive")
         if self.verbose:
             print(f"[schedules] total_steps={self.total_steps} base_lr={self.base_lr} base_wd={self.base_wd}")
 
-    def on_train_batch_begin(self, batch: int, logs: dict | None = None) -> None:
-        # Convert to a clamped global step in [0, total_steps]
+    def on_train_batch_begin(self, batch: int, logs=None):
         step = min(self._step, self.total_steps)
         scale = float(sched.cosine_scaler(step=step, total_steps=self.total_steps))
 
-        # Scale learning rate (prefer assign if it's a tf.Variable)
+        # Scale learning rate
         lr = self.base_lr * scale
         try:
             self.opt.learning_rate.assign(lr)
         except Exception:
             self.opt.learning_rate = lr
 
-        # Scale weight decay if the optimizer exposes it
+        # Scale weight decay if present
         if self.base_wd is not None and hasattr(self.opt, "weight_decay"):
             wd = self.base_wd * scale
             try:
@@ -349,7 +149,7 @@ class CosineScheduleCallback(keras.callbacks.Callback):
 
         self._step += 1
 
-    def on_epoch_begin(self, epoch: int, logs: dict | None = None) -> None:
+    def on_epoch_begin(self, epoch: int, logs=None):
         if not self.verbose:
             return
         try:
@@ -366,239 +166,269 @@ class CosineScheduleCallback(keras.callbacks.Callback):
         print(msg)
 
 
-# ------------------------------------------------------------------------------
-# Early parse for device flag (so I can set CUDA visibility prior to TF init).
-# ------------------------------------------------------------------------------
-_pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument(
-    "--device",
-    choices=["auto", "gpu", "cpu"],
-    default="auto",
-    help="Device placement: try GPU, force GPU, or force CPU.",
-)
-_pre_args, _ = _pre.parse_known_args()
+# ======================== Metrics logging for plots =============================
 
-# Hide GPUs if I explicitly asked for CPU (must be set before TF loads).
-if _pre_args.device == "cpu":
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-# Reduce TF logging noise unless there is an error.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
-
-
-def parse_args() -> argparse.Namespace:
+class VicRegMetricsLogger(keras.callbacks.Callback):
     """
-    Parse all CLI arguments for pretraining.
+    Log VICReg losses and simple embedding stats to JSONL for my plots.
 
-    Returns
-    -------
-    argparse.Namespace
-        Holds all CLI options as attributes.
+    What I record
+    -------------
+    • loss/total, loss/align, loss/var, loss/cov  (if trainer exposes metrics)
+    • stats/avg_std  (mean per-dim std across batch)
+    • stats/avg_offdiag_corr_sq  (mean squared off-diagonal entries of corr)
+
+    Why this matters
+    ----------------
+    These values power my figures in `report_metrics.py`, and help me spot
+    collapse (low std) or redundancy (high off-diagonal corr).
+
+    Parameters
+    ----------
+    run_dir : str
+        Where I write `<run_dir>/metrics/history.jsonl`.
+    encoder : tf.keras.Model
+        Backbone used to generate features for stats.
+    projector : tf.keras.Model or None
+        Projection head; if I compute on 'projector', I forward through it too.
+    sample_images : tf.Tensor | None
+        A small fixed single-view probe batch. If None, I only log losses.
+    compute_on : {'projector','encoder'}
+        Stage to compute stats on.
+    loss_keys : dict[str,str]
+        Map from pretty name to Keras log key.
+    record_every : int
+        Record every N epochs to reduce overhead.
     """
-    p = argparse.ArgumentParser(parents=[_pre])
-    # --- Data & schedule ------------------------------------------------------
-    p.add_argument("--dataset", type=str, default="cifar10", help="cifar10 or cifar100.")
-    p.add_argument("--image-size", type=int, default=32, help="Square crop size.")
-    p.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
-    p.add_argument("--batch-size", type=int, default=256, help="Global batch size.")
-    # --- Model widths ---------------------------------------------------------
-    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width.")
-    p.add_argument("--proj-out", type=int, default=8192, help="Projector output width.")
-    p.add_argument(
-        "--proj-layers",
-        type=int,
-        default=3,
-        help="Number of MLP layers in the projector (1, 2, or 3).",
-    )
-    # --- Optimizer ------------------------------------------------------------
-    p.add_argument("--lr", type=float, default=0.2, help="Base learning rate.")
-    p.add_argument("--wd", type=float, default=1e-6, help="Weight decay (if supported).")
-    # --- Adaptive & schedules -------------------------------------------------
-    p.add_argument("--adaptive", action="store_true", help="Enable adaptive gamma/nu targets.")
-    p.add_argument("--use-schedules", action="store_true", help="Apply cosine schedules.")
-    # --- Output layout --------------------------------------------------------
-    p.add_argument("--model-dir", type=str, default="checkpoints_tf", help="Root output dir.")
-    p.add_argument(
-        "--run-name",
-        type=str,
-        default=None,
-        help="Optional subfolder prefix; if omitted, a timestamp is used.",
-    )
-    p.add_argument(
-        "--ckpt-out",
-        type=str,
-        default=None,
-        help="Optional explicit path for full weights (overrides model-dir).",
-    )
-    # --- Metrics logger knobs -------------------------------------------------
-    p.add_argument(
-        "--metrics-probe-batch",
-        type=int,
-        default=256,
-        help="Size of the probe batch for internal metrics (single view).",
-    )
-    p.add_argument(
-        "--metrics-compute-on",
-        choices=["projector", "encoder"],
-        default="projector",
-        help="Where to compute embedding stats.",
-    )
-    p.add_argument(
-        "--record-every",
-        type=int,
-        default=1,
-        help="Record internal metrics every N epochs (to reduce overhead).",
-    )
-    return p.parse_args()
+    def __init__(self, run_dir: str, encoder: tf.keras.Model,
+                 projector: Optional[tf.keras.Model],
+                 sample_images: Optional[tf.Tensor],
+                 compute_on: str = "projector",
+                 loss_keys: Optional[dict] = None,
+                 record_every: int = 1) -> None:
+        super().__init__()
+        self.run_dir = run_dir
+        self.encoder = encoder
+        self.projector = projector
+        self.sample_images = sample_images
+        self.compute_on = compute_on
+        self.loss_keys = loss_keys or {
+            "total": "loss",
+            "align": "l_align",
+            "var": "l_var",
+            "cov": "l_cov",
+        }
+        self.record_every = int(record_every)
+        self.metrics_dir = os.path.join(self.run_dir, "metrics")
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        self.history_path = os.path.join(self.metrics_dir, "history.jsonl")
+
+    def _get_embeddings(self, x: tf.Tensor) -> tf.Tensor:
+        z = self.encoder(x, training=False)
+        if self.compute_on == "projector" and self.projector is not None:
+            z = self.projector(z, training=False)
+        return z
+
+    @staticmethod
+    def _tf_avg_std(z: tf.Tensor) -> tf.Tensor:
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])
+        std = tf.math.reduce_std(z2, axis=0)
+        return tf.reduce_mean(std)
+
+    @staticmethod
+    def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])     # [N, D]
+        n = tf.shape(z2)[0]
+        d = tf.shape(z2)[1]
+        mean = tf.reduce_mean(z2, axis=0, keepdims=True)
+        zc = z2 - mean
+        std = tf.math.reduce_std(zc, axis=0, keepdims=True)
+        std = tf.where(std < eps, tf.ones_like(std), std)
+        zn = zc / std                                # standardized
+        corr = tf.matmul(zn, zn, transpose_a=True) / tf.cast(n, zn.dtype)  # [D, D]
+        eye = tf.eye(d, dtype=tf.bool)
+        off = tf.boolean_mask(corr, ~eye)
+        return tf.reduce_mean(tf.square(off))
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        logs = logs or {}
+        if (epoch + 1) % self.record_every != 0:
+            return
+
+        rec = {"epoch": int(epoch + 1)}
+        # Pick up loss scalars if present
+        for pretty, key in self.loss_keys.items():
+            if key in logs and logs[key] is not None:
+                try:
+                    rec[f"loss/{pretty}"] = float(logs[key])
+                except Exception:
+                    pass
+
+        if self.sample_images is not None:
+            x = self.sample_images
+            if not tf.is_tensor(x):
+                x = tf.convert_to_tensor(x)
+            if x.dtype != tf.float32:
+                x = tf.cast(x, tf.float32)
+
+            z = self._get_embeddings(x)
+            if z.dtype not in (tf.float32, tf.float64):
+                z = tf.cast(z, tf.float32)
+            try:
+                rec["stats/avg_std"] = float(self._tf_avg_std(z).numpy().item())
+                rec["stats/avg_offdiag_corr_sq"] = float(self._tf_avg_offdiag_corr_sq(z).numpy().item())
+            except Exception:
+                rec["stats/avg_std"] = float("nan")
+                rec["stats/avg_offdiag_corr_sq"] = float("nan")
+
+        with open(self.history_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+
+# ============================== CLI / Device ===================================
+
+def _preparse_device_flag() -> str:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
+    args, _ = p.parse_known_args()
+    if args.device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+    return args.device
+
+
+_DEVICE_FLAG = _preparse_device_flag()
 
 
 def decide_device(device_flag: str) -> str:
     """
     Choose a TF device string based on my preference and a quick GPU sanity probe.
-
-    Parameters
-    ----------
-    device_flag : str
-        One of {"auto","gpu","cpu"} from the CLI.
-
-    Returns
-    -------
-    str
-        A TensorFlow device string, e.g. "/GPU:0" or "/CPU:0".
     """
     if device_flag == "cpu":
         print("[train] Forcing CPU mode per flag.")
         return "/CPU:0"
-
-    # Print visible devices and enable memory growth to avoid pre-allocating all VRAM.
     print_devices()
     enable_memory_growth()
-
     if device_flag == "gpu":
         print("[train] Requested GPU; will not fall back.")
         return "/GPU:0"
-
-    # device_flag == "auto": try fast probe; fall back to CPU if kernels unavailable.
     ok = gpu_probe_ok()
     if not ok:
         print("[train] GPU probe failed; falling back to CPU.")
     return "/GPU:0" if ok else "/CPU:0"
 
 
-def _take_single_view_batch(
-    ds: tf.data.Dataset, size_limit: int | None
-) -> tf.Tensor | None:
+def parse_args() -> argparse.Namespace:
     """
-    Take one small, single-view batch from a possibly two-view SSL dataset.
+    Parse all CLI arguments for my VICReg pretraining.
+    """
+    p = argparse.ArgumentParser(parents=[argparse.ArgumentParser(add_help=False)])
+    # Data & schedule
+    p.add_argument("--dataset", type=str, default="cifar10", help="cifar10 or cifar100.")
+    p.add_argument("--image-size", type=int, default=32, help="Square crop size.")
+    p.add_argument("--epochs", type=int, default=100, help="Training epochs.")
+    p.add_argument("--batch-size", type=int, default=256, help="Global batch size.")
+    # Model
+    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width.")
+    p.add_argument("--proj-out", type=int, default=4096, help="Projector output width.")
+    p.add_argument("--proj-layers", type=int, default=3, help="Projector depth (1,2,3).")
+    # Optimizer
+    p.add_argument("--lr", type=float, default=0.01, help="Base learning rate.")
+    p.add_argument("--wd", type=float, default=1e-6, help="Weight decay if optimizer supports it.")
+    # Adaptive & schedules
+    p.add_argument("--adaptive", action="store_true", help="Enable adaptive gamma/nu targets.")
+    p.add_argument("--use-schedules", action="store_true", help="Apply cosine schedules per step.")
+    # Output / run naming
+    p.add_argument("--model-dir", type=str, default="checkpoints_tf", help="Root output dir.")
+    p.add_argument("--run-name", type=str, default=None, help="Subfolder prefix; timestamp is appended.")
+    p.add_argument("--ckpt-out", type=str, default=None,
+                   help="Optional explicit full weights path (overrides model-dir).")
+    # Metrics logger knobs
+    p.add_argument("--metrics-probe-batch", type=int, default=256,
+                   help="Size of the fixed single-view probe batch for stats.")
+    p.add_argument("--metrics-compute-on", choices=["projector", "encoder"], default="projector",
+                   help="Where to compute embedding stats.")
+    p.add_argument("--record-every", type=int, default=1,
+                   help="Record internal metrics every N epochs.")
+    return p.parse_args()
 
-    Parameters
-    ----------
-    ds : tf.data.Dataset
-        The same dataset I pass to `fit()`. Often yields `(view1, view2)`.
-    size_limit : int or None
-        Optionally slice the batch to this many samples to keep metrics cheap.
 
-    Returns
-    -------
-    tf.Tensor or None
-        A tensor `[N, H, W, C]` if available; otherwise None (metrics will skip).
+# ================================ main ==========================================
+
+def _take_single_view_batch(ds: tf.data.Dataset, size_limit: Optional[int]) -> Optional[tf.Tensor]:
+    """
+    Take one small single-view batch from a possibly two-view SSL dataset.
+    I only need a cheap probe batch for stats; no gradients are computed on it.
     """
     try:
-        batch = next(iter(ds))
+        b = next(iter(ds))
     except Exception:
         return None
-
-    # If dataset yields (view1, view2), I take the first view for probing.
-    if isinstance(batch, (tuple, list)) and len(batch) >= 1:
-        x = batch[0]
-    else:
-        x = batch
-
-    # Optionally slice to keep metrics lightweight.
+    x = b[0] if (isinstance(b, (tuple, list)) and len(b) >= 1) else b
     if size_limit is not None:
         x = x[: int(size_limit)]
-
     return x
 
 
 def main() -> None:
     """
-    Entry point: builds models, prepares data, runs training, and writes checkpoints.
-
-    This function orchestrates:
-      1) argparse + recording a JSON config,
-      2) dataset building (two-view pipeline),
-      3) model construction (encoder + projector + VICRegTrainer),
-      4) optimizer and callbacks (including optional cosine schedules),
-      5) training with `.fit()`,
-      6) saving both full and encoder-only weights.
+    Orchestrate data, models, optimizer, schedules, metrics, and saving.
     """
     args = parse_args()
-
-    # Use float32 by default. I can flip to bfloat16 via set_mixed_precision(True) if desired.
     set_mixed_precision(False)
 
-    # Build infinite two-view dataset and report steps/epoch.
+    # Dataset and steps/epoch
     ds = build_dataset(args.dataset, args.image_size, args.batch_size)
     _, steps_per_epoch = steps_for_dataset(args.dataset, args.batch_size)
-    print(
-        f"[train] dataset={args.dataset} img={args.image_size} "
-        f"bs={args.batch_size} epochs={args.epochs} steps/epoch={steps_per_epoch}"
-    )
+    print(f"[train] dataset={args.dataset} img={args.image_size} bs={args.batch_size} "
+          f"epochs={args.epochs} steps/epoch={steps_per_epoch}")
 
-    # Decide where to write artifacts (weights/config/metrics).
+    # Output paths
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M")
     if args.ckpt_out:
-        # If an explicit weights path is provided, I co-locate side artifacts next to it.
         os.makedirs(os.path.dirname(args.ckpt_out), exist_ok=True)
         out_dir = os.path.dirname(args.ckpt_out)
         full_ckpt = args.ckpt_out
         enc_ckpt = full_ckpt.replace(".weights.h5", ".encoder.weights.h5")
     else:
-        base = args.model_dir
         run_prefix = args.run_name or "pretrain"
-        out_dir = os.path.join(base, f"{run_prefix}_{ts}")
+        out_dir = os.path.join(args.model_dir, f"{run_prefix}_{ts}")
         os.makedirs(out_dir, exist_ok=True)
         full_ckpt = os.path.join(out_dir, "vicreg_full.weights.h5")
         enc_ckpt = os.path.join(out_dir, "vicreg_encoder.weights.h5")
 
-    # Persist the config for reproducibility.
     with open(os.path.join(out_dir, "train_config.json"), "w") as f:
-        json.dump(
-            {
-                "timestamp": ts,
-                "dataset": args.dataset,
-                "image_size": args.image_size,
-                "batch_size": args.batch_size,
-                "epochs": args.epochs,
-                "feat_dim": args.feat_dim,
-                "proj_out": args.proj_out,
-                "proj_layers": args.proj_layers,
-                "lr": args.lr,
-                "wd": args.wd,
-                "adaptive": args.adaptive,
-                "use_schedules": args.use_schedules,
-            },
-            f,
-            indent=2,
-        )
+        json.dump({
+            "timestamp": ts,
+            "dataset": args.dataset,
+            "image_size": args.image_size,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "feat_dim": args.feat_dim,
+            "proj_out": args.proj_out,
+            "proj_layers": args.proj_layers,
+            "lr": args.lr,
+            "wd": args.wd,
+            "adaptive": args.adaptive,
+            "use_schedules": args.use_schedules,
+        }, f, indent=2)
 
-    device_str = decide_device(_pre_args.device)
+    device_str = decide_device(_DEVICE_FLAG)
     print(f"[train] Using device scope: {device_str}")
 
     with tf.device(device_str):
-        # 1) Build the encoder and projector.
+        # Build models
         encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
         projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
 
-        # 2) Optimizer: prefer AdamW (tfa) if available, else Adam.
+        # Optimizer: prefer AdamW if available
         try:
             import tensorflow_addons as tfa
             opt = tfa.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.wd)
         except Exception:
             opt = keras.optimizers.Adam(learning_rate=args.lr)
 
-        # 3) Wrap encoder+projector into VICRegTrainer (my subclassed Model).
+        # Trainer
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
@@ -607,28 +437,25 @@ def main() -> None:
             use_schedules=args.use_schedules,
             steps_per_epoch=steps_per_epoch,
             epochs=args.epochs,
-            base_lr=args.lr,           # <-- NEW
-            base_wd=args.wd,           # <-- NEW
+            base_lr=args.lr,
+            base_wd=args.wd,
         )
         trainer.compile(optimizer=opt)
 
-        # 4) Build variables so save_weights works for subclassed models.
+        # Force variable creation so save_weights works for subclassed models
         force_build_for_saving(trainer, encoder, projector, args.image_size)
 
-        # 5) Keras callbacks: save best weights by total loss, stop on NaN.
-        ckpt_cb = keras.callbacks.ModelCheckpoint(
-            filepath=full_ckpt,
-            save_weights_only=True,
-            monitor="loss",
-            mode="min",
-            save_best_only=True,
-            verbose=1,
-        )
-        ton_cb = keras.callbacks.TerminateOnNaN()
+        # Callbacks: checkpoint, NaN guard, metrics logger, optional sched
+        cbs: List[keras.callbacks.Callback] = [
+            keras.callbacks.ModelCheckpoint(
+                filepath=full_ckpt, save_weights_only=True,
+                monitor="loss", mode="min", save_best_only=True, verbose=1),
+            keras.callbacks.TerminateOnNaN(),
+        ]
 
-        # 6) Internal metrics callback (this powers my report_metrics plots/tables).
+        # Internal metrics logger powering my plots
         sample_images = _take_single_view_batch(ds, size_limit=args.metrics_probe_batch)
-        metrics_cb = VicRegMetricsLogger(
+        cbs.append(VicRegMetricsLogger(
             run_dir=out_dir,
             encoder=encoder,
             projector=projector,
@@ -636,19 +463,16 @@ def main() -> None:
             compute_on=args.metrics_compute_on,
             loss_keys={"total": "loss", "align": "l_align", "var": "l_var", "cov": "l_cov"},
             record_every=args.record_every,
-        )
+        ))
 
-        # 7) Optional cosine schedule (applied per optimizer step).
-        cbs: list[keras.callbacks.Callback] = [ckpt_cb, ton_cb, metrics_cb]
+        # Optional cosine LR/WD
         if args.use_schedules:
             total_steps = steps_per_epoch * args.epochs
-            cbs.insert(0, CosineScheduleCallback(optimizer=opt,
-                                                 total_steps=total_steps,
-                                                 base_lr=args.lr,
-                                                 base_wd=args.wd,
-                                                 verbose=1))
+            cbs.insert(0, CosineScheduleCallback(
+                optimizer=opt, total_steps=total_steps,
+                base_lr=args.lr, base_wd=args.wd, verbose=1))
 
-        # 8) Train. The dataset repeats; steps_per_epoch bounds each epoch.
+        # Train
         trainer.fit(
             ds,
             epochs=args.epochs,
@@ -657,7 +481,7 @@ def main() -> None:
             verbose=1,
         )
 
-        # 9) Always save encoder-only snapshot for downstream evaluation.
+        # Save encoder-only snapshot
         encoder.save_weights(enc_ckpt)
 
     print(
