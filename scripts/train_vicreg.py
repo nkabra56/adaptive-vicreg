@@ -18,7 +18,7 @@ python3 scripts/train_vicreg.py \
   --epochs 100 \
   --batch-size 512 \
   --feat-dim 2048 \
-  --proj-out 8192 \
+  --proj-out 4096 \
   --proj-layers 3 \
   --lr 0.01 \
   --wd 1e-6 \
@@ -29,17 +29,20 @@ python3 scripts/train_vicreg.py \
   --record-every 1 \
   --model-dir checkpoints_tf \
   --run-name pretrain-c10_checktrainer \
+  --device auto
 
 How it works (high level)
 -------------------------
 1) Build CIFAR two-view pipeline via my `vicreg_tf.data` helpers.
 2) Build `build_encoder()` and `build_projector()` and wrap in `VICRegTrainer`.
-3) If `--use-schedules`, a cosine scheduler scales LR/WD per step.
-4) I log both losses and embedding stats every epoch to `metrics/history.jsonl`.
-5) Save the best full weights and always save an encoder-only snapshot at the end.
+3) If `--use-schedules`, a cosine scheduler scales LR/WD per step (callback),
+   and inside the trainer I also ramp the covariance weight across training.
+4) If `--adaptive`, I ramp the variance floor gamma from 0.9 -> 1.0 early on.
+5) I log both losses and embedding stats every epoch to `metrics/history.jsonl`.
+6) Save the best full weights and always save an encoder-only snapshot at the end.
 
 Author: Nishant Kabra
-Date: 11/17/2025
+Date: 11/18/2025
 """
 from __future__ import annotations
 
@@ -125,6 +128,7 @@ class CosineScheduleCallback(keras.callbacks.Callback):
             print(f"[schedules] total_steps={self.total_steps} base_lr={self.base_lr} base_wd={self.base_wd}")
 
     def on_train_batch_begin(self, batch: int, logs=None):
+        # I compute a per-step cosine scale in [min_scale, 1].
         step = min(self._step, self.total_steps)
         scale = float(sched.cosine_scaler(step=step, total_steps=self.total_steps))
 
@@ -149,6 +153,7 @@ class CosineScheduleCallback(keras.callbacks.Callback):
         self._step += 1
 
     def on_epoch_begin(self, epoch: int, logs=None):
+        # Only print if verbose is enabled
         if not self.verbose:
             return
         try:
@@ -230,12 +235,14 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
 
     @staticmethod
     def _tf_avg_std(z: tf.Tensor) -> tf.Tensor:
+        # Flatten per-example, then compute per-dim std and average it
         z2 = tf.reshape(z, [tf.shape(z)[0], -1])
         std = tf.math.reduce_std(z2, axis=0)
         return tf.reduce_mean(std)
 
     @staticmethod
     def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
+        # Standardize features, compute correlation, average off-diagonal squares
         z2 = tf.reshape(z, [tf.shape(z)[0], -1])     # [N, D]
         n = tf.shape(z2)[0]
         d = tf.shape(z2)[1]
@@ -277,6 +284,7 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
                 rec["stats/avg_std"] = float(self._tf_avg_std(z).numpy().item())
                 rec["stats/avg_offdiag_corr_sq"] = float(self._tf_avg_offdiag_corr_sq(z).numpy().item())
             except Exception:
+                # If something goes wrong (e.g., no GPU), I still keep the file valid.
                 rec["stats/avg_std"] = float("nan")
                 rec["stats/avg_offdiag_corr_sq"] = float("nan")
 
@@ -287,6 +295,9 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
 # ============================== CLI / Device ===================================
 
 def _preparse_device_flag() -> str:
+    """
+    I grab --device early so I can set CUDA visibility before TF initializes.
+    """
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     args, _ = p.parse_known_args()
@@ -336,7 +347,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wd", type=float, default=1e-6, help="Weight decay if optimizer supports it.")
     # Adaptive & schedules
     p.add_argument("--adaptive", action="store_true", help="Enable adaptive gamma/nu targets.")
-    p.add_argument("--use-schedules", action="store_true", help="Apply cosine schedules per step.")
+    p.add_argument("--use-schedules", action="store_true", help="Apply cosine schedules per step + cov-weight ramp.")
     # Output / run naming
     p.add_argument("--model-dir", type=str, default="checkpoints_tf", help="Root output dir.")
     p.add_argument("--run-name", type=str, default=None, help="Subfolder prefix; timestamp is appended.")
@@ -396,6 +407,7 @@ def main() -> None:
         full_ckpt = os.path.join(out_dir, "vicreg_full.weights.h5")
         enc_ckpt = os.path.join(out_dir, "vicreg_encoder.weights.h5")
 
+    # Save a small config dict for reproducibility
     with open(os.path.join(out_dir, "train_config.json"), "w") as f:
         json.dump({
             "timestamp": ts,
@@ -420,18 +432,18 @@ def main() -> None:
         encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
         projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
 
-        # Optimizer: prefer AdamW if available
+        # Optimizer: prefer AdamW if available (weight decay support)
         try:
             import tensorflow_addons as tfa
             opt = tfa.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.wd)
         except Exception:
             opt = keras.optimizers.Adam(learning_rate=args.lr)
 
-        # Trainer
+        # Trainer (note: internal schedules are handled inside VICRegTrainer now)
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
-            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.5),
+            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.5),  # base weights; cov will ramp internally if --use-schedules
             adaptive=args.adaptive,
             use_schedules=args.use_schedules,
             steps_per_epoch=steps_per_epoch,
@@ -464,7 +476,7 @@ def main() -> None:
             record_every=args.record_every,
         ))
 
-        # Optional cosine LR/WD
+        # Optional cosine LR/WD (externally applied to the optimizer)
         if args.use_schedules:
             total_steps = steps_per_epoch * args.epochs
             cbs.insert(0, CosineScheduleCallback(

@@ -14,16 +14,15 @@ How I use this module
 - During training I attach a callback that calls `cosine_scaler(step=..., total_steps=...)`
   each batch to scale optimizer LR and WD.
 - Inside the trainer I instantiate `AdaptiveTargets` when I want time-varying
-  `gamma` and `nu`. Right now my schedule is effectively constant, but it is
-  implemented in a TF-friendly way so I can change it without touching core
-  logic.
+  `gamma` and `nu`. With my defaults below, `gamma` ramps quickly from 0.9 -> 1.0
+  during the first 10% of training, and `nu` stays near 0 (classical VICReg).
 - `WeightSchedules` is a small convenience wrapper that prints base LR/WD and
-  can return scheduled LR/WD (or just constants if schedules are off). It also
-  exposes `weights(frac)` to scale the VICReg weights across training if I
-  decide to, while currently returning the base values unchanged.
+  can return scheduled LR/WD (or just constants if schedules are off). I also
+  expose `weights(frac)` where I gently ramp the covariance weight up over time
+  (helps reduce redundancy more as features stabilize).
 
 Author: Nishant Kabra
-Date: 11/16/2025
+Date: 11/18/2025
 """
 from __future__ import annotations
 
@@ -199,16 +198,18 @@ class WeightSchedules:
 
     I primarily use this to print my base LR/WD once and to offer
     `lr_at(step)` / `wd_at(step)` helpers. The `weights(frac)` method returns
-    the VICReg loss weights for a given progress fraction; right now I choose
-    to keep them constant (w0), but having this method makes it trivial to add
-    time-dependent scaling later.
+    the VICReg loss weights for a given progress fraction. I keep `sim` and
+    `var` constant and *gently ramp up* the covariance weight from 0.5× to 1.5×
+    its base value across training. This puts more emphasis on redundancy
+    reduction once features have stabilized, which is a common tweak.
 
     Fields
     ------
     w0 : VICRegWeights
         Base weights for (sim, var, cov). I coerce from dict if needed.
     use : bool
-        If False, `lr_at` and `wd_at` just return the base values.
+        If False, `lr_at` and `wd_at` just return the base values; the weight
+        ramp still returns a simple constant equal to w0.
     base_lr : float
         Learning rate before scheduling.
     base_wd : float
@@ -270,17 +271,28 @@ class WeightSchedules:
 
         Current behavior
         ----------------
-        I keep the weights constant and simply expose `w0`. This hook exists so
-        that I can easily add smooth weight ramps (e.g., emphasize variance loss
-        early and covariance later) without changing call sites.
+        - `sim` := w0.sim  (constant)
+        - `var` := w0.var  (constant)
+        - `cov` := w0.cov * (0.5 + 1.0*frac)  -> ramps 0.5× at t=0 to 1.5× at t=1
+
+        Rationale: I want to down-weight the covariance penalty early (when
+        features are noisy), and then emphasize redundancy reduction later.
 
         Args:
-            frac: Progress fraction in [0, 1] (unused for now).
+            frac: Progress fraction in [0, 1].
 
         Returns:
             A dict with keys 'sim', 'var', 'cov'.
         """
-        return {"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov}
+        if _TF and tf.is_tensor(frac):
+            # Tensor path
+            frac = tf.clip_by_value(tf.cast(frac, tf.float32), 0.0, 1.0)
+            cov_scale = 0.5 + 1.0 * frac
+            return {"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov * cov_scale}
+        # Python path
+        f = max(0.0, min(1.0, _to_float(frac)))
+        cov_scale = 0.5 + 1.0 * f
+        return {"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov * cov_scale}
 
 
 @dataclass
@@ -290,15 +302,10 @@ class AdaptiveTargets:
 
     What I return
     -------------
-    - `gamma(frac)`: a scalar or Tensor scalar, depending on input type,
-      representing the variance floor used in the variance term.
-    - `nu(frac)`: a scalar or Tensor scalar, representing the target for the
-      off-diagonal correlation in the covariance term.
-
-    Current defaults
-    ----------------
-    I keep gamma = 1.0 and nu = 0.0 across training. The schedule objects are
-    set up so I can change this behavior later, without touching model logic.
+    - `gamma(frac)`: ramps from ~0.9 -> 1.0 over the first 10% of training,
+      then stays near 1.0. This makes the variance floor gentle at the start.
+    - `nu(frac)`: stays close to 0.0 (classical VICReg), but I keep it as a
+      callable so I can make it time-varying later without touching call sites.
 
     Fields
     ------
@@ -307,16 +314,18 @@ class AdaptiveTargets:
     gamma_sched : CosineWarmup
         Schedule that maps frac->[scale] before mapping to [start,end].
     nu_sched : CosineWarmup
-        Schedule that maps frac->[scale]; currently mapped to [0,1] then to 0.0.
+        Schedule that maps frac->[scale]; I map it to 0.0 by default.
     start : float
-        Start value for gamma (used if I later want ramping).
+        Start value for gamma.
     end : float
-        End value for gamma (ditto).
+        End value for gamma.
     """
     use: bool
-    gamma_sched: CosineWarmup = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0, min_scale=1.0))
-    nu_sched: CosineWarmup    = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0, min_scale=0.0))
-    start: float = 1.0
+    # I warm up gamma quickly: 10% warmup, min_scale=1.0 (keeps scale >= 1.0),
+    # then I map [0,1] -> [start,end] below.
+    gamma_sched: CosineWarmup = field(default_factory=lambda: CosineWarmup(warmup_frac=0.10, min_scale=1.0))
+    nu_sched: CosineWarmup    = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0,  min_scale=0.0))
+    start: float = 0.9
     end:   float = 1.0
 
     def gamma(self, frac: Union[float, "tf.Tensor"]):
@@ -326,7 +335,7 @@ class AdaptiveTargets:
         Behavior:
             - If `use` is False, I return constant 1.0.
             - Else, I follow `gamma_sched(frac)` and map it from [0,1] into
-              [start, end]. With defaults, this is identically 1.0.
+              [start, end] (default: 0.9 -> 1.0).
         """
         if not self.use:
             return tf.constant(1.0, tf.float32) if _TF else 1.0
@@ -343,15 +352,14 @@ class AdaptiveTargets:
 
         Behavior:
             - If `use` is False, I return constant 0.0.
-            - Else, I evaluate `nu_sched(frac)`. Right now I keep this mapped to
-              the identity on [0,1] and then effectively clamp to 0.0 by design.
-              If I want a non-zero target later, I’ll change the mapping here.
+            - Else, I evaluate `nu_sched(frac)` and clamp it to 0.0 for now.
+              I keep the shape/type plumbing so I can change this later.
         """
         if not self.use:
             return tf.constant(0.0, tf.float32) if _TF else 0.0
         base = self.nu_sched(frac)
         if _TF and tf.is_tensor(base):
             # Currently returns 0.0 (placeholder for future non-zero schedules).
-            return tf.cast(0.0, tf.float32) + tf.cast(1.0, tf.float32) * base
+            return tf.cast(0.0, tf.float32) + tf.cast(1.0, tf.float32) * 0.0
         # Python path; same placeholder behavior
-        return float(base)
+        return 0.0

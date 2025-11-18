@@ -22,7 +22,8 @@ Design notes
 - `VICRegTrainer.train_step` computes z1/z2 from two augmented views, computes
   VICReg total loss (and parts), updates metrics, and returns a logs dict so
   Keras shows "loss", "l_align", "l_var", "l_cov" per step/epoch.
-- I avoid `float(tensor)` so this code works in both eager and graph modes.
+- I now wire in real adaptive scheduling: gamma ramps from 0.9 -> 1.0 early,
+  and the covariance weight ramps up over training (see schedules.py).
 
 Example (building only)
 -----------------------
@@ -35,8 +36,8 @@ Example (trainer)
 ...     encoder=enc,
 ...     projector=proj,
 ...     w0=VICRegWeights(sim=25.0, var=25.0, cov=1.5),
-...     adaptive=True,               # enable gamma/nu scheduling (internal simple schedule)
-...     use_schedules=True,          # cosmetic flag; LR/WD scaled in my callback
+...     adaptive=True,               # enable gamma/nu scheduling
+...     use_schedules=True,          # enables weight ramp for covariance
 ...     steps_per_epoch=390,
 ...     epochs=100,
 ...     base_lr=0.01,
@@ -45,7 +46,7 @@ Example (trainer)
 >>> trainer.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01))
 
 Author: Nishant Kabra
-Date: 11/17/2025
+Date: 11/18/2025
 """
 from __future__ import annotations
 
@@ -55,8 +56,10 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers as L
 
-# I import losses + weights container from my vicreg_tf package.
+# Losses + weights
 from .losses import vicreg_total, VICRegWeights
+# Adaptive schedules: targets (gamma/nu) and weight ramp for covariance
+from . import schedules as sched
 
 
 # -----------------------------------------------------------------------------
@@ -126,18 +129,6 @@ def build_encoder(image_size: int, feat_dim: int) -> tf.keras.Model:
 # -----------------------------------------------------------------------------
 # Projector builder
 # -----------------------------------------------------------------------------
-def _mlp_block(units: int) -> keras.Sequential:
-    """A tiny helper to create "Dense -> BN -> ReLU" as a block for the MLP."""
-    return keras.Sequential(
-        [
-            L.Dense(units, use_bias=False),
-            L.BatchNormalization(),
-            L.ReLU(),
-        ],
-        name=f"mlp_{units}",
-    )
-
-
 def build_projector(feat_dim: int, proj_out: int, proj_layers: int) -> keras.Model:
     """
     Build the projection head (MLP) for VICReg.
@@ -166,7 +157,7 @@ def build_projector(feat_dim: int, proj_out: int, proj_layers: int) -> keras.Mod
         x = keras.layers.Dense(
             proj_out,
             use_bias=False,
-            name=f"proj_dense_{i}"
+            name=f"proj_dense_{i}"    # unique name to avoid collisions
         )(x)
         x = keras.layers.BatchNormalization(name=f"proj_bn_{i}")(x)
         x = keras.layers.ReLU(name=f"proj_relu_{i}")(x)
@@ -193,6 +184,11 @@ class VICRegTrainer(keras.Model):
     - updates metrics so Keras history contains loss/align/var/cov,
     - returns a logs dict so callbacks can see those values by name.
 
+    I also integrate *adaptive targets* and a *covariance-weight ramp*:
+      - `gamma` ramp: 0.9 -> 1.0 during early training (variance floor),
+      - `nu` target: ~0.0 throughout (classic VICReg),
+      - weight ramp: increases covariance loss weight over time.
+
     Parameters
     ----------
     encoder : tf.keras.Model
@@ -202,12 +198,9 @@ class VICRegTrainer(keras.Model):
     w0 : VICRegWeights
         Base weights for (sim, var, cov) in the total loss.
     adaptive : bool
-        If True, I schedule gamma (variance floor) and nu (off-diag target)
-        with a simple time-based schedule. If False, I use constants:
-        gamma=1.0, nu=0.0
+        If True, I schedule gamma (variance floor) and nu (off-diag target).
     use_schedules : bool
-        Cosmetic flag carried for completeness; LR/WD are actually handled by
-        my training callback (CosineScheduleCallback) outside of this class.
+        If True, I enable the covariance weight ramp (and LR/WD handled outside).
     steps_per_epoch : int
         Steps in each epoch; used to compute overall progress fraction.
     epochs : int
@@ -248,6 +241,18 @@ class VICRegTrainer(keras.Model):
         self.base_lr = float(base_lr)
         self.base_wd = float(base_wd)
 
+        # NEW: Instantiate adaptive targets and weight schedules.
+        # - AdaptiveTargets handles gamma/nu over time.
+        # - WeightSchedules handles a gentle ramp of the covariance weight.
+        self.adapt = sched.AdaptiveTargets(use=self.adaptive)
+        self.schedules = sched.WeightSchedules(
+            w0={"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov},
+            use=self.use_schedules,
+            base_lr=self.base_lr,
+            base_wd=self.base_wd,
+            total_steps=self.total_steps,
+        )
+
         # I set up Keras Metric objects so they appear in `model.history.history`.
         # The names match what my plotting utilities expect ("loss", "l_*").
         self.loss_tracker = keras.metrics.Mean(name="loss")
@@ -263,7 +268,7 @@ class VICRegTrainer(keras.Model):
         """
         return [self.loss_tracker, self.align_tracker, self.var_tracker, self.cov_tracker]
 
-    # ------------------------ helpers: schedules for gamma/nu -------------------
+    # ------------------------ helpers: schedules for gamma/nu/weights ----------
     def _progress_frac(self) -> tf.Tensor:
         """
         Compute a [0,1] progress fraction based on optimizer iterations.
@@ -276,29 +281,6 @@ class VICRegTrainer(keras.Model):
         total = tf.cast(self.total_steps, tf.float32)
         # I clip in [0,1] to avoid any numerical drift after training ends.
         return tf.clip_by_value(step / tf.maximum(1.0, total), 0.0, 1.0)
-
-    def _gamma_nu(self) -> Tuple[tf.Tensor, tf.Tensor]:
-        """
-        Return (gamma, nu) as tensors.
-
-        If `adaptive` is True, I run a very light schedule:
-        - gamma(t) = 1.0  (kept constant by default; easy to tweak later)
-        - nu(t)    = 0.0  (kept constant by default)
-
-        The key point is: I return TF tensors, not Python floats, so the
-        downstream math in `losses.py` stays graph-friendly.
-        """
-        if not self.adaptive:
-            # Non-adaptive: I return simple constants as tensors.
-            return tf.constant(1.0, dtype=tf.float32), tf.constant(0.0, dtype=tf.float32)
-
-        # Adaptive: I *could* vary these with time. Right now I keep the
-        # defaults but in a TF graph-friendly way.
-        t = self._progress_frac()  # I compute this to keep the door open for future schedules
-        _ = t  # unused; placeholder for future schedule tweaks
-        gamma = tf.constant(1.0, dtype=tf.float32)
-        nu = tf.constant(0.0, dtype=tf.float32)
-        return gamma, nu
 
     # ------------------------------- train_step --------------------------------
     def train_step(self, data):
@@ -313,7 +295,7 @@ class VICRegTrainer(keras.Model):
         What I do
         ---------
         - Forward pass both views through encoder + projector -> z1, z2
-        - Compute VICReg total loss and individual parts
+        - Compute VICReg total loss (with time-varying gamma/nu and weights)
         - Apply gradients
         - Update Keras metrics and return a logs dict for Keras/Callbacks
         """
@@ -328,8 +310,11 @@ class VICRegTrainer(keras.Model):
         x1 = tf.cast(x1, tf.float32)
         x2 = tf.cast(x2, tf.float32)
 
-        # I compute scheduled targets (gamma/nu) as TENSORS (graph-friendly).
-        gamma, nu = self._gamma_nu()
+        # Compute scheduled targets and weight ramp as TENSORS (graph-friendly).
+        frac = self._progress_frac()
+        gamma = self.adapt.gamma(frac)   # variance floor ~ [0.9 -> 1.0]
+        nu    = self.adapt.nu(frac)      # ~0.0 (classic VICReg)
+        wdict = self.schedules.weights(frac)  # ramps cov weight over time
 
         with tf.GradientTape() as tape:
             # Forward view 1
@@ -341,7 +326,7 @@ class VICRegTrainer(keras.Model):
             z2 = self.projector(f2, training=True)
 
             # Compute VICReg loss + parts using my imported loss helper.
-            total, parts = vicreg_total(z1, z2, self.w0, gamma=gamma, nu=nu)
+            total, parts = vicreg_total(z1, z2, wdict, gamma=gamma, nu=nu)
 
         # Standard Keras gradient application.
         grads = tape.gradient(total, self.trainable_variables)
@@ -377,14 +362,18 @@ class VICRegTrainer(keras.Model):
         x1 = tf.cast(x1, tf.float32)
         x2 = tf.cast(x2, tf.float32)
 
-        gamma, nu = self._gamma_nu()
+        # Use the same schedules for evaluation logs to keep metrics comparable.
+        frac = self._progress_frac()
+        gamma = self.adapt.gamma(frac)
+        nu    = self.adapt.nu(frac)
+        wdict = self.schedules.weights(frac)
 
         f1 = self.encoder(x1, training=False)
         z1 = self.projector(f1, training=False)
         f2 = self.encoder(x2, training=False)
         z2 = self.projector(f2, training=False)
 
-        total, parts = vicreg_total(z1, z2, self.w0, gamma=gamma, nu=nu)
+        total, parts = vicreg_total(z1, z2, wdict, gamma=gamma, nu=nu)
 
         self.loss_tracker.update_state(total)
         self.align_tracker.update_state(parts["l_align"])
