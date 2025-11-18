@@ -32,17 +32,16 @@ Typical usage
 python3 src/vicreg_tf/report_metrics.py \
   --out-dir reports/pretrain-c10_checktrainer_baseline \
   --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
-  --linear-csv results/pretrain-c10_checktrainer_baseline/pretrain-c10_checktrainer_baseline_linear_adamw.csv \
-  --knn-csv    results/pretrain-c10_checktrainer_baseline/pretrain-c10_checktrainer_baseline_knn_eval.csv
+  --linear-csv results/linear_eval.csv \
+  --knn-csv    results/knn_eval.csv
 
 # B) Compare two runs in training plots (Baseline vs Ours)
 python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/compare \
-  --history name=VICReg-Baseline,path=checkpoints_tf/pretrain-c10_checktrainer_baseline_20251118-1906/metrics/history.jsonl \
-  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
+  --out-dir reports/compare_baseline_e10 \
+  --history name=VICReg-Baseline,path=checkpoints_tf/c10_vicreg_baseline_10_20251118-2141/metrics/history.jsonl \
+  --history name=AdaptiveVICReg,path=checkpoints_tf/c10_adaptive_vicreg_10_20251118-2155/metrics/history.jsonl \
   --linear-csv results/linear_eval.csv \
-  --knn-csv    results/knn_eval.csv \
-  --robustness-csv results/robustness.csv
+  --knn-csv    results/knn_eval.csv
 
 Notes
 -----

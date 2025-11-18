@@ -336,6 +336,93 @@ class VICRegTrainer(keras.Model):
             "l_var": self.var_tracker.result(),
             "l_cov": self.cov_tracker.result(),
         }
+    def get_config(self):
+        """
+        Return a JSON-serializable snapshot of my construction-time settings.
 
-    # I don't override test_step because I don't use trainer.evaluate()
-    # for this self-supervised pretraining phase.
+        Why I implement this
+        --------------------
+        Keras warns when a subclassed Model has no `get_config()` because it
+        cannot serialize the constructor args. I'm only saving **weights**
+        (via `save_weights` / ModelCheckpoint with `save_weights_only=True`),
+        so Keras will not *use* this config to rebuild the model; it just needs
+        something serializable to stop warning.
+
+        What I include
+        --------------
+        Only plain Python types (bool/int/float/str/dict) – never Trackables
+        like the actual `encoder` / `projector` models or Optimizers.
+
+        Returns
+        -------
+        dict
+            A minimal, JSON-serializable dictionary describing run-time knobs.
+        """
+        # Base hyperparameters: keep them JSON-serializable
+        cfg = {
+            "class_name": self.__class__.__name__,          # helpful breadcrumb
+            "adaptive": bool(getattr(self, "adaptive", False)),
+            "use_schedules": bool(getattr(self, "use_schedules", False)),
+        }
+
+        # Loss weights (convert dataclass to plain dict of floats)
+        try:
+            w0 = getattr(self, "w0")
+            cfg["w0"] = {"sim": float(w0.sim), "var": float(w0.var), "cov": float(w0.cov)}
+        except Exception:
+            cfg["w0"] = {"sim": 25.0, "var": 25.0, "cov": 1.0}
+
+        # Training duration in steps; safer than storing steps_per_epoch/epochs separately
+        total_steps = getattr(self, "total_steps", None)
+        if total_steps is not None:
+            try:
+                cfg["total_steps"] = int(total_steps)
+            except Exception:
+                pass
+
+        # Scheduler bases (if present). Fall back to attributes set in __init__.
+        base_lr = None
+        base_wd = None
+        try:
+            base_lr = float(getattr(self, "schedules").base_lr)
+            base_wd = float(getattr(self, "schedules").base_wd)
+            cfg["warmup_frac"] = float(getattr(self, "schedules").warmup_frac)
+            cfg["min_scale"]   = float(getattr(self, "schedules").min_scale)
+        except Exception:
+            pass
+
+        if base_lr is None:
+            base_lr = float(getattr(self, "base_lr", 0.0))
+        if base_wd is None:
+            base_wd = float(getattr(self, "base_wd", 0.0))
+
+        cfg["base_lr"] = base_lr
+        cfg["base_wd"] = base_wd
+
+        # NOTE: I deliberately do NOT include actual models/optimizers/callbacks,
+        # because they are not JSON-serializable and are restored from weights.
+        return cfg
+
+    @classmethod
+    def from_config(cls, config):
+        """
+        Rebuild a trainer from a config dict.
+
+        Important
+        ---------
+        My training workflow restores **weights** into an already-constructed
+        trainer that you build via your `build_encoder` / `build_projector`
+        helpers. Because `encoder` and `projector` are required and not
+        serializable into JSON, automatic reconstruction from this config is
+        intentionally **not** supported.
+
+        This method exists only to satisfy Keras' serialization contract and
+        prevent warnings during weight saving. If someone tries to call it,
+        I raise a clear error explaining the supported path.
+        """
+        raise NotImplementedError(
+            "VICRegTrainer cannot be constructed from config alone. "
+            "Build encoder/projector explicitly, create VICRegTrainer(encoder=..., projector=..., ...), "
+            "then call `load_weights(...)` if needed."
+        )
+

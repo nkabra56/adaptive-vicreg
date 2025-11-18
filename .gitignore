@@ -12,3 +12,4 @@ logs/
 results/
 .venv-ngc/
 .config/
+reports/
