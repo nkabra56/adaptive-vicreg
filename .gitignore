@@ -13,3 +13,5 @@ results/
 .venv-ngc/
 .config/
 reports/
+ngcContainer.sh
+ngcContEnv.sh
