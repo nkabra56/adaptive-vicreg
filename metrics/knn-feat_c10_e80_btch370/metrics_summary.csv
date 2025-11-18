@@ -1,2 +1,0 @@
-run,dataset,n_classes,accuracy,precision_macro,recall_macro,f1_macro,precision_weighted,recall_weighted,f1_weighted,precision_micro,recall_micro,f1_micro,roc_auc_macro_ovr,roc_auc_micro_ovr,pr_ap_macro
-knn-feat_c10_e80_btch370,cifar10,10,0.2316,0.2310,0.2316,0.2154,0.2310,0.2316,0.2154,0.2316,0.2316,0.2316,0.7062,0.7154,0.2171
