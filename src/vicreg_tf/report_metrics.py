@@ -52,8 +52,12 @@ Notes
                 prec_weighted, rec_weighted, auc_ovr
     If you instead pass prediction files (y_true, y_pred or y_proba),
     the script will compute these metrics for you (requires scikit-learn).
-  - kNN CSV should contain: method, dataset, top1_k20, top1_k200
-    Optionally the same additional metrics if you computed them.
+  - kNN CSV can be EITHER:
+      (a) wide/pivoted: columns 'method', 'top1_k20', 'top1_k200' (percentages),
+          OR
+      (b) long-form: 'dataset','method','k','temperature','top1' where
+          'top1' is in [0,1] or [%]. We auto-pivot to columns per k and
+          convert to percent if needed.
 • History JSONL rows are produced by the training callback; each row looks like:
     {"epoch": 1, "loss/total":..., "loss/align":..., "loss/var":..., "loss/cov":...,
      "stats/avg_std":..., "stats/avg_offdiag_corr_sq":...}
@@ -151,7 +155,7 @@ def _read_eval_csv(path: str) -> pd.DataFrame:
       - f1_macro, f1_weighted,
       - prec_macro, rec_macro, prec_weighted, rec_weighted,
       - auc_ovr,
-      - For kNN: top1_k20, top1_k200.
+      - For kNN: top1_k20, top1_k200 or long-form 'k' + 'top1'.
 
     Returns
     -------
@@ -298,55 +302,90 @@ def _line_plot(
 
 
 # ----------------------------- Public API functions ----------------------------
-def build_linear_table(
-    linear_csv: str,
-    methods_order: list[str] | None = None,
-) -> pd.DataFrame:
+def build_linear_table(csv_path: str) -> pd.DataFrame:
     """
-    Build the Linear Probing quantitative table.
+    Read the linear-probe CSV and normalize column names so downstream code
+    can always rely on 'method' and 'top1'.
+
+    Why this exists
+    ---------------
+    My linear eval script may emit 'test_acc' (or 'acc', 'accuracy') instead of
+    'top1'. This function maps common aliases to a canonical 'top1'. Likewise,
+    it maps 'method_name' or 'name' to 'method'.
 
     Parameters
     ----------
-    linear_csv : str
-        Path to CSV with columns at least: method, top1, top5.
-        Optionally includes f1_weighted, f1_macro, precision/recall variants.
-    methods_order : list[str] or None
-        Optional order for methods (rows). If None, uses CSV order.
+    csv_path : str
+        Path to the CSV produced by scripts/eval_linear.py.
 
     Returns
     -------
-    pd.DataFrame
-        Columns: Method, Top-1 (%), Top-5 (%), F1 (Weighted) (%)
+    pandas.DataFrame
+        A dataframe that *must* contain at least: 'method', 'top1'.
+        All other columns are preserved as-is.
     """
-    df = _read_eval_csv(linear_csv).copy()
-    # Normalize column names to a consistent set
-    col_map = {c.lower(): c for c in df.columns}
-    def _get(colnames: list[str], default=None):
-        for c in colnames:
-            if c in col_map:
-                return df[col_map[c]]
-        return default
+    if csv_path is None or str(csv_path).strip() == "":
+        raise ValueError("Missing --linear-csv path.")
 
-    method = _get(["method"])
-    top1 = _get(["top1", "acc_top1", "accuracy"])
-    top5 = _get(["top5", "acc_top5"])
-    f1w  = _get(["f1_weighted", "f1w", "f1_w"])
-    if method is None or top1 is None:
-        raise ValueError("Linear CSV must contain at least 'method' and 'top1' (or equivalent).")
+    df = pd.read_csv(csv_path)
 
-    table = pd.DataFrame({
-        "Method": method,
-        "Top-1 Accuracy (%)": np.round(top1.astype(float), 2),
-        "Top-5 Accuracy (%)": np.round(top5.astype(float), 2) if top5 is not None else np.nan,
-        "F1-Score (Weighted) (%)": np.round(f1w.astype(float), 2) if f1w is not None else np.nan,
-    })
+    # --- Normalize the 'method' column ---
+    method_candidates = ["method", "method_name", "name"]
+    found_method = None
+    for c in df.columns:
+        lc = c.strip().lower()
+        if lc in method_candidates:
+            found_method = c
+            break
+    if found_method is None:
+        # If completely missing, create a reasonable default
+        df["method"] = "LinearProbe"
+    else:
+        if found_method != "method":
+            df = df.rename(columns={found_method: "method"})
 
-    # Reorder methods if requested
-    if methods_order:
-        table["__order__"] = table["Method"].apply(lambda m: methods_order.index(m) if m in methods_order else len(methods_order))
-        table = table.sort_values("__order__").drop(columns="__order__")
+    # --- Normalize the accuracy column to 'top1' ---
+    # Look for common accuracy columns, in priority order.
+    acc_priority = [
+        "top1", "test_acc", "acc", "accuracy", "val_top1", "val_acc", "test_accuracy"
+    ]
+    found_acc = None
+    lc_map = {c: c.strip().lower() for c in df.columns}
+    for c in df.columns:
+        if lc_map[c] in acc_priority:
+            found_acc = c
+            break
+    # As a last resort, pick the first column that contains 'acc' (case-insensitive).
+    if found_acc is None:
+        for c in df.columns:
+            if "acc" in c.strip().lower():
+                found_acc = c
+                break
 
-    return table
+    if found_acc is None:
+        raise ValueError(
+            "Linear CSV must contain an accuracy column such as 'top1', 'test_acc', 'acc', or 'accuracy'."
+        )
+
+    # Rename to 'top1' if needed and coerce to float
+    if found_acc != "top1":
+        df = df.rename(columns={found_acc: "top1"})
+
+    # Make sure top1 is numeric
+    df["top1"] = pd.to_numeric(df["top1"], errors="coerce")
+
+    # If someone logged percentages (e.g., 87.3 instead of 0.873), try to detect
+    # and convert to [0,1] if values look like percentages.
+    if df["top1"].max() > 1.5:
+        df["top1"] = df["top1"] / 100.0
+
+    # Keep other columns intact; ensure we at least return method + top1
+    needed = {"method", "top1"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"Linear CSV is missing required columns after normalization: {missing}")
+
+    return df
 
 
 def build_knn_table(
@@ -354,36 +393,101 @@ def build_knn_table(
     methods_order: list[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Build the k-NN quantitative table (Top-1 @ k=20, 200).
+    Build the k-NN quantitative table.
+
+    This function supports **two input formats**:
+
+    1) Wide/pivoted (already has specific k columns):
+       Columns include at least: 'method', 'top1_k20', 'top1_k200'
+       Values are expected as **percentages** (e.g., 78.45).
+
+    2) Long-form (what my knn_eval.py emits by default):
+       Columns: 'dataset','method','k','temperature','top1'
+       - 'top1' can be in [0,1] or in [%]; we auto-convert to [%] if needed.
+       - If multiple rows exist per (method, k), we keep the **best** top-1.
+       - The table will include columns for the k values present. If only one k
+         exists (e.g., 200), only that column will be shown.
 
     Parameters
     ----------
     knn_csv : str
-        Path to CSV with columns: method, top1_k20, top1_k200.
+        Path to CSV with k-NN results.
     methods_order : list[str] or None
         Optional order for methods (rows).
 
     Returns
     -------
     pd.DataFrame
-        Columns: Method, Top-1 (k=20) (%), Top-1 (k=200) (%)
+        Nicely formatted table with Method and one or more "Top-1 Accuracy (k=K) (%)"
+        columns, depending on what is available in the CSV.
     """
     df = _read_eval_csv(knn_csv).copy()
-    col = {c.lower(): c for c in df.columns}
-    method = df[col["method"]] if "method" in col else None
-    k20 = df[col["top1_k20"]] if "top1_k20" in col else None
-    k200 = df[col["top1_k200"]] if "top1_k200" in col else None
-    if method is None or k20 is None or k200 is None:
-        raise ValueError("kNN CSV must contain 'method', 'top1_k20', and 'top1_k200'.")
 
-    table = pd.DataFrame({
-        "Method": method,
-        "Top-1 Accuracy (k=20) (%)": np.round(k20.astype(float), 2),
-        "Top-1 Accuracy (k=200) (%)": np.round(k200.astype(float), 2),
-    })
+    # Case A: user already provided wide columns
+    lower = {c.lower(): c for c in df.columns}
+    if "method" in lower and ("top1_k20" in lower or "top1_k200" in lower):
+        # Pull available columns and format
+        method_col = lower["method"]
+        cols = []
+        if "top1_k20" in lower:
+            cols.append(("Top-1 Accuracy (k=20) (%)", lower["top1_k20"]))
+        if "top1_k200" in lower:
+            cols.append(("Top-1 Accuracy (k=200) (%)", lower["top1_k200"]))
+
+        table = pd.DataFrame({"Method": df[method_col]})
+        for pretty, raw in cols:
+            x = pd.to_numeric(df[raw], errors="coerce")
+            # If data looks like [0,1], convert to %
+            if x.max() <= 1.5:
+                x = 100.0 * x
+            table[pretty] = np.round(x.astype(float), 2)
+
+        if methods_order:
+            table["__order__"] = table["Method"].apply(
+                lambda m: methods_order.index(m) if m in methods_order else len(methods_order)
+            )
+            table = table.sort_values("__order__").drop(columns="__order__")
+
+        return table
+
+    # Case B: long-form from our knn_eval.py
+    need = {"method", "k", "top1"}
+    if not need.issubset({c.lower() for c in df.columns}):
+        raise ValueError(
+            "kNN CSV must either be wide (have 'method' + 'top1_k20'/'top1_k200') "
+            "or long-form with columns: method, k, top1."
+        )
+
+    # Normalize column names to canonical
+    colmap = {c.lower(): c for c in df.columns}
+    df = df.rename(columns=colmap)
+
+    # Make numeric
+    df["k"] = pd.to_numeric(df["k"], errors="coerce")
+    df["top1"] = pd.to_numeric(df["top1"], errors="coerce")
+
+    # If top1 is in [0,1], convert to percentage
+    if df["top1"].max() <= 1.5:
+        df["top1"] = 100.0 * df["top1"]
+
+    # Keep the best result per (method, k) (e.g., best temperature)
+    agg = df.groupby(["method", "k"], as_index=False)["top1"].max()
+
+    # Determine which k columns to show (sorted ascending)
+    ks = sorted(agg["k"].dropna().unique().astype(int).tolist())
+    # Create a pivot: rows=method, columns=k, values=top1
+    piv = agg.pivot(index="method", columns="k", values="top1").reset_index().fillna(np.nan)
+
+    # Build final table with pretty column names
+    table = pd.DataFrame({"Method": piv["method"]})
+    for k in ks:
+        pretty = f"Top-1 Accuracy (k={k}) (%)"
+        table[pretty] = np.round(piv.get(k, np.nan).astype(float), 2)
 
     if methods_order:
-        table["__order__"] = table["Method"].apply(lambda m: methods_order.index(m) if m in methods_order else len(methods_order))
+        table["__order__"] = table["Method"].apply(
+            lambda m: methods_order.index(m) if m in methods_order else len(methods_order)
+        )
         table = table.sort_values("__order__").drop(columns="__order__")
 
     return table
@@ -428,7 +532,8 @@ def render_training_dynamics(
         out: dict[str, list[float]] = {}
         for name, df in hdfs.items():
             if col in df.columns:
-                s = df.set_index("epoch")[col].reindex(all_epochs).interpolate().fillna(method="bfill").fillna(method="ffill")
+                # forward/backward fill around missing epochs
+                s = df.set_index("epoch")[col].reindex(all_epochs).interpolate().bfill().ffill()
                 out[name] = s.tolist()
         return out
 
@@ -648,6 +753,7 @@ def compute_embedding_avg_std(self, z, axis: int = 0) -> "tf.Tensor":
         size of 1) `reduce_std` is still well-defined but we ensure no NaNs
         propagate.
     """
+    import tensorflow as tf
     x = tf.convert_to_tensor(z, dtype=tf.float32)           # [B, D]
     std_per_dim = tf.math.reduce_std(x, axis=axis)          # [D]
     std_per_dim = tf.where(tf.math.is_finite(std_per_dim),
