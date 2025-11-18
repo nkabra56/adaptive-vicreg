@@ -42,7 +42,7 @@ python3 src/vicreg_tf/report_metrics.py \
   --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
   --linear-csv results/linear_eval.csv \
   --knn-csv    results/knn_eval.csv \
-  --robustness-csv results/compare/robustness.csv
+  --robustness-csv results/robustness.csv
 
 Notes
 -----

@@ -26,12 +26,12 @@ Typical usage
 -------------
 # Example (CIFAR-10, k=200, T=0.1)
 python3 scripts/knn_eval.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_*/vicreg_encoder.weights.h5 \
+  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_2*/vicreg_encoder.weights.h5 \
   --dataset cifar10 --image-size 32 --batch-size 512 \
   --feat-dim 2048 \
   --k 200 --temperature 0.1 \
   --out-csv results/knn_eval.csv \
-  --method-name VICReg
+  --method-name AdaptiveVICReg
 
 Notes on resources and stability
 --------------------------------

@@ -23,13 +23,13 @@ Artifacts
 Example usage (why I do each flag)
 ----------------------------------
 python3 scripts/eval_linear.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_baseline_*/vicreg_encoder.weights.h5 \
+  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_2*/vicreg_encoder.weights.h5 \
   --dataset cifar10 --image-size 32 --batch-size 512 \
   --epochs 10 --lr 0.003 --l2 1e-4 \
   --feat-dim 2048 \
   --opt adamw \
-  --out-csv results/pretrain-c10_checktrainer_baseline/pretrain-c10_checktrainer_baseline_linear_adamw.csv \
-  --method-name VICReg
+  --out-csv results/linear_eval.csv \
+  --method-name AdaptiveVICReg
 
 Notes:
 • I pass a glob for --encoder-ckpt so the script picks the newest match.

@@ -13,6 +13,3 @@ logs/
 results/
 .venv-ngc/
 .config/
-reports/
-*/vicreg_tf/__pycache__/*
-
