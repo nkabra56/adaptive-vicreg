@@ -13,3 +13,4 @@ results/
 .venv-ngc/
 .config/
 reports/
+src/*/__pycache__
