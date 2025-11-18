@@ -133,7 +133,6 @@ python3 scripts/train_vicreg.py \
   --record-every 5 \
   --model-dir checkpoints_tf \
   --run-name "$RUN_NAME" \
-  --device auto
 ```
 
 Artifacts written by the training script:
@@ -346,11 +345,7 @@ BibTeX snippets:
 }
 ```
 
-If you add comparisons against SimCLR, BYOL, SimSiam, or other SSL methods, please cite those works as well.
-
 ---
-
-## License
 
 This code is my original work for academic use in CS-584. CIFAR-10 remains under its original license. Please open issues or pull requests for suggestions and corrections.
 

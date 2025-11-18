@@ -29,7 +29,6 @@ python3 scripts/train_vicreg.py \
   --record-every 1 \
   --model-dir checkpoints_tf \
   --run-name pretrain-c10_checktrainer \
-  --device gpu
 
 How it works (high level)
 -------------------------
