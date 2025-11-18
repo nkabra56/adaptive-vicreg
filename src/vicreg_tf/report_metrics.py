@@ -30,19 +30,19 @@ Typical usage
 -------------
 # A) Minimal: read one run's history and precomputed eval CSVs
 python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/runA \
-  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_model5_e100_20251117-0011/metrics/history.jsonl \
-  --linear-csv results/model5_linear_eval.csv \
-  --knn-csv    results/model5_knn_eval.csv
+  --out-dir reports/pretrain-c10_checktrainer_baseline \
+  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
+  --linear-csv results/pretrain-c10_checktrainer_baseline/pretrain-c10_checktrainer_baseline_linear_adamw.csv \
+  --knn-csv    results/pretrain-c10_checktrainer_baseline/pretrain-c10_checktrainer_baseline_knn_eval.csv
 
 # B) Compare two runs in training plots (Baseline vs Ours)
 python3 src/vicreg_tf/report_metrics.py \
   --out-dir reports/compare \
-  --history name=VICReg-Baseline,path=checkpoints_tf/pretrain-c10_model3_e80_.../metrics/history.jsonl \
-  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_model4_e100_.../metrics/history.jsonl \
+  --history name=VICReg-Baseline,path=checkpoints_tf/pretrain-c10_checktrainer_baseline_20251118-1906/metrics/history.jsonl \
+  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
   --linear-csv results/linear_eval.csv \
   --knn-csv    results/knn_eval.csv \
-  --robustness-csv results/robustness.csv
+  --robustness-csv results/compare/robustness.csv
 
 Notes
 -----

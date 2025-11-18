@@ -1,46 +1,67 @@
 """
 Script Title: kNN Evaluation on Frozen Encoder Features (CIFAR-10/100)
 
-Purpose
--------
-I use this script to evaluate a pretrained encoder by kNN classification on
-frozen features. It loads my encoder weights, extracts features for train/test,
-and computes top-1 accuracy with temperature-weighted voting.
+What the script does
+--------------------
+1) Loads my encoder architecture with the exact feature dimensionality I used
+   during pretraining (e.g., feat_dim=2048).
+2) Restores the encoder weights from a checkpoint file
+   (typically "vicreg_encoder.weights.h5").  If I pass a directory, the script
+   will try to resolve a typical filename inside it.
+3) Extracts **train** and **test** features from CIFAR-10 or CIFAR-100 using a
+   simple, deterministic preprocessing pipeline.
+4) Runs **cosine-similarity kNN** with **temperature-weighted voting** to
+   predict test labels from the train feature bank.
+5) Reports **top-1 accuracy** and appends a single row to a CSV for bookkeeping.
+
+Relationship to my Adaptive VICReg method
+-----------------------------------------
+This evaluation script is **method-agnostic**: it does not know whether the
+encoder was trained with baseline VICReg or **Adaptive VICReg**. I simply pass
+`--method-name` so that the row in my CSV makes it clear which training
+configuration produced the encoder.  This is intentional: it ensures a fair,
+identical evaluation pipeline for both baseline and adaptive variants.
 
 Typical usage
 -------------
+# Example (CIFAR-10, k=200, T=0.1)
 python3 scripts/knn_eval.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_model9_20251117-1530/vicreg_encoder.weights.h5 \
+  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_*/vicreg_encoder.weights.h5 \
   --dataset cifar10 --image-size 32 --batch-size 512 \
   --feat-dim 2048 \
   --k 200 --temperature 0.1 \
-  --out-csv results/pretrain-c10_model9/pretrain-c10_model9_knn_eval.csv \
-  --method-name AdaptiveVICReg
+  --out-csv results/knn_eval.csv \
+  --method-name VICReg
 
-Notes
------
-• I keep memory use sane by batching the test set for similarity computation.
-• If I pass a directory path instead of a file for --encoder-ckpt, the script
-  will try to locate a typical filename like "vicreg_encoder.weights.h5".
-• The features come from `build_encoder(image_size, feat_dim)` and I freeze it.
-• I L2-normalize features and use cosine similarity with temperature.
+Notes on resources and stability
+--------------------------------
+• I L2-normalize all features and use cosine similarity.  This makes kNN robust
+  to scale and typically improves retrieval quality.
+• I compute similarities in **chunks** to keep peak memory usage low.
+• I set `TF_CPP_MIN_LOG_LEVEL=1` to reduce TF verbosity.
+• If I want CPU-only evaluation or to ensure I use a specific device, I can pass
+  `--device cpu` or `--device gpu`. The script also tries a quick GPU probe.
 
 Author: Nishant Kabra
-Date: 11/17/2025
+Date: 11/03/2025
 """
+
 from __future__ import annotations
 
-# --- Make sure my local package (under <repo>/src) is importable. --------------
+# ── Make sure my local package (under <repo>/src) is importable ─────────────────
+# I add <repo>/src to sys.path so `from vicreg_tf import ...` works whether I run
+# from project root or from inside scripts/. This matches my training scripts.
 from pathlib import Path
 import sys
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]   # <repo>
+_REPO_ROOT = Path(__file__).resolve().parents[1]   # <repo> (one level above scripts/)
 _SRC_DIR = _REPO_ROOT / "src"
 if not _SRC_DIR.exists():
+    # If this fails, I'm probably running from the wrong working directory.
     raise RuntimeError(f"Could not find expected source directory: {_SRC_DIR}")
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
-# ------------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 
 import argparse
 import csv
@@ -51,18 +72,39 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
+# I reuse these helpers from my package. They are small utilities to print
+# devices, enable memory growth, and quick-probe the GPU by running a trivial op.
 from vicreg_tf import build_encoder, print_devices, enable_memory_growth, gpu_probe_ok
 
 
-# ----------------------- CLI and device handling -------------------------------
+# ==============================================================================
+# Device selection (I parse --device early to control CUDA visibility before TF)
+# ==============================================================================
 
 def _preparse_device() -> str:
-    """Parse --device early so I can hide GPUs before TF initializes."""
+    """
+    Parse --device **before** TensorFlow initializes.
+
+    Why I do this:
+    --------------
+    If I want to force CPU mode (or control GPU visibility) I need to set the
+    relevant environment variables (e.g., CUDA_VISIBLE_DEVICES) **before**
+    importing/initializing CUDA drivers. Parsing here lets me do that cleanly.
+
+    Returns
+    -------
+    device_flag : str
+        One of {"auto","gpu","cpu"} to be used by `decide_device`.
+    """
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     args, _ = p.parse_known_args()
+
+    # If user asked for CPU, hide CUDA devices **before** TF loads them.
     if args.device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+    # Quiet down TF logging a bit (still shows warnings/errors).
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
     return args.device
 
@@ -72,12 +114,24 @@ _DEVICE_FLAG = _preparse_device()
 
 def decide_device(device_flag: str) -> str:
     """
-    Decide TF device string based on my preference and a quick GPU probe.
+    Decide the TensorFlow device string to use for feature extraction.
+
+    Behavior
+    --------
+    • "cpu": force CPU ("/CPU:0").
+    • "gpu": prefer GPU ("/GPU:0"), do not fall back.
+    • "auto": probe GPU with a tiny Conv2D; if it fails, fall back to CPU.
+
+    Returns
+    -------
+    device_str : str
+        TensorFlow device string, e.g., "/GPU:0" or "/CPU:0".
     """
     if device_flag == "cpu":
         print("[knn] Forcing CPU mode per flag.")
         return "/CPU:0"
 
+    # Print and configure GPUs for good behavior (memory growth).
     print_devices()
     enable_memory_growth()
 
@@ -85,36 +139,66 @@ def decide_device(device_flag: str) -> str:
         print("[knn] Requested GPU; will not fall back.")
         return "/GPU:0"
 
+    # "auto" path: attempt a tiny GPU op to verify kernels and drivers.
     ok = gpu_probe_ok()
     if not ok:
         print("[knn] GPU probe failed; falling back to CPU.")
     return "/GPU:0" if ok else "/CPU:0"
 
 
+# ==============================================================================
+# CLI
+# ==============================================================================
+
 def parse_args() -> argparse.Namespace:
     """
-    Define and parse CLI arguments for my kNN evaluation.
+    Define and parse command-line arguments for my kNN evaluation.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed flags including encoder path, dataset, k, temperature, etc.
     """
     p = argparse.ArgumentParser(parents=[argparse.ArgumentParser(add_help=False)])
     p.add_argument("--encoder-ckpt", type=str, required=True,
-                   help="Path to encoder .weights.h5 (or folder containing it).")
+                   help="Path to encoder .weights.h5 (or a directory containing it).")
     p.add_argument("--dataset", type=str, choices=["cifar10", "cifar100"], default="cifar10",
-                   help="Evaluation dataset.")
-    p.add_argument("--image-size", type=int, default=32, help="Square crop size.")
+                   help="Which dataset to evaluate on.")
+    p.add_argument("--image-size", type=int, default=32, help="Square side used to preprocess inputs.")
     p.add_argument("--batch-size", type=int, default=512, help="Batch size for feature extraction.")
-    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width.")
-    p.add_argument("--k", type=int, default=200, help="Number of neighbors for kNN.")
+    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width (must match training).")
+    p.add_argument("--k", type=int, default=200, help="Number of neighbors for kNN retrieval.")
     p.add_argument("--temperature", type=float, default=0.1, help="Softmax temperature for voting.")
-    p.add_argument("--out-csv", type=str, required=True, help="Where to append a results row.")
-    p.add_argument("--method-name", type=str, default="AdaptiveVICReg", help="Name to record in CSV.")
+    p.add_argument("--out-csv", type=str, required=True, help="CSV file where I append a results row.")
+    p.add_argument("--method-name", type=str, default="AdaptiveVICReg",
+                   help="Free-form label written to CSV (e.g., 'VICReg' or 'AdaptiveVICReg'). "
+                        "This keeps evaluation identical while allowing me to distinguish encoders.")
     return p.parse_args()
 
 
-# -------------------------- Data utilities -------------------------------------
+# ==============================================================================
+# Data utilities (CIFAR loaders and preprocessing)
+# ==============================================================================
 
 def _load_cifar(dataset: str) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], int]:
     """
-    Load CIFAR-10/100 using Keras datasets. I return (x_train, y_train), (x_test, y_test), num_classes.
+    Load CIFAR-10 or CIFAR-100 and return train/test arrays plus class count.
+
+    Args
+    ----
+    dataset : {"cifar10","cifar100"}
+        Which dataset to load via `keras.datasets`.
+
+    Returns
+    -------
+    (x_train, y_train), (x_test, y_test), num_classes : tuple
+        Numpy arrays of images and labels along with number of classes.
+
+    Implementation notes
+    --------------------
+    • Labels come back as shape [N,1]; I flatten to shape [N] for convenience.
+    • I do **not** perform mean/std normalization here—kNN with cosine similarity
+      and L2-normalized features is fairly stable without it for CIFAR.
     """
     if dataset == "cifar10":
         (x_tr, y_tr), (x_te, y_te) = keras.datasets.cifar10.load_data()
@@ -123,20 +207,36 @@ def _load_cifar(dataset: str) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.n
         (x_tr, y_tr), (x_te, y_te) = keras.datasets.cifar100.load_data(label_mode="fine")
         num_classes = 100
 
-    # Flatten labels to shape [N]
-    y_tr = y_tr.reshape(-1)
-    y_te = y_te.reshape(-1)
+    y_tr = y_tr.reshape(-1)  # [N]
+    y_te = y_te.reshape(-1)  # [N]
     return (x_tr, y_tr), (x_te, y_te), num_classes
 
 
 def _preprocess_images(x: np.ndarray, image_size: int) -> np.ndarray:
     """
-    Convert to float32 in [0,1]; optionally resize to image_size (if not 32).
-    I keep it simple and avoid whitening/mean-std normalization here.
+    Convert images to float32 in [0,1] and resize if needed.
+
+    Args
+    ----
+    x : np.ndarray
+        Input images as uint8 in [0,255] (CIFAR default).
+    image_size : int
+        Target square size; if not 32, I bilinearly resize.
+
+    Returns
+    -------
+    np.ndarray
+        Images as float32 in [0,1], shape [N, H, W, 3].
+
+    Rationale
+    ---------
+    I deliberately keep preprocessing simple and deterministic for evaluation.
+    The goal is to measure the *representation quality* learned during
+    pretraining, not to squeeze accuracy through heavy test-time augmentation.
     """
     x = x.astype("float32") / 255.0
     if image_size != x.shape[1]:
-        # Resize with TF once (NHWC)
+        # Resize with TF once (operates on NHWC tensors).
         xt = tf.convert_to_tensor(x)
         xt = tf.image.resize(xt, (image_size, image_size), method="bilinear")
         x = xt.numpy()
@@ -145,35 +245,81 @@ def _preprocess_images(x: np.ndarray, image_size: int) -> np.ndarray:
 
 def _build_ds(x: np.ndarray, y: np.ndarray, batch_size: int) -> tf.data.Dataset:
     """
-    Build a simple tf.data pipeline for inference (no shuffles, no repeats).
+    Build a simple input pipeline for inference (no shuffling, no repeats).
+
+    Args
+    ----
+    x, y : np.ndarray
+        Images and labels.
+    batch_size : int
+        Inference batch size.
+
+    Returns
+    -------
+    tf.data.Dataset
+        Dataset yielding (images, labels) mini-batches for the encoder.
     """
     ds = tf.data.Dataset.from_tensor_slices((x, y))
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
-# ------------------------- Feature extraction -----------------------------------
+# ==============================================================================
+# Feature extraction (frozen encoder)
+# ==============================================================================
 
 def _extract_features(encoder: tf.keras.Model,
                       ds: tf.data.Dataset) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run frozen encoder on a dataset to collect features and labels.
+    Run my frozen encoder on a dataset to collect features and labels.
+
+    Args
+    ----
+    encoder : tf.keras.Model
+        The backbone created by `build_encoder(image_size, feat_dim)`.
+    ds : tf.data.Dataset
+        Batched dataset yielding (images, labels) pairs.
+
+    Returns
+    -------
+    (feats, labels) : (np.ndarray, np.ndarray)
+        • feats: shape [N, D] (I flatten spatial dims if present).
+        • labels: shape [N], integer class ids.
+
+    Implementation detail
+    ---------------------
+    I use `training=False` so BatchNorm (if any) and other layers behave in eval
+    mode.  I also reshape features to 2D so the kNN math is straightforward.
     """
     feats = []
     labels = []
     for xb, yb in ds:
         z = encoder(xb, training=False)
-        z = tf.reshape(z, [tf.shape(z)[0], -1])  # flatten feature if needed
+        z = tf.reshape(z, [tf.shape(z)[0], -1])   # ensure [N, D] even if encoder outputs [N, H, W, C]
         feats.append(z.numpy())
         labels.append(yb.numpy())
     return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
 
 
-# ----------------------------- kNN core -----------------------------------------
+# ==============================================================================
+# kNN core (cosine similarity + temperature-weighted voting)
+# ==============================================================================
 
 def _l2_normalize(a: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """
-    L2-normalize rows of a 2D array (N, D).
+    L2-normalize each row vector of a 2D array.
+
+    Args
+    ----
+    a : np.ndarray
+        Input of shape [N, D].
+    eps : float
+        Numerical guard against division by zero.
+
+    Returns
+    -------
+    np.ndarray
+        Row-normalized array with the same shape.
     """
     nrm = np.linalg.norm(a, axis=1, keepdims=True)
     nrm = np.maximum(nrm, eps)
@@ -188,10 +334,45 @@ def _knn_predict(train_feats: np.ndarray,
                  num_classes: int,
                  chunk: int = 1024) -> np.ndarray:
     """
-    Predict labels for test features using cosine-similarity kNN with
-    temperature-weighted voting. I compute in chunks to save memory.
+    Predict labels for test features using cosine-similarity kNN.
+
+    I do chunked similarity computation to reduce peak memory usage:
+    instead of building a giant [N_test, N_train] matrix at once,
+    I process contiguous slices of the test set.
+
+    Args
+    ----
+    train_feats : np.ndarray
+        Feature bank for training set, shape [N_train, D].
+    train_labels : np.ndarray
+        Integer class ids for training set, shape [N_train].
+    test_feats : np.ndarray
+        Feature matrix for test set, shape [N_test, D].
+    k : int
+        Number of nearest neighbors to consider.
+    temperature : float
+        Softmax temperature for turning similarities into weights. Smaller
+        temperature sharpens the distribution (more peaky).
+    num_classes : int
+        Number of classes for the voting bins.
+    chunk : int
+        Size of the test slice processed per loop iteration.
+
+    Returns
+    -------
+    np.ndarray
+        Predicted labels for test set, shape [N_test].
+
+    Implementation notes
+    --------------------
+    • I **L2-normalize** both train and test features first. Cosine similarity
+      then reduces to a dot-product.
+    • I use `np.argpartition` to get top-k indices efficiently without a full
+      sort of all similarities.
+    • I apply temperature-scaled exp(.) to top-k similarities and vote into
+      class bins via `np.add.at` to avoid Python loops per class.
     """
-    # Normalize features once
+    # Normalize features once (cosine similarity as dot product).
     train_feats = _l2_normalize(train_feats.astype(np.float32))
     test_feats  = _l2_normalize(test_feats.astype(np.float32))
 
@@ -201,41 +382,76 @@ def _knn_predict(train_feats: np.ndarray,
     for start in range(0, n_test, chunk):
         end = min(start + chunk, n_test)
         q = test_feats[start:end]                     # [B, D]
-        sim = np.matmul(q, train_feats.T)            # [B, Ntrain]
+        sim = np.matmul(q, train_feats.T)            # [B, N_train], cosine similarity (dot product)
 
-        # Take top-k indices
-        # Use argpartition then gather for speed/memory
+        # Top-k indices via partial selection (faster + lower memory than full argsort).
         topk_idx = np.argpartition(sim, -k, axis=1)[:, -k:]
-        # Gather top-k sims and labels
+
+        # Gather the top-k similarities and corresponding labels.
         rows = np.arange(end - start)[:, None]
         topk_sim = sim[rows, topk_idx]               # [B, k]
         topk_lbl = train_labels[topk_idx]            # [B, k]
 
-        # Temperature-softmax weights per test sample over its k neighbors
+        # Temperature-scaled softmax weights (no normalization needed for voting).
         w = np.exp(topk_sim / float(temperature))    # [B, k]
 
-        # Accumulate weighted votes into class bins via advanced indexing
+        # Accumulate weighted votes into per-class bins.
         votes = np.zeros((end - start, num_classes), dtype=np.float64)
-        # For each position in the k list, accumulate
         for j in range(k):
+            # votes[b, lbl_j] += w[b, j]  for each row b
             np.add.at(votes, (np.arange(end - start), topk_lbl[:, j]), w[:, j])
 
-        preds[start:end] = votes.argmax(axis=1)
+        preds[start:end] = votes.argmax(axis=1)      # predicted class = argmax of votes
 
     return preds
 
 
 def _top1_acc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute top-1 accuracy in [0, 1]."""
+    """
+    Compute top-1 accuracy.
+
+    Args
+    ----
+    y_true, y_pred : np.ndarray
+        True and predicted labels as shape [N] integer arrays.
+
+    Returns
+    -------
+    float
+        Fraction of correct predictions in [0,1].
+    """
     return float((y_true == y_pred).mean())
 
 
-# ----------------------------- Checkpoint utils ---------------------------------
+# ==============================================================================
+# Checkpoint resolution helper
+# ==============================================================================
 
 def _resolve_encoder_ckpt(path: str) -> str:
     """
-    Resolve an encoder checkpoint path.
-    If I pass a directory, try common filenames. Else require that file exists.
+    Resolve an encoder checkpoint path robustly.
+
+    Args
+    ----
+    path : str
+        Either a direct file path to `*.weights.h5` or a directory that
+        contains a typical filename like "vicreg_encoder.weights.h5".
+
+    Returns
+    -------
+    str
+        Resolved file path to the encoder weights.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no suitable file is found.
+
+    Why I do this
+    -------------
+    My training script writes checkpoints into per-run directories. Sometimes I
+    just copy/paste the run directory into this flag; this helper saves me from
+    having to type the full filename.
     """
     if os.path.isfile(path):
         return path
@@ -254,50 +470,72 @@ def _resolve_encoder_ckpt(path: str) -> str:
     )
 
 
-# ------------------------------------ main --------------------------------------
+# ==============================================================================
+# Main
+# ==============================================================================
 
 def main() -> None:
     """
-    Entry point: load data, build encoder, extract features, run kNN, write CSV row.
+    Entry point: load data, build encoder, extract features, run kNN, write CSV.
+
+    Steps
+    -----
+    1) Decide device (CPU/GPU/auto) and print it.
+    2) Load CIFAR (train/test) and preprocess to [0,1] float; resize if needed.
+    3) Build the encoder (`build_encoder(image_size, feat_dim)`) and load weights.
+    4) Extract train/test features in batches with `training=False`.
+    5) Run kNN with cosine similarity and temperature voting.
+    6) Append a results row to `--out-csv` with columns:
+       [dataset, method, k, temperature, top1].
+
+    **ADAPTIVE VICREG NOTE**:
+    -------------------------
+    The *only* place that is aware of "Adaptive VICReg" here is the string I pass
+    via `--method-name`. This script does not change behavior based on the method;
+    it intentionally remains identical for both baseline and adaptive encoders to
+    keep evaluation fair and comparable.
     """
     args = parse_args()
     device_str = decide_device(_DEVICE_FLAG)
     print(f"[knn] Using device: {device_str}")
 
+    # 1) Load and preprocess data
     (x_tr, y_tr), (x_te, y_te), num_classes = _load_cifar(args.dataset)
     x_tr = _preprocess_images(x_tr, args.image_size)
     x_te = _preprocess_images(x_te, args.image_size)
 
+    # 2) Build datasets for feature extraction
     ds_tr = _build_ds(x_tr, y_tr, args.batch_size)
     ds_te = _build_ds(x_te, y_te, args.batch_size)
 
     with tf.device(device_str):
-        # Build encoder and load weights robustly
+        # 3) Build encoder and load weights
         enc = build_encoder(args.image_size, feat_dim=args.feat_dim)
         ckpt = _resolve_encoder_ckpt(args.encoder_ckpt)
         print(f"[knn] Loading encoder weights from: {ckpt}")
-        enc.load_weights(ckpt)
+        enc.load_weights(ckpt)  # pure load; encoder is kept frozen
 
-        # Extract features
+        # 4) Extract features
         print("[knn] Extracting train features...")
         f_tr, y_tr_np = _extract_features(enc, ds_tr)
         print("[knn] Extracting test features...")
         f_te, y_te_np = _extract_features(enc, ds_te)
 
-        # kNN predict
+        # 5) kNN predict
         print(f"[knn] Running kNN: k={args.k} T={args.temperature}")
         y_pred = _knn_predict(f_tr, y_tr_np, f_te, args.k, args.temperature, num_classes)
         acc1 = _top1_acc(y_te_np, y_pred)
 
-    # Append results to CSV (create parent dir if needed)
+    # 6) Write/append CSV row with a consistent header
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
     header = ["dataset", "method", "k", "temperature", "top1"]
     exists = os.path.isfile(args.out_csv)
     with open(args.out_csv, "a", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(header)
+            w.writerow(header)  # create header only once
         w.writerow([args.dataset, args.method_name, args.k, args.temperature, f"{acc1:.4f}"])
+
     print(f"[knn] top-1 accuracy: {acc1:.4f}")
     print(f"[knn] Wrote results row to: {args.out_csv}")
 
