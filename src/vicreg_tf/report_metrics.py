@@ -1,796 +1,696 @@
 """
-Script Title: Metrics Aggregation & Visualization for VICReg / Adaptive VICReg
+Report generator for Adaptive VICReg vs. Baseline on CIFAR-10.
 
-What this script does
----------------------
-Aggregates, computes, and **saves** the quantitative tables and training plots
-required for your project report. It supports:
-  1) Downstream metrics tables (Linear Probing, k-NN) with Top-1/Top-5,
-     F1 (macro/weighted), Precision (macro/weighted), Recall (macro/weighted),
-     and optional AUC-ROC (if predictions/probabilities are provided).
-  2) Training dynamics plots using per-epoch `metrics/history.jsonl`
-     emitted by `train_vicreg.py`:
-       • Loss components (align / var / cov) per epoch,
-       • Average embedding standard deviation per epoch (variance control),
-       • Average squared off-diagonal correlation per epoch (redundancy control).
-  3) Robustness plot: Top-1 accuracy vs Batch Size for multiple methods.
+What this script produces (under --out-dir):
+- Plots of training dynamics (loss parts & embedding stats), overlaid for multiple runs.
+- Quantitative tables:
+  * table_linear.csv/.png  -> method, top1, top5, f1_weighted (from linear probe CSVs)
+  * table_knn.csv/.png     -> method, top1_k20, top1_k200   (from kNN eval CSVs; falls back to grid)
+- Robustness plot:
+  * perf_vs_batchsize_k200.png -> Top-1@k=200 (from kNN) vs training batch size across runs.
 
-Outputs (all files saved under --out-dir):
-  • table_linear.png            (Linear probing summary)
-  • table_knn.png               (k-NN evaluation summary)
-  • plot_loss_align.png
-  • plot_loss_var.png
-  • plot_loss_cov.png
-  • plot_avg_std.png
-  • plot_avg_corr_log.png
-  • plot_robustness_vs_batch.png
-  • metrics_summary.md          (brief index of files produced)
+Usage (single run; backward compatible):
+  python3 src/vicreg_tf/report_metrics.py \
+    --out-dir "reports/${RUN_NAME}" \
+    --history "name=AdaptiveVICReg,path=${RUN_DIR}/metrics/history.jsonl" \
+    --linear-csv "results/${RUN_NAME}/${RUN_NAME}_linear_adamw.csv" \
+    --knn-csv    "results/${RUN_NAME}/${RUN_NAME}_knn_eval.csv"
 
-Typical usage
--------------
-# A) Minimal: read one run's history and precomputed eval CSVs
-python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/pretrain-c10_checktrainer_baseline \
-  --history name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_checktrainer_20251118-1847/metrics/history.jsonl \
-  --linear-csv results/linear_eval.csv \
-  --knn-csv    results/knn_eval.csv
-
-# B) Compare two runs in training plots (Baseline vs Ours)
-python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/compare_baseline_e10 \
-  --history name=VICReg-Baseline,path=checkpoints_tf/c10_vicreg_baseline_10_20251118-2141/metrics/history.jsonl \
-  --history name=AdaptiveVICReg,path=checkpoints_tf/c10_adaptive_vicreg_10_20251118-2155/metrics/history.jsonl \
-  --linear-csv results/linear_eval.csv \
-  --knn-csv    results/knn_eval.csv
+Usage (two runs: baseline vs adaptive, with auto-overlays and robustness):
+  python3 src/vicreg_tf/report_metrics.py \
+    --out-dir "reports/COMPARE_baseline_vs_adaptive" \
+    --history "name=VICReg,path=checkpoints_tf/baseline_run/metrics/history.jsonl,config=checkpoints_tf/baseline_run/train_config.json" \
+    --history "name=AdaptiveVICReg,path=checkpoints_tf/adaptive_run/metrics/history.jsonl,config=checkpoints_tf/adaptive_run/train_config.json" \
+    --linear-csv "name=VICReg,path=results/baseline_run/baseline_run_linear_adamw.csv" \
+    --linear-csv "name=AdaptiveVICReg,path=results/adaptive_run/adaptive_run_linear_adamw.csv" \
+    --knn-csv "name=VICReg,path=results/baseline_run/baseline_run_knn_eval.csv" \
+    --knn-csv "name=AdaptiveVICReg,path=results/adaptive_run/adaptive_run_knn_eval.csv" \
+    --knn-grid "name=VICReg,path=results/baseline_run/baseline_run_knn_grid.csv" \
+    --knn-grid "name=AdaptiveVICReg,path=results/adaptive_run/adaptive_run_knn_grid.csv"
 
 Notes
------
-• CSV formats (flexible):
-  - Linear CSV should contain at least: method, dataset, top1, top5
-    Optionally: f1_macro, f1_weighted, prec_macro, rec_macro,
-                prec_weighted, rec_weighted, auc_ovr
-    If you instead pass prediction files (y_true, y_pred or y_proba),
-    the script will compute these metrics for you (requires scikit-learn).
-  - kNN CSV can be EITHER:
-      (a) wide/pivoted: columns 'method', 'top1_k20', 'top1_k200' (percentages),
-          OR
-      (b) long-form: 'dataset','method','k','temperature','top1' where
-          'top1' is in [0,1] or [%]. We auto-pivot to columns per k and
-          convert to percent if needed.
-• History JSONL rows are produced by the training callback; each row looks like:
-    {"epoch": 1, "loss/total":..., "loss/align":..., "loss/var":..., "loss/cov":...,
-     "stats/avg_std":..., "stats/avg_offdiag_corr_sq":...}
-• AUC-ROC for multiclass requires one-vs-rest probabilities. If you only have
-  discrete predictions, AUC will be skipped.
+- If 'config=' is omitted in --history, we try to infer train_config.json from the history path.
+- Linear CSVs: if top5 or f1_weighted columns are absent, they show as NaN (not a failure).
+- kNN: If k=20/200 columns are missing in the eval CSV, we mine the grid CSV (if provided) for best rows at k=20 and k=200.
+- Embedding plots:
+    * stats/avg_std: we draw a horizontal gamma=1 line (baseline target). If your history ever logs 'target/gamma'
+      per epoch, we'll overlay it as a dashed curve (useful for future dynamic targets).
+    * stats/avg_offdiag_corr_sq: plotted with a LOG y-axis to visualize decorrelation progress.
 
 Author: Nishant Kabra
-Date: 11/16/2025
+Date: 11/18/2025
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import typing as _t
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-# Try optional sklearn for metric computation from raw predictions/probas.
-try:
-    from sklearn.metrics import (
-        accuracy_score,
-        f1_score,
-        precision_score,
-        recall_score,
-        roc_auc_score,
-        top_k_accuracy_score,
-    )
-    _HAVE_SK = True
-except Exception:
-    _HAVE_SK = False
 
 
-# ----------------------------- Data structures --------------------------------
-@dataclass
-class HistorySpec:
-    """Represents one training history source."""
-    name: str
-    path: str
+# =============================== Parsing helpers ===============================
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 
-# ----------------------------- I/O utilities ----------------------------------
-def _ensure_out(out_dir: str) -> None:
-    """Create output directory if needed."""
-    os.makedirs(out_dir, exist_ok=True)
-
-
-def _load_history_jsonl(path: str) -> pd.DataFrame:
+def _parse_kv_spec(spec: str) -> Dict[str, str]:
     """
-    Load metrics history from JSONL (one JSON object per line).
+    Parse 'key=val,key=val,...' into a dict. Keys and values are stripped.
+    Minimalistic to keep compatibility with your previous CLI style.
 
-    Parameters
-    ----------
-    path : str
-        Path to the `metrics/history.jsonl` produced during training.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns include `epoch`, optional `loss/...`, and `stats/...`.
+    Examples:
+      "name=AdaptiveVICReg,path=/a/b/history.jsonl"
+      "path=/a/b/linears.csv"     -> returns {"path": "..."} (no name)
     """
-    rows = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                # Skip malformed lines (robust to partial writes)
-                continue
-    if not rows:
-        return pd.DataFrame(columns=["epoch"])
-    df = pd.DataFrame(rows)
-    # Ensure epoch is integer-sorted
-    if "epoch" in df.columns:
-        df = df.sort_values("epoch").reset_index(drop=True)
-    return df
-
-
-def _read_eval_csv(path: str) -> pd.DataFrame:
-    """
-    Read a generic evaluation CSV.
-
-    Notes
-    -----
-    The script is agnostic to exact column names beyond a few defaults.
-    Common columns:
-      - method, dataset,
-      - top1, top5,
-      - f1_macro, f1_weighted,
-      - prec_macro, rec_macro, prec_weighted, rec_weighted,
-      - auc_ovr,
-      - For kNN: top1_k20, top1_k200 or long-form 'k' + 'top1'.
-
-    Returns
-    -------
-    pd.DataFrame
-    """
-    return pd.read_csv(path)
-
-
-def _maybe_compute_metrics_from_preds(
-    y_true: np.ndarray,
-    y_pred: np.ndarray | None = None,
-    y_proba: np.ndarray | None = None,
-    topk: _t.Sequence[int] = (1, 5),
-) -> dict[str, float]:
-    """
-    Compute classification metrics from raw predictions/probabilities.
-
-    Parameters
-    ----------
-    y_true : np.ndarray
-        True class indices shape [N].
-    y_pred : np.ndarray or None
-        Predicted class indices shape [N] (if available).
-    y_proba : np.ndarray or None
-        Prediction probabilities shape [N, C] (for Top-5, AUC, and better F1).
-    topk : sequence[int]
-        Which top-k accuracies to compute when probabilities are available.
-
-    Returns
-    -------
-    dict[str, float]
-        Dictionary including top1/top5 accuracy when computable, f1/precision/recall
-        macro+weighted, and auc_ovr when probabilities are provided.
-
-    Notes
-    -----
-    Requires scikit-learn. If unavailable, only returns keys computable with
-    y_pred (accuracy/f1/precision/recall).
-    """
-    out: dict[str, float] = {}
-    if not _HAVE_SK:
-        # Minimal fallback if sklearn is not installed
-        if y_pred is not None:
-            acc = float((y_pred == y_true).mean())
-            out["top1"] = 100.0 * acc
-        return out
-
-    if y_pred is None and y_proba is not None:
-        # Derive hard predictions from probabilities
-        y_pred = np.argmax(y_proba, axis=1)
-
-    if y_pred is not None:
-        out["top1"] = 100.0 * accuracy_score(y_true, y_pred)
-        out["f1_macro"] = 100.0 * f1_score(y_true, y_pred, average="macro")
-        out["f1_weighted"] = 100.0 * f1_score(y_true, y_pred, average="weighted")
-        out["prec_macro"] = 100.0 * precision_score(y_true, y_pred, average="macro", zero_division=0)
-        out["prec_weighted"] = 100.0 * precision_score(y_true, y_pred, average="weighted", zero_division=0)
-        out["rec_macro"] = 100.0 * recall_score(y_true, y_pred, average="macro", zero_division=0)
-        out["rec_weighted"] = 100.0 * recall_score(y_true, y_pred, average="weighted", zero_division=0)
-
-    if y_proba is not None:
-        # Top-k accuracies
-        for k in topk:
-            try:
-                out[f"top{k}"] = 100.0 * top_k_accuracy_score(y_true, y_proba, k=k)
-            except Exception:
-                pass
-        # AUC one-vs-rest (requires probabilities)
-        try:
-            out["auc_ovr"] = 100.0 * roc_auc_score(y_true, y_proba, multi_class="ovr")
-        except Exception:
-            pass
-
+    out: Dict[str, str] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+        else:
+            # Single path without key.
+            if "path" not in out:
+                out["path"] = part
     return out
 
 
-# ----------------------------- Plotting helpers --------------------------------
-def _save_table_image(df: pd.DataFrame, out_path: str, title: str) -> None:
-    """
-    Render a pandas DataFrame as a static image using matplotlib's table.
+@dataclass
+class RunEntry:
+    """Container for one run: history, config (optional), linear/knn csvs."""
+    name: str
+    history: str
+    config: Optional[str] = None
+    linear_csvs: List[str] = None
+    knn_csvs: List[str] = None
+    knn_grid_csvs: List[str] = None
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The table data (already formatted as strings or numbers).
-    out_path : str
-        Where to save the PNG file.
-    title : str
-        Plot title.
+    def __post_init__(self):
+        self.linear_csvs = self.linear_csvs or []
+        self.knn_csvs = self.knn_csvs or []
+        self.knn_grid_csvs = self.knn_grid_csvs or []
+
+    def infer_config_from_history(self) -> None:
+        """If config isn't provided, infer ../train_config.json from history path."""
+        if self.config and os.path.exists(self.config):
+            return
+        # Expect .../<run_dir>/metrics/history.jsonl -> ../train_config.json
+        try:
+            metrics_dir = os.path.dirname(self.history)
+            run_dir = os.path.dirname(metrics_dir)
+            guess = os.path.join(run_dir, "train_config.json")
+            if os.path.exists(guess):
+                self.config = guess
+        except Exception:
+            pass
+
+
+def _attach_file_to_named_run(runs_by_name: Dict[str, RunEntry],
+                              spec_list: List[str],
+                              slot: str) -> None:
     """
-    fig, ax = plt.subplots(figsize=(max(6, 0.35 * (len(df.columns) + 1)), 0.6 * (len(df) + 2)))
+    Attach files (linear/knn/knn-grid) to runs. Each spec may be:
+      - "name=Foo,path=/x/y.csv"
+      - "/x/y.csv"  (if there is only ONE run total, we attach it to that one)
+    """
+    if not spec_list:
+        return
+    unnamed_targets: List[str] = []
+    for raw in spec_list:
+        kv = _parse_kv_spec(raw)
+        name = kv.get("name")
+        path = kv.get("path")
+        if not path:
+            continue
+        if name:
+            runs_by_name.setdefault(name, RunEntry(name=name, history="")).__dict__[slot].append(path)
+        else:
+            unnamed_targets.append(path)
+
+    # If only one run exists and some paths were unnamed, attach to that run:
+    if unnamed_targets and len(runs_by_name) == 1:
+        only = next(iter(runs_by_name.values()))
+        only.__dict__[slot].extend(unnamed_targets)
+
+
+# ============================ I/O + safe readers ================================
+
+def read_history_jsonl(path: str) -> Optional[pd.DataFrame]:
+    """Load history.jsonl with epoch and known keys; return None if missing."""
+    if not path or not os.path.exists(path):
+        return None
+    rows = []
+    with open(path, "r") as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    # Ensure epoch exists
+    if "epoch" not in df.columns:
+        df["epoch"] = np.arange(1, len(df) + 1)
+    else:
+        df["epoch"] = df["epoch"].astype(int)
+
+    # Maintain a tidy set if present:
+    keep = [
+        "epoch",
+        "loss/total", "loss/align", "loss/var", "loss/cov",
+        "stats/avg_std", "stats/avg_offdiag_corr_sq",
+        "target/gamma"  # optional; if you ever log it
+    ]
+    cols = [c for c in keep if c in df.columns]
+    return df[cols].sort_values("epoch")
+
+
+def read_train_config(path: Optional[str]) -> Dict:
+    """Load train_config.json (may be missing). Returns {} if not found."""
+    try:
+        if path and os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def read_csv_soft(path: str) -> Optional[pd.DataFrame]:
+    """Read CSV if exists; else None."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+# ========================= Metric selectors / reducers ==========================
+
+def _pick_acc_col(df: pd.DataFrame, prefer_k200: bool = False) -> Optional[str]:
+    """
+    Pick an accuracy column from df, prefer names containing 'top1' or 'acc'.
+    If prefer_k200=True, prefer a column name that mentions '200'.
+    """
+    if df is None:
+        return None
+    cands = [c for c in df.columns if ("top1" in c.lower()) or (c.lower() == "acc") or ("val_acc" in c.lower())]
+    if not cands:
+        return None
+    if prefer_k200:
+        spec = [c for c in cands if "200" in c]
+        if spec:
+            return spec[0]
+    return cands[0]
+
+
+def _best_value(df: pd.DataFrame, col: str) -> Optional[float]:
+    """Return max value of col in df (float), or None."""
+    try:
+        return float(df[col].max())
+    except Exception:
+        return None
+
+
+def _last_value(df: pd.DataFrame, col: str) -> Optional[float]:
+    """Return last value of col in df (float), or None."""
+    try:
+        return float(df[col].iloc[-1])
+    except Exception:
+        return None
+
+
+def _knn_best_at_k_from_grid(grid_df: pd.DataFrame, k: int) -> Optional[float]:
+    """
+    From a kNN grid CSV (with columns 'k', temperature, and an accuracy column),
+    pick the best top-1 for a fixed k across temperatures.
+    """
+    if grid_df is None or "k" not in grid_df.columns:
+        return None
+    dfk = grid_df[grid_df["k"] == k]
+    if dfk.empty:
+        return None
+    col = _pick_acc_col(dfk, prefer_k200=(k == 200))
+    if not col:
+        return None
+    return _best_value(dfk, col)
+
+
+# ============================== Plotting utils =================================
+
+def _savefig(out_dir: str, name: str) -> str:
+    path = os.path.join(out_dir, name)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
+
+def plot_histories_overlaid(out_dir: str, runs: List[Tuple[str, pd.DataFrame]], key: str, title: str,
+                            logy: bool = False, hline: Optional[Tuple[float, str]] = None,
+                            extra_series: Optional[List[Tuple[str, np.ndarray, np.ndarray]]] = None) -> Optional[str]:
+    """
+    Overlay line plots for a metric key from multiple runs.
+
+    - runs: list of (run_name, history_df)
+    - key: history column to plot (e.g., 'loss/var' or 'stats/avg_std')
+    - hline: optional (y, label) to draw a horizontal reference (e.g., gamma=1)
+    - extra_series: optional list of (label, epochs, values) tuples to overlay (for dynamic targets if logged)
+    """
+    plotted = False
+    plt.figure(figsize=(7.5, 4.3))
+    for name, h in runs:
+        if h is None or key not in h.columns:
+            continue
+        plt.plot(h["epoch"], h[key], label=name)
+        plotted = True
+
+    if not plotted and not extra_series and not hline:
+        return None
+
+    if extra_series:
+        for label, xs, ys in extra_series:
+            plt.plot(xs, ys, linestyle="--", label=label)
+
+    if hline:
+        y, label = hline
+        plt.axhline(y, linestyle=":", color="gray", label=label)
+
+    plt.xlabel("Epoch")
+    plt.ylabel(title)
+    plt.title(title)
+    if logy:
+        # Avoid log(0) – add a tiny epsilon
+        ymin, ymax = plt.ylim()
+        plt.ylim(max(ymin, 1e-8), ymax)
+        plt.yscale("log")
+    plt.legend()
+    return _savefig(out_dir, f"{key.replace('/','_')}.png")
+
+
+# ============================ Table image helpers ===============================
+
+def _format_numbers_for_display(df: pd.DataFrame, decimals: int = 2) -> pd.DataFrame:
+    """
+    Return a copy of df with numeric columns rounded and converted to strings.
+    Non-numeric columns are left as-is. NaNs remain empty strings for clarity.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.{decimals}f}")
+    return out
+
+
+def _save_table_image(df: pd.DataFrame, out_dir: str, filename: str, title: Optional[str] = None,
+                      header_facecolor: str = "#f0f0f0", fontsize: int = 10) -> str:
+    """
+    Render a DataFrame as a high-resolution PNG table using matplotlib.
+
+    Sizing heuristics:
+      - width scales with number of columns
+      - height scales with number of rows
+    """
+    _ensure_dir(out_dir)
+    df_disp = _format_numbers_for_display(df)
+    n_rows, n_cols = df_disp.shape
+
+    # Heuristics for readable sizing
+    col_w = 1.6
+    row_h = 0.5
+    fig_w = max(4.0, min(20.0, 1.2 + col_w * n_cols))
+    fig_h = max(2.2, min(30.0, 1.0 + row_h * (n_rows + 1)))  # +1 for header
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
 
-    # Create table; cellText expects array-like
-    the_table = ax.table(
-        cellText=df.values,
-        colLabels=df.columns.tolist(),
-        loc="center",
-        cellLoc="center",
-    )
-    the_table.scale(1.0, 1.4)  # Slightly increase cell height
-    ax.set_title(title, pad=16)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-
-
-def _line_plot(
-    xs: _t.Sequence[float],
-    ys_dict: dict[str, _t.Sequence[float]],
-    xlabel: str,
-    ylabel: str,
-    out_path: str,
-    logy: bool = False,
-    hlines: dict[str, float] | None = None,
-    title: str | None = None,
-) -> None:
-    """
-    Generic single-axis line plot (one line per dict entry).
-
-    Notes for grading requirements:
-    - We do not specify any colors (matplotlib default).
-    - One chart per figure (no subplots).
-    """
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    for label, ys in ys_dict.items():
-        ax.plot(xs, ys, label=label)  # use default colors only
-
-    if hlines:
-        for lbl, yval in hlines.items():
-            ax.axhline(y=yval, linestyle="--", linewidth=1.0)
-            ax.text(xs[0], yval, f" {lbl}", va="bottom", ha="left")
-
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if logy:
-        ax.set_yscale("log")
     if title:
-        ax.set_title(title)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
+        ax.set_title(title, fontsize=fontsize + 2, pad=12)
 
-
-# ----------------------------- Public API functions ----------------------------
-def build_linear_table(csv_path: str) -> pd.DataFrame:
-    """
-    Read the linear-probe CSV and normalize column names so downstream code
-    can always rely on 'method' and 'top1'.
-
-    Why this exists
-    ---------------
-    My linear eval script may emit 'test_acc' (or 'acc', 'accuracy') instead of
-    'top1'. This function maps common aliases to a canonical 'top1'. Likewise,
-    it maps 'method_name' or 'name' to 'method'.
-
-    Parameters
-    ----------
-    csv_path : str
-        Path to the CSV produced by scripts/eval_linear.py.
-
-    Returns
-    -------
-    pandas.DataFrame
-        A dataframe that *must* contain at least: 'method', 'top1'.
-        All other columns are preserved as-is.
-    """
-    if csv_path is None or str(csv_path).strip() == "":
-        raise ValueError("Missing --linear-csv path.")
-
-    df = pd.read_csv(csv_path)
-
-    # --- Normalize the 'method' column ---
-    method_candidates = ["method", "method_name", "name"]
-    found_method = None
-    for c in df.columns:
-        lc = c.strip().lower()
-        if lc in method_candidates:
-            found_method = c
-            break
-    if found_method is None:
-        # If completely missing, create a reasonable default
-        df["method"] = "LinearProbe"
-    else:
-        if found_method != "method":
-            df = df.rename(columns={found_method: "method"})
-
-    # --- Normalize the accuracy column to 'top1' ---
-    # Look for common accuracy columns, in priority order.
-    acc_priority = [
-        "top1", "test_acc", "acc", "accuracy", "val_top1", "val_acc", "test_accuracy"
-    ]
-    found_acc = None
-    lc_map = {c: c.strip().lower() for c in df.columns}
-    for c in df.columns:
-        if lc_map[c] in acc_priority:
-            found_acc = c
-            break
-    # As a last resort, pick the first column that contains 'acc' (case-insensitive).
-    if found_acc is None:
-        for c in df.columns:
-            if "acc" in c.strip().lower():
-                found_acc = c
-                break
-
-    if found_acc is None:
-        raise ValueError(
-            "Linear CSV must contain an accuracy column such as 'top1', 'test_acc', 'acc', or 'accuracy'."
-        )
-
-    # Rename to 'top1' if needed and coerce to float
-    if found_acc != "top1":
-        df = df.rename(columns={found_acc: "top1"})
-
-    # Make sure top1 is numeric
-    df["top1"] = pd.to_numeric(df["top1"], errors="coerce")
-
-    # If someone logged percentages (e.g., 87.3 instead of 0.873), try to detect
-    # and convert to [0,1] if values look like percentages.
-    if df["top1"].max() > 1.5:
-        df["top1"] = df["top1"] / 100.0
-
-    # Keep other columns intact; ensure we at least return method + top1
-    needed = {"method", "top1"}
-    missing = needed - set(df.columns)
-    if missing:
-        raise ValueError(f"Linear CSV is missing required columns after normalization: {missing}")
-
-    return df
-
-
-def build_knn_table(
-    knn_csv: str,
-    methods_order: list[str] | None = None,
-) -> pd.DataFrame:
-    """
-    Build the k-NN quantitative table.
-
-    This function supports **two input formats**:
-
-    1) Wide/pivoted (already has specific k columns):
-       Columns include at least: 'method', 'top1_k20', 'top1_k200'
-       Values are expected as **percentages** (e.g., 78.45).
-
-    2) Long-form (what my knn_eval.py emits by default):
-       Columns: 'dataset','method','k','temperature','top1'
-       - 'top1' can be in [0,1] or in [%]; we auto-convert to [%] if needed.
-       - If multiple rows exist per (method, k), we keep the **best** top-1.
-       - The table will include columns for the k values present. If only one k
-         exists (e.g., 200), only that column will be shown.
-
-    Parameters
-    ----------
-    knn_csv : str
-        Path to CSV with k-NN results.
-    methods_order : list[str] or None
-        Optional order for methods (rows).
-
-    Returns
-    -------
-    pd.DataFrame
-        Nicely formatted table with Method and one or more "Top-1 Accuracy (k=K) (%)"
-        columns, depending on what is available in the CSV.
-    """
-    df = _read_eval_csv(knn_csv).copy()
-
-    # Case A: user already provided wide columns
-    lower = {c.lower(): c for c in df.columns}
-    if "method" in lower and ("top1_k20" in lower or "top1_k200" in lower):
-        # Pull available columns and format
-        method_col = lower["method"]
-        cols = []
-        if "top1_k20" in lower:
-            cols.append(("Top-1 Accuracy (k=20) (%)", lower["top1_k20"]))
-        if "top1_k200" in lower:
-            cols.append(("Top-1 Accuracy (k=200) (%)", lower["top1_k200"]))
-
-        table = pd.DataFrame({"Method": df[method_col]})
-        for pretty, raw in cols:
-            x = pd.to_numeric(df[raw], errors="coerce")
-            # If data looks like [0,1], convert to %
-            if x.max() <= 1.5:
-                x = 100.0 * x
-            table[pretty] = np.round(x.astype(float), 2)
-
-        if methods_order:
-            table["__order__"] = table["Method"].apply(
-                lambda m: methods_order.index(m) if m in methods_order else len(methods_order)
-            )
-            table = table.sort_values("__order__").drop(columns="__order__")
-
-        return table
-
-    # Case B: long-form from our knn_eval.py
-    need = {"method", "k", "top1"}
-    if not need.issubset({c.lower() for c in df.columns}):
-        raise ValueError(
-            "kNN CSV must either be wide (have 'method' + 'top1_k20'/'top1_k200') "
-            "or long-form with columns: method, k, top1."
-        )
-
-    # Normalize column names to canonical
-    colmap = {c.lower(): c for c in df.columns}
-    df = df.rename(columns=colmap)
-
-    # Make numeric
-    df["k"] = pd.to_numeric(df["k"], errors="coerce")
-    df["top1"] = pd.to_numeric(df["top1"], errors="coerce")
-
-    # If top1 is in [0,1], convert to percentage
-    if df["top1"].max() <= 1.5:
-        df["top1"] = 100.0 * df["top1"]
-
-    # Keep the best result per (method, k) (e.g., best temperature)
-    agg = df.groupby(["method", "k"], as_index=False)["top1"].max()
-
-    # Determine which k columns to show (sorted ascending)
-    ks = sorted(agg["k"].dropna().unique().astype(int).tolist())
-    # Create a pivot: rows=method, columns=k, values=top1
-    piv = agg.pivot(index="method", columns="k", values="top1").reset_index().fillna(np.nan)
-
-    # Build final table with pretty column names
-    table = pd.DataFrame({"Method": piv["method"]})
-    for k in ks:
-        pretty = f"Top-1 Accuracy (k={k}) (%)"
-        table[pretty] = np.round(piv.get(k, np.nan).astype(float), 2)
-
-    if methods_order:
-        table["__order__"] = table["Method"].apply(
-            lambda m: methods_order.index(m) if m in methods_order else len(methods_order)
-        )
-        table = table.sort_values("__order__").drop(columns="__order__")
-
-    return table
-
-
-def render_training_dynamics(
-    histories: list[HistorySpec],
-    out_dir: str,
-    gamma_baseline: float = 1.0,
-) -> None:
-    """
-    Render the training dynamics plots:
-      • Loss components (align, var, cov) — one PNG per component.
-      • Average embedding std per epoch (with horizontal baseline gamma).
-      • Average off-diagonal correlation (squared) per epoch (log scale).
-
-    Parameters
-    ----------
-    histories : list[HistorySpec]
-        Each item has a display name and path to a history.jsonl.
-        Use two items (Baseline vs Ours) for comparison curves.
-    out_dir : str
-        Where to write the plot PNGs.
-    gamma_baseline : float
-        Horizontal reference line for variance control (e.g., 1.0).
-    """
-    _ensure_out(out_dir)
-
-    # Collect dataframes keyed by run name
-    hdfs: dict[str, pd.DataFrame] = {}
-    for spec in histories:
-        hdfs[spec.name] = _load_history_jsonl(spec.path)
-
-    # X-axis (epochs) — use union of all epochs across histories
-    all_epochs = sorted({int(e) for df in hdfs.values() for e in df.get("epoch", [])})
-    if not all_epochs:
-        print("[report] No epoch data found in histories — skipping dynamics plots.")
-        return
-
-    # Helper to gather a series from each history by column name
-    def gather(col: str) -> dict[str, list[float]]:
-        out: dict[str, list[float]] = {}
-        for name, df in hdfs.items():
-            if col in df.columns:
-                # forward/backward fill around missing epochs
-                s = df.set_index("epoch")[col].reindex(all_epochs).interpolate().bfill().ffill()
-                out[name] = s.tolist()
-        return out
-
-    # Loss components (if exposed by trainer)
-    for key, title, fname in [
-        ("loss/align", "Alignment Loss (Invariance)", "plot_loss_align.png"),
-        ("loss/var",   "Variance Loss",              "plot_loss_var.png"),
-        ("loss/cov",   "Covariance Loss",            "plot_loss_cov.png"),
-    ]:
-        ys = gather(key)
-        if ys:
-            _line_plot(
-                xs=all_epochs,
-                ys_dict=ys,
-                xlabel="Epochs",
-                ylabel="Loss Value",
-                out_path=os.path.join(out_dir, fname),
-                title=title,
-            )
-
-    # Average standard deviation of embeddings
-    ys_std = gather("stats/avg_std")
-    if ys_std:
-        _line_plot(
-            xs=all_epochs,
-            ys_dict=ys_std,
-            xlabel="Epochs",
-            ylabel="Average Standard Deviation",
-            out_path=os.path.join(out_dir, "plot_avg_std.png"),
-            hlines={"gamma": float(gamma_baseline)},
-            title="Embedding Variance Control (Avg σ)",
-        )
-
-    # Average squared off-diagonal correlation (log Y)
-    ys_corr = gather("stats/avg_offdiag_corr_sq")
-    if ys_corr:
-        _line_plot(
-            xs=all_epochs,
-            ys_dict=ys_corr,
-            xlabel="Epochs",
-            ylabel="Average Corr^2 (off-diagonal)",
-            out_path=os.path.join(out_dir, "plot_avg_corr_log.png"),
-            logy=True,
-            title="Redundancy / Decorrelation (log scale)",
-        )
-
-
-def render_robustness_plot(
-    robustness_csv: str,
-    out_dir: str,
-    title: str = "Robustness vs Batch Size (Top-1 Accuracy)",
-) -> None:
-    """
-    Render accuracy vs batch size for multiple methods.
-
-    Parameters
-    ----------
-    robustness_csv : str
-        CSV with columns: method, batch_size, top1 (percentage).
-        You can build this by concatenating linear-probing runs at different batch sizes.
-    out_dir : str
-        Output directory for the plot.
-    title : str
-        Plot title.
-    """
-    _ensure_out(out_dir)
-    df = pd.read_csv(robustness_csv)
-    if not {"method", "batch_size", "top1"}.issubset({c.lower() for c in df.columns}):
-        raise ValueError("robustness_csv must contain columns: method, batch_size, top1")
-
-    # Normalize columns to lower-case for robustness
-    col = {c.lower(): c for c in df.columns}
-    df = df.rename(columns=col)
-
-    # Pivot into series per method
-    methods = sorted(df["method"].unique().tolist())
-
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    for m in methods:
-        sub = df[df["method"] == m].sort_values("batch_size")
-        ax.plot(sub["batch_size"].values, sub["top1"].values, marker="o", label=m)  # default colors only
-
-    ax.set_xlabel("Batch Size")
-    ax.set_ylabel("Top-1 Accuracy (%)")
-    ax.set_title(title)
-    ax.legend()
-    fig.tight_layout()
-    out_path = os.path.join(out_dir, "plot_robustness_vs_batch.png")
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-
-
-# ----------------------------- CLI glue ----------------------------------------
-def parse_args() -> argparse.Namespace:
-    """
-    Parse CLI arguments for metrics aggregation and visualization.
-    """
-    p = argparse.ArgumentParser()
-    p.add_argument("--out-dir", required=True, type=str, help="Directory to save outputs.")
-    p.add_argument(
-        "--history",
-        action="append",
-        default=[],
-        help=(
-            "Add a training history in the form name=DISPLAY,path=/path/to/history.jsonl. "
-            "Provide this flag multiple times to compare runs."
-        ),
+    table = ax.table(
+        cellText=df_disp.values,
+        colLabels=list(df_disp.columns),
+        cellLoc="center",
+        colLoc="center",
+        loc="upper center",
+        bbox=[0.0, 0.0, 1.0, 1.0],  # fill the axes
     )
-    p.add_argument("--linear-csv", type=str, default=None, help="CSV with linear probing results.")
-    p.add_argument("--knn-csv", type=str, default=None, help="CSV with k-NN results.")
-    p.add_argument("--robustness-csv", type=str, default=None, help="CSV for robustness plot.")
-    p.add_argument("--gamma", type=float, default=1.0, help="Baseline gamma line for variance plot.")
-    return p.parse_args()
+
+    # Style
+    table.auto_set_font_size(False)
+    table.set_fontsize(fontsize)
+    table.scale(1.0, 1.2)  # a bit taller rows
+
+    # Header shading
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_facecolor(header_facecolor)
+            cell.set_text_props(weight="bold")
+
+    # Save image
+    out_path = os.path.join(out_dir, filename)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    return out_path
 
 
-def _parse_histories(history_args: list[str]) -> list[HistorySpec]:
+# ================================ Tables =======================================
+
+def build_linear_table(out_dir: str, run_map: Dict[str, List[str]]) -> pd.DataFrame:
     """
-    Convert CLI --history items into HistorySpec objects.
-
-    Each item should look like: name=AdaptiveVICReg,path=/.../history.jsonl
+    Build Table 1 (Quantitative: Linear probe).
+    Expected columns if present:
+      - 'method' (if absent we use the run name)
+      - 'top1' or any column containing 'top1'/'acc' (we pick max across epochs)
+      - 'top5' (optional)
+      - 'f1_weighted' (optional)
+    We write 'table_linear.csv' and 'table_linear.png' under out_dir.
     """
-    specs: list[HistorySpec] = []
-    for item in history_args:
-        parts = {}
-        for kv in item.split(","):
-            if "=" in kv:
-                k, v = kv.split("=", 1)
-                parts[k.strip()] = v.strip()
-        if "name" in parts and "path" in parts:
-            specs.append(HistorySpec(name=parts["name"], path=parts["path"]))
-        else:
-            raise ValueError(f"Bad --history item: {item}. Expected name=...,path=...")
-    return specs
+    rows = []
+    for name, paths in run_map.items():
+        # Prefer an AdamW linear CSV if both exist; else first available.
+        pref = sorted(paths, key=lambda p: (0 if "adam" in os.path.basename(p).lower() else 1, p))
+        chosen = None
+        for p in pref:
+            if os.path.exists(p):
+                chosen = p; break
+        if not chosen:
+            continue
 
+        df = read_csv_soft(chosen)
+        if df is None or df.empty:
+            continue
+
+        # Find top-1 column (best across epochs)
+        top1_col = _pick_acc_col(df, prefer_k200=False)
+        top1 = _best_value(df, top1_col) if top1_col else None
+        # Optional columns
+        top5 = _best_value(df, "top5") if "top5" in df.columns else None
+        f1w  = _best_value(df, "f1_weighted") if "f1_weighted" in df.columns else None
+
+        method = None
+        if "method" in df.columns:
+            try:
+                method = str(df["method"].iloc[0])
+            except Exception:
+                pass
+        method = method or name
+
+        rows.append({
+            "method": method,
+            "top1": top1,
+            "top5": top5,
+            "f1_weighted": f1w,
+            "source_csv": os.path.relpath(chosen)
+        })
+
+    out = pd.DataFrame(rows)
+    # Order columns when present
+    cols = [c for c in ["method", "top1", "top5", "f1_weighted", "source_csv"] if c in out.columns]
+    out = out[cols] if cols else out
+
+    # Save CSV
+    csv_path = os.path.join(out_dir, "table_linear.csv")
+    out.to_csv(csv_path, index=False)
+
+    # Save PNG image of the table
+    _save_table_image(out, out_dir, "table_linear.png", title="Linear Probe (CIFAR-10)")
+    return out
+
+
+def build_knn_table(out_dir: str,
+                    eval_map: Dict[str, List[str]],
+                    grid_map: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    Build Table 2 (Quantitative: kNN evaluation).
+    We try to read *_knn_eval.csv (single setting). If that file doesn't contain
+    explicit k-specific columns, we then look at the *_knn_grid.csv to compute:
+      - top1_k20  (best over temperature at k=20)
+      - top1_k200 (best over temperature at k=200)
+    We write 'table_knn.csv' and 'table_knn.png' under out_dir.
+    """
+    rows = []
+
+    all_names = set(eval_map.keys()).union(set(grid_map.keys()))
+    for name in sorted(all_names):
+        # Try eval file first
+        top1_k20 = None
+        top1_k200 = None
+        src_eval = None
+
+        eval_paths = eval_map.get(name, [])
+        grid_paths = grid_map.get(name, [])
+
+        # Use the last eval path (most recent)
+        if eval_paths:
+            p = [x for x in eval_paths if os.path.exists(x)]
+            if p:
+                src_eval = p[-1]
+                df = read_csv_soft(src_eval)
+                if df is not None and not df.empty:
+                    # If eval already has explicit columns, use them:
+                    if "top1_k20" in df.columns:
+                        top1_k20 = _last_value(df, "top1_k20")
+                    if "top1_k200" in df.columns:
+                        top1_k200 = _last_value(df, "top1_k200")
+                    # Else, if it only has a generic top1 + k column:
+                    if (top1_k20 is None or top1_k200 is None) and "k" in df.columns:
+                        col = _pick_acc_col(df, prefer_k200=False)
+                        if col:
+                            if top1_k20 is None:
+                                best = df[df["k"] == 20]
+                                if not best.empty:
+                                    top1_k20 = _best_value(best, col)
+                            if top1_k200 is None:
+                                best = df[df["k"] == 200]
+                                if not best.empty:
+                                    top1_k200 = _best_value(best, col)
+
+        # If still missing, try grid CSVs (best across temperature)
+        if (top1_k20 is None or top1_k200 is None) and grid_paths:
+            p = [x for x in grid_paths if os.path.exists(x)]
+            if p:
+                df = read_csv_soft(p[-1])
+                if df is not None and not df.empty:
+                    if top1_k20 is None:
+                        top1_k20 = _knn_best_at_k_from_grid(df, 20)
+                    if top1_k200 is None:
+                        top1_k200 = _knn_best_at_k_from_grid(df, 200)
+
+        # Determine method name from eval CSV if present, else fallback to run name
+        method = name
+        if src_eval:
+            df = read_csv_soft(src_eval)
+            if df is not None and "method" in df.columns:
+                try:
+                    method = str(df["method"].iloc[0]) or method
+                except Exception:
+                    pass
+
+        rows.append({
+            "method": method,
+            "top1_k20": top1_k20,
+            "top1_k200": top1_k200,
+            "source_eval_csv": os.path.relpath(src_eval) if src_eval else ""
+        })
+
+    out = pd.DataFrame(rows)
+    # Order columns when present
+    cols = [c for c in ["method", "top1_k20", "top1_k200", "source_eval_csv"] if c in out.columns]
+    out = out[cols] if cols else out
+
+    # Save CSV
+    csv_path = os.path.join(out_dir, "table_knn.csv")
+    out.to_csv(csv_path, index=False)
+
+    # Save PNG image of the table
+    _save_table_image(out, out_dir, "table_knn.png", title="kNN Evaluation (CIFAR-10)")
+    return out
+
+
+# =========================== Robustness (Batch size) ============================
+
+def plot_perf_vs_batchsize_k200(out_dir: str,
+                                runs_with_cfg: List[Tuple[str, Dict]],
+                                knn_by_name: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]) -> Optional[str]:
+    """
+    Build Performance vs. Batch Size (Top-1@k=200). For each run, we:
+      1) read training 'batch_size' from train_config.json
+      2) pull Top-1@k=200 either from knn_eval.csv or knn_grid.csv
+    We plot a line chart with points per run. Returns path or None.
+    """
+    xs, ys, labels = [], [], []
+    for name, cfg in runs_with_cfg:
+        bs = cfg.get("batch_size")
+        if not isinstance(bs, int):
+            continue
+
+        eval_df, grid_df = knn_by_name.get(name, (None, None))
+        val = None
+        if eval_df is not None:
+            # Prefer explicit 'top1_k200'
+            if "top1_k200" in eval_df.columns:
+                val = _last_value(eval_df, "top1_k200")
+            else:
+                # else pick top1 for k==200 if available
+                if "k" in eval_df.columns:
+                    col = _pick_acc_col(eval_df, prefer_k200=True)
+                    if col:
+                        best = eval_df[eval_df["k"] == 200]
+                        if not best.empty:
+                            val = _best_value(best, col)
+        if val is None and grid_df is not None:
+            val = _knn_best_at_k_from_grid(grid_df, 200)
+        if val is None:
+            continue
+
+        xs.append(bs); ys.append(val); labels.append(name)
+
+    if not xs:
+        return None
+
+    # Sort by batch size for a nice line
+    order = np.argsort(xs)
+    xs = np.array(xs)[order]
+    ys = np.array(ys)[order]
+    labels = np.array(labels)[order]
+
+    plt.figure(figsize=(6.8, 4.2))
+    plt.plot(xs, ys, marker="o")
+    for x, y, lab in zip(xs, ys, labels):
+        plt.annotate(lab, (x, y), textcoords="offset points", xytext=(6, 4), fontsize=9)
+
+    plt.xlabel("Batch Size")
+    plt.ylabel("Top-1 Accuracy @ k=200 (%)")
+    plt.title("Performance vs. Batch Size (kNN)")
+    return _savefig(out_dir, "perf_vs_batchsize_k200.png")
+
+
+# ================================ Main =========================================
 
 def main() -> None:
-    """
-    Entry point: builds tables and plots, writes PNGs + a small index markdown.
-    """
-    args = parse_args()
-    _ensure_out(args.out_dir)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-dir", required=True, type=str, help="Directory to write plots and tables.")
+    # Repeatable: allow multiple histories (to overlay baseline vs adaptive)
+    ap.add_argument("--history", action="append", default=[],
+                    help="Run spec 'name=...,path=/.../metrics/history.jsonl[,config=/.../train_config.json]'. "
+                         "If 'config' omitted, it's inferred from history path.")
+    # Optional: attach linear / knn CSVs. Use 'name=...,path=...' to bind to a run if multiple runs.
+    ap.add_argument("--linear-csv", action="append", default=[],
+                    help="(Optional) Linear probe CSV path or 'name=...,path=...'.")
+    ap.add_argument("--knn-csv", action="append", default=[],
+                    help="(Optional) kNN eval CSV path or 'name=...,path=...'.")
+    ap.add_argument("--knn-grid", action="append", default=[],
+                    help="(Optional) kNN grid CSV (k x temperature) path or 'name=...,path=...'.")
+    args = ap.parse_args()
 
-    # 1) Training dynamics plots (A/B/C)
-    histories = _parse_histories(args.history) if args.history else []
-    if histories:
-        render_training_dynamics(histories=histories, out_dir=args.out_dir, gamma_baseline=args.gamma)
+    out_dir = args.out_dir
+    _ensure_dir(out_dir)
 
-    # 2) Quantitative Results (Tables)
-    produced = []
-    if args.linear_csv:
-        df_lin = build_linear_table(args.linear_csv)
-        png_lin = os.path.join(args.out_dir, "table_linear.png")
-        _save_table_image(df_lin, png_lin, title="Linear Classification (Frozen Features)")
-        df_lin.to_csv(os.path.join(args.out_dir, "table_linear.csv"), index=False)
-        produced.append(("table_linear.png", "Linear probing results"))
+    # ------------------------ Build run registry --------------------------
+    runs_by_name: Dict[str, RunEntry] = {}
 
-    if args.knn_csv:
-        df_knn = build_knn_table(args.knn_csv)
-        png_knn = os.path.join(args.out_dir, "table_knn.png")
-        _save_table_image(df_knn, png_knn, title="k-NN Evaluation (Feature Space Quality)")
-        df_knn.to_csv(os.path.join(args.out_dir, "table_knn.csv"), index=False)
-        produced.append(("table_knn.png", "k-NN results"))
+    # histories (required; can be multiple)
+    for raw in args.history:
+        kv = _parse_kv_spec(raw)
+        name = kv.get("name")
+        path = kv.get("path")
+        cfg  = kv.get("config")
+        if not name or not path:
+            raise ValueError("Each --history must include at least name=...,path=...")
+        runs_by_name[name] = RunEntry(name=name, history=path, config=cfg)
 
-    # 3) Robustness plot (D)
-    if args.robustness_csv:
-        render_robustness_plot(args.robustness_csv, out_dir=args.out_dir)
-        produced.append(("plot_robustness_vs_batch.png", "Robustness vs batch size"))
+    # Attach linear/knn files to known runs
+    _attach_file_to_named_run(runs_by_name, args.linear_csv, "linear_csvs")
+    _attach_file_to_named_run(runs_by_name, args.knn_csv, "knn_csvs")
+    _attach_file_to_named_run(runs_by_name, args.knn_grid, "knn_grid_csvs")
 
-    # 4) Write a tiny index markdown
-    index_md = os.path.join(args.out_dir, "metrics_summary.md")
-    with open(index_md, "w") as f:
-        f.write("# Metrics Artifacts\n\n")
-        if histories:
-            f.write("- Training dynamics:\n")
-            f.write("  - `plot_loss_align.png`, `plot_loss_var.png`, `plot_loss_cov.png`\n")
-            f.write("  - `plot_avg_std.png` (shows baseline gamma)\n")
-            f.write("  - `plot_avg_corr_log.png` (log-scale correlation decay)\n\n")
-        if args.linear_csv:
-            f.write("- Quantitative tables:\n")
-            f.write("  - `table_linear.png` (+ `table_linear.csv`)\n")
-        if args.knn_csv:
-            f.write("  - `table_knn.png` (+ `table_knn.csv`)\n")
-        if args.robustness_csv:
-            f.write("- Robustness:\n")
-            f.write("  - `plot_robustness_vs_batch.png`\n")
+    # Try to infer missing configs
+    for r in runs_by_name.values():
+        r.infer_config_from_history()
 
-    print(f"[report] Wrote artifacts to: {args.out_dir}")
+    # -------------------- Load histories & configs ------------------------
+    hist_map: Dict[str, pd.DataFrame] = {}
+    cfg_map: Dict[str, Dict] = {}
+    for name, r in runs_by_name.items():
+        hist_map[name] = read_history_jsonl(r.history)
+        cfg_map[name] = read_train_config(r.config)
 
+    # -------------------- Quantitative tables -----------------------------
+    # Collect mapping name -> [linear_csvs]
+    lin_map = {name: r.linear_csvs for name, r in runs_by_name.items()}
+    df_linear = build_linear_table(out_dir, lin_map)   # saves CSV + PNG
 
-# ----------------------------- VICReg-specific stat fns ------------------------
-# These mirror the functions used by the training callback (imported earlier),
-# duplicated here for clarity if you want to compute one-off stats interactively.
-def compute_embedding_avg_std(self, z, axis: int = 0) -> "tf.Tensor":
-    """
-    Compute the average per-dimension standard deviation of a batch of embeddings.
+    # name -> [knn_eval_csvs], name -> [knn_grid_csvs]
+    knn_eval_map = {name: r.knn_csvs for name, r in runs_by_name.items()}
+    knn_grid_map = {name: r.knn_grid_csvs for name, r in runs_by_name.items()}
+    df_knn = build_knn_table(out_dir, knn_eval_map, knn_grid_map)  # saves CSV + PNG
 
-    Parameters
-    ----------
-    z : Union[tf.Tensor, np.ndarray]
-        Embedding batch of shape [batch, dim] (or [N, D]). Values can be a
-        TensorFlow tensor or a NumPy array.
-    axis : int, default=0
-        Axis representing the batch dimension over which the std is computed.
+    # -------------------- Training dynamics (overlays) --------------------
+    # Prepare list of (name, history_df) for plotting
+    named_histories = [(name, hist_map[name]) for name in runs_by_name.keys()]
 
-    Returns
-    -------
-    tf.Tensor
-        Scalar Tensor (dtype float32) with the mean of per-dimension std.
-        Returning a Tensor (not a Python float) keeps this function safe
-        inside traced/graph contexts and avoids attribute errors when callers
-        try to use `.numpy()`.
+    # Loss parts
+    plot_histories_overlaid(out_dir, named_histories, "loss/total", "Training Loss (total)")
+    plot_histories_overlaid(out_dir, named_histories, "loss/align", "Alignment Loss")
+    plot_histories_overlaid(out_dir, named_histories, "loss/var", "Variance Loss")
+    plot_histories_overlaid(out_dir, named_histories, "loss/cov", "Covariance Loss")
 
-    Notes
-    -----
-    - We explicitly convert inputs to a Tensor to keep dtype/device consistent.
-    - We guard against non-finite values; in degenerate cases (e.g., batch
-        size of 1) `reduce_std` is still well-defined but we ensure no NaNs
-        propagate.
-    """
-    import tensorflow as tf
-    x = tf.convert_to_tensor(z, dtype=tf.float32)           # [B, D]
-    std_per_dim = tf.math.reduce_std(x, axis=axis)          # [D]
-    std_per_dim = tf.where(tf.math.is_finite(std_per_dim),
-                            std_per_dim,
-                            tf.zeros_like(std_per_dim))
-    avg_std = tf.reduce_mean(std_per_dim)                   # scalar Tensor
-    return avg_std
+    # Embedding stats
+    # stats/avg_std: add a horizontal gamma=1 line (baseline target)
+    # If any history contains 'target/gamma', also overlay that curve.
+    extra_gamma_series = []
+    for name, h in named_histories:
+        if h is not None and "target/gamma" in h.columns:
+            extra_gamma_series.append((f"{name}: gamma_t", h["epoch"].values, h["target/gamma"].values))
+    plot_histories_overlaid(out_dir, named_histories, "stats/avg_std", "Avg per-dim std (features)",
+                            hline=(1.0, "γ = 1.0 (baseline target)"),
+                            extra_series=extra_gamma_series if extra_gamma_series else None)
 
-def compute_avg_offdiag_corr_sq(z: np.ndarray | "tf.Tensor") -> float:
-    """
-    Compute the mean squared off-diagonal correlation coefficient.
+    # stats/avg_offdiag_corr_sq: logarithmic scale for decorrelation visualization
+    plot_histories_overlaid(out_dir, named_histories, "stats/avg_offdiag_corr_sq",
+                            "Mean off-diagonal corr$^2$ (log scale)", logy=True)
 
-    Parameters
-    ----------
-    z : np.ndarray or tf.Tensor
-        Embeddings shaped [N, D].
+    # -------------------- Robustness vs Batch Size ------------------------
+    # Prepare (name, cfg) for runs that have a config
+    runs_with_cfg = [(name, cfg_map[name]) for name in runs_by_name.keys() if cfg_map[name]]
 
-    Returns
-    -------
-    float
-        Average of squared off-diagonal entries of the correlation matrix.
-    """
-    import tensorflow as tf
-    z = tf.convert_to_tensor(z)
-    z = z - tf.reduce_mean(z, axis=0, keepdims=True)                # center features
-    # Compute covariance; add small epsilon on diagonal to avoid division by zero
-    cov = tf.matmul(z, z, transpose_a=True) / tf.cast(tf.shape(z)[0] - 1, z.dtype)
-    d = tf.linalg.diag_part(cov)
-    inv_std = tf.math.rsqrt(d + 1e-6)
-    # Normalize to correlation matrix: C = D^{-1/2} cov D^{-1/2}
-    C = cov * inv_std[None, :] * inv_std[:, None]
-    # Square, zero diagonal, then average off-diagonal
-    C2 = tf.square(C)
-    off = C2 - tf.linalg.diag(tf.linalg.diag_part(C2))
-    D = tf.cast(tf.shape(C)[0], tf.float32)
-    denom = D * (D - 1.0)  # number of off-diagonal entries
-    return float(tf.reduce_sum(off) / denom)
-# ------------------------------------------------------------------------------
+    # Map: name -> (knn_eval_df, knn_grid_df)
+    knn_by_name: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for name, r in runs_by_name.items():
+        eval_df = None
+        if r.knn_csvs:
+            last = [p for p in r.knn_csvs if os.path.exists(p)]
+            if last:
+                eval_df = read_csv_soft(last[-1])
+        grid_df = None
+        if r.knn_grid_csvs:
+            last = [p for p in r.knn_grid_csvs if os.path.exists(p)]
+            if last:
+                grid_df = read_csv_soft(last[-1])
+        knn_by_name[name] = (eval_df, grid_df)
+
+    if len(runs_with_cfg) >= 2:
+        plot_perf_vs_batchsize_k200(out_dir, runs_with_cfg, knn_by_name)
+
+    # -------------------- Console summary -------------------------------
+    print(f"[report] Wrote tables to: {out_dir}/table_linear.csv, {out_dir}/table_knn.csv")
+    print(f"[report] Also saved images: {out_dir}/table_linear.png, {out_dir}/table_knn.png")
+    print(f"[report] Plots saved under: {out_dir}")
+    if len(runs_with_cfg) < 2:
+        print("[report] Robustness plot (perf_vs_batchsize_k200.png) rendered only if >=2 runs with train_config.json were provided.")
 
 
 if __name__ == "__main__":

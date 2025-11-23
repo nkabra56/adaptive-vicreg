@@ -13,4 +13,10 @@ results/
 .venv-ngc/
 .config/
 reports/
-src/*/__pycache__
+ngcContainer.sh
+ngcContEnv.sh
+ablations.md
+old_chkpt_tf/
+old_rprt/
+old_rslt/
+slides.md
