@@ -489,7 +489,7 @@ def main() -> None:
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
-            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.5),
+            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.0),
             adaptive=args.adaptive,          # <── toggle: True => adaptive targets; False => baseline
             use_schedules=args.use_schedules,
             steps_per_epoch=steps_per_epoch,
