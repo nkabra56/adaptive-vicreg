@@ -15,3 +15,8 @@ results/
 reports/
 ngcContainer.sh
 ngcContEnv.sh
+ablations.md
+old_chkpt_tf/
+old_rprt/
+old_rslt/
+slides.md
