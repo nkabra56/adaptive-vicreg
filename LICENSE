@@ -1,0 +1,38 @@
+Copyright (c) 2025 Nishant Kabra
+All rights reserved.
+
+Permission is hereby granted to any person obtaining a copy of this software
+and associated documentation files (the "Software") to:
+
+  1. View and study the Software.
+  2. Clone or download the repository for personal, academic, or
+     non-commercial research use only.
+
+Subject to the following conditions:
+
+  - The Software may NOT be redistributed, sublicensed, or published in whole
+    or in part, in any form, without the prior written permission of the
+    copyright holder.
+
+  - The Software may NOT be modified and redistributed, or incorporated into
+    any other software project, library, or codebase, without the prior
+    written permission of the copyright holder.
+
+  - The Software may NOT be used for any commercial purpose, including but
+    not limited to products, services, or research that is conducted for
+    commercial gain, without the prior written permission of the copyright
+    holder.
+
+  - Any academic or research work that substantially uses the ideas,
+    algorithms, or implementation details from the Software must provide
+    appropriate citation to the original VICReg paper and related work,
+    and should acknowledge this implementation by citing the author
+    (Nishant Kabra) and linking to this repository where appropriate.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

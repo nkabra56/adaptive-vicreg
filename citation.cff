@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+type: software
+
+title: "Adaptive VICReg in TensorFlow/Keras"
+version: "0.1.0"
+date-released: "2025-11-24"
+
+authors:
+  - family-names: Kabra
+    given-names: Nishant
+    affiliation: "Illinois Institute of Technology"
+    orcid: "0000-0000-0000-0000"  # remove or update if you have a real ORCID
+
+repository-code: "https://github.com/<your-github-username>/<your-repo-name>"
+license: "proprietary"
+keywords:
+  - self-supervised learning
+  - VICReg
+  - adaptive loss weighting
+  - TensorFlow
+  - CIFAR-10
+
+abstract: >
+  This repository contains a TensorFlow/Keras reimplementation of VICReg
+  (Variance-Invariance-Covariance Regularization) and an experimental Adaptive
+  VICReg variant that dynamically reweights the three loss terms during
+  self-supervised pretraining on CIFAR-10. It includes scripts for pretraining,
+  linear evaluation, kNN evaluation, and automatic generation of plots and
+  LaTeX-ready tables.
