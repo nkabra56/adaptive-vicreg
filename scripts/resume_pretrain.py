@@ -1,60 +1,44 @@
 """
-Script Title: Resume VICReg Pretraining From Existing Weights
+Resume VICReg pretraining from a saved checkpoint.
 
-Purpose
--------
-I use this to safely resume a VICReg run from saved weights. It rebuilds the
-encoder+projector+trainer, loads weights, optionally warms up LR, optionally
-freezes BN updates for a few steps, guards against loss spikes, and logs the
-same per-epoch metrics JSONL as my training script.
+Rebuilds the encoder, projector, and trainer identically to
+`train_vicreg.py`, loads weights, optionally applies LR warmup and a loss
+explosion guard, and appends to the same per-epoch metrics JSONL.
 
-Example usage
--------------
-python3 scripts/resume_pretrain.py \
-  --ckpt checkpoints_tf/pretrain-c10_model9_20251117-1530/vicreg_full.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 256 \
-  --proj-out 4096 \
-  --proj-layers 3 \
-  --epochs 200 \
-  --initial-epoch 80 \
-  --lr 0.01 \
-  --resume-lr 0.003 \
-  --wd 1e-6 \
-  --warmup-steps 500 \
-  --bn-freeze-steps 200 \
-  --adaptive \
-  --use-schedules \
-  --record-every 1 \
-  --metrics-probe-batch 256 \
-  --metrics-compute-on projector \
-  --model-dir checkpoints_tf/resumed_run \
-  --device auto
-
-How it works (high level)
--------------------------
-1) Rebuild encoder/projector/trainer identically to train_vicreg.py.
-2) Load weights robustly (full trainer or encoder-only).
-3) Optionally apply LR warmup and loss explosion guard callbacks.
-4) Log the same losses and embedding stats JSONL for continuity.
-
-Author: Nishant Kabra
-Date: 11/17/2025
+Example:
+  python3 scripts/resume_pretrain.py \
+    --ckpt checkpoints_tf/pretrain-c10_model9_20251117-1530/vicreg_full.weights.h5 \
+    --dataset cifar10 \
+    --image-size 32 \
+    --batch-size 256 \
+    --proj-out 4096 \
+    --proj-layers 3 \
+    --epochs 200 \
+    --initial-epoch 80 \
+    --lr 0.01 \
+    --resume-lr 0.003 \
+    --wd 1e-6 \
+    --warmup-steps 500 \
+    --adaptive \
+    --use-schedules \
+    --record-every 1 \
+    --metrics-probe-batch 256 \
+    --metrics-compute-on projector \
+    --model-dir checkpoints_tf/resumed_run \
+    --device auto
 """
 from __future__ import annotations
 
-# --- Make sure local package "vicreg_tf" (under <repo>/src) is importable. -----
+# Make local `src/` importable so `from vicreg_tf import ...` resolves.
 from pathlib import Path
 import sys
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]   # <repo>
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_DIR = _REPO_ROOT / "src"
 if not _SRC_DIR.exists():
     raise RuntimeError(f"Could not find expected source directory: {_SRC_DIR}")
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
-# ------------------------------------------------------------------------------
 
 import argparse
 import json
@@ -75,19 +59,14 @@ from vicreg_tf import (
     gpu_probe_ok,
     print_devices,
     safe_load_trainer_weights,
+    set_global_seed,
     set_mixed_precision,
     steps_for_dataset,
 )
 
 
-# =========================== Helper callbacks ==================================
-
 class WarmupLR(keras.callbacks.Callback):
-    """
-    Linear LR warmup for the first N steps after resume.
-
-    I scale LR from 10% to 100% over `warmup_steps` to avoid sudden jumps.
-    """
+    """Linear LR warmup from 10% to 100% of `base_lr` over the first `warmup_steps` steps after resume."""
     def __init__(self, base_lr: float, warmup_steps: int):
         super().__init__()
         self.base_lr = float(base_lr)
@@ -96,7 +75,7 @@ class WarmupLR(keras.callbacks.Callback):
     def on_train_batch_begin(self, batch, logs=None):
         if self.warmup_steps <= 0:
             return
-        step = int(self.model.curr_step)  # assumes trainer exposes this
+        step = int(self.model.curr_step)
         if step < self.warmup_steps:
             scale = 0.1 + 0.9 * (step + 1) / float(self.warmup_steps)
             new_lr = self.base_lr * scale
@@ -104,9 +83,7 @@ class WarmupLR(keras.callbacks.Callback):
 
 
 class LossExplosionGuard(keras.callbacks.Callback):
-    """
-    Reduce LR if a single batch loss explodes beyond a threshold.
-    """
+    """Shrink the learning rate by `factor` whenever a single batch loss exceeds `threshold`."""
     def __init__(self, threshold: float = 1e8, factor: float = 0.1):
         super().__init__()
         self.threshold = float(threshold)
@@ -124,9 +101,7 @@ class LossExplosionGuard(keras.callbacks.Callback):
 
 
 class VicRegMetricsLogger(keras.callbacks.Callback):
-    """
-    Same JSONL logger I use in training: records losses + embedding stats.
-    """
+    """Same JSONL logger as `train_vicreg.py`, so a resumed run's metrics history stays continuous."""
     def __init__(self, run_dir: str, encoder: tf.keras.Model,
                  projector: Optional[tf.keras.Model],
                  sample_images: Optional[tf.Tensor],
@@ -144,6 +119,9 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
             "align": "l_align",
             "var": "l_var",
             "cov": "l_cov",
+            "w_sim": "w_sim",
+            "w_var": "w_var",
+            "w_cov": "w_cov",
         }
         self.record_every = int(record_every)
         self.metrics_dir = os.path.join(self.run_dir, "metrics")
@@ -164,7 +142,7 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
 
     @staticmethod
     def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
-        z2 = tf.reshape(z, [tf.shape(z)[0], -1])     # [N, D]
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])
         n = tf.shape(z2)[0]
         d = tf.shape(z2)[1]
         mean = tf.reduce_mean(z2, axis=0, keepdims=True)
@@ -210,9 +188,8 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
             f.write(json.dumps(rec) + "\n")
 
 
-# ============================== CLI / Device ===================================
-
 def _preparse_device() -> str:
+    """Parse --device before TF initializes CUDA, so CPU-only mode can hide GPUs in time."""
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     a, _ = p.parse_known_args()
@@ -226,6 +203,7 @@ _DEVICE_FLAG = _preparse_device()
 
 
 def decide_device(device_flag: str) -> str:
+    """Resolve --device to a TF device string, probing the GPU in "auto" mode."""
     if device_flag == "cpu":
         print("[resume] Forcing CPU mode per flag.")
         return "/CPU:0"
@@ -246,12 +224,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", type=str, default="cifar10", help="cifar10 or cifar100.")
     p.add_argument("--image-size", type=int, default=32, help="Square crop size.")
     p.add_argument("--batch-size", type=int, default=256, help="Global batch size.")
+    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width (must match the checkpoint).")
     p.add_argument("--proj-out", type=int, default=4096, help="Projector output width.")
     p.add_argument("--proj-layers", type=int, default=3, help="Projector depth (1, 2, or 3).")
     p.add_argument("--lr", type=float, default=0.01, help="Base LR used for scheduling.")
     p.add_argument("--resume-lr", type=float, default=None, help="LR set immediately after resume.")
     p.add_argument("--wd", type=float, default=1e-6, help="Weight decay (if optimizer supports).")
-    p.add_argument("--adaptive", action="store_true", help="Enable adaptive target schedules.")
+    p.add_argument("--adaptive", action="store_true",
+                   help="Enable adaptive loss-term weighting (AdaptiveReweighter). Must match "
+                        "the flag used for the checkpoint being resumed.")
+    p.add_argument("--adaptive-targets", action="store_true",
+                   help="Separate, optional gamma/nu target schedule. Must match the checkpoint.")
+    p.add_argument("--ema-decay", type=float, default=0.98, help="AdaptiveReweighter EMA decay.")
+    p.add_argument("--var-boost-k", type=float, default=2.0, help="AdaptiveReweighter var reactive-boost strength.")
+    p.add_argument("--cov-boost-k", type=float, default=2.0, help="AdaptiveReweighter cov reactive-boost strength.")
     p.add_argument("--use-schedules", action="store_true", help="Enable cosine schedules.")
     p.add_argument("--initial-epoch", type=int, default=0, help="Epoch index to start from.")
     p.add_argument("--epochs", type=int, default=100, help="Final epoch count to train to.")
@@ -266,12 +252,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--metrics-compute-on", choices=["projector", "encoder"], default="projector",
                    help="Where to compute embedding stats.")
     p.add_argument("--record-every", type=int, default=1, help="Record stats every N epochs.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Seed Python/NumPy/TF for reproducibility. Omit for nondeterministic runs.")
     return p.parse_args()
 
 
-# ================================== main =======================================
-
 def _take_single_view_batch(ds: tf.data.Dataset, size_limit: Optional[int]) -> Optional[tf.Tensor]:
+    """Take one small single-view batch from the two-view dataset, for probe statistics only."""
     try:
         batch = next(iter(ds))
     except Exception:
@@ -283,10 +270,9 @@ def _take_single_view_batch(ds: tf.data.Dataset, size_limit: Optional[int]) -> O
 
 
 def main() -> None:
-    """
-    Resume training from existing weights with optional LR warmup and guards.
-    """
     args = parse_args()
+    if args.seed is not None:
+        set_global_seed(args.seed)
     set_mixed_precision(False)
 
     ds = build_dataset(args.dataset, args.image_size, args.batch_size)
@@ -300,44 +286,64 @@ def main() -> None:
     run_dir = args.model_dir
     os.makedirs(run_dir, exist_ok=True)
 
+    if args.bn_freeze_steps > 0:
+        print("[resume] WARNING: --bn-freeze-steps is not implemented by VICRegTrainer "
+              "(no BN-freeze mechanism exists yet); the flag is accepted but has no effect.")
+
     with tf.device(device_str):
-        encoder = build_encoder(args.image_size)
-        projector = build_projector(2048, args.proj_out, args.proj_layers)
+        encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
+        projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
+
+        base_lr = args.lr if args.resume_lr is None else float(args.resume_lr)
 
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
             w0=VICRegWeights(sim=25.0, var=25.0, cov=1.0),
-            adaptive=args.adaptive,
+            adaptive_weights=args.adaptive,
+            adaptive_targets=args.adaptive_targets,
             use_schedules=args.use_schedules,
             steps_per_epoch=steps_per_epoch,
             epochs=args.epochs,
-            bn_freeze_steps=args.bn_freeze_steps,
+            base_lr=base_lr,
+            base_wd=args.wd,
+            reweighter_kwargs={
+                "decay": args.ema_decay,
+                "k_std": args.var_boost_k,
+                "k_cov": args.cov_boost_k,
+            },
         )
 
         force_build_for_saving(trainer, encoder, projector, args.image_size)
 
-        # Robust weight load (full trainer or partial-by-name)
+        # Robust weight load: full trainer, or encoder-only by_name fallback.
         safe_load_trainer_weights(trainer, args.ckpt)
 
-        # Optimizer preference: AdamW if available
-        base_lr = args.lr if args.resume_lr is None else float(args.resume_lr)
+        # Prefer native Keras AdamW, then TFA's AdamW, then plain Adam.
         try:
-            import tensorflow_addons as tfa
-            opt = tfa.optimizers.AdamW(
+            opt = keras.optimizers.AdamW(
                 learning_rate=base_lr,
                 weight_decay=args.wd,
                 clipnorm=(args.clipnorm if args.clipnorm > 0 else None),
             )
         except Exception:
-            opt = keras.optimizers.Adam(
-                learning_rate=base_lr,
-                clipnorm=(args.clipnorm if args.clipnorm > 0 else None),
-            )
+            try:
+                import tensorflow_addons as tfa
+                opt = tfa.optimizers.AdamW(
+                    learning_rate=base_lr,
+                    weight_decay=args.wd,
+                    clipnorm=(args.clipnorm if args.clipnorm > 0 else None),
+                )
+            except Exception:
+                opt = keras.optimizers.Adam(
+                    learning_rate=base_lr,
+                    clipnorm=(args.clipnorm if args.clipnorm > 0 else None),
+                )
         trainer.compile(optimizer=opt)
 
-        # Align internal step counter for smooth schedules
-        trainer.curr_step = int(args.initial_epoch) * int(steps_per_epoch)
+        # curr_step is a tf.Variable; assigning a plain int here would replace
+        # it and break train_step's assign_add, so use .assign() instead.
+        trainer.curr_step.assign(int(args.initial_epoch) * int(steps_per_epoch))
 
         ckpt_path = os.path.join(run_dir, "vicreg_tf.weights.h5")
 
@@ -348,7 +354,10 @@ def main() -> None:
             projector=projector,
             sample_images=sample_images,
             compute_on=args.metrics_compute_on,
-            loss_keys={"total": "loss", "align": "l_align", "var": "l_var", "cov": "l_cov"},
+            loss_keys={
+                "total": "loss", "align": "l_align", "var": "l_var", "cov": "l_cov",
+                "w_sim": "w_sim", "w_var": "w_var", "w_cov": "w_cov",
+            },
             record_every=args.record_every,
         )
 
