@@ -10,10 +10,10 @@ authors:
   - family-names: Kabra
     given-names: Nishant
     affiliation: "Illinois Institute of Technology"
-    orcid: "0000-0000-0000-0000"  # remove or update if you have a real ORCID
+    orcid: "0000-0000-0000-0000"
 
-repository-code: "https://github.com/<your-github-username>/<your-repo-name>"
-license: "proprietary"
+repository-code: "https://github.com/nkabra56/adaptive-vicreg-cs584-final-proj"
+license-url: "https://github.com/nkabra56/adaptive-vicreg-cs584-final-proj/blob/main/LICENSE"
 keywords:
   - self-supervised learning
   - VICReg

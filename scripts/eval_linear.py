@@ -1,44 +1,29 @@
 """
-Script Title: Linear Evaluation on Frozen Encoder (TensorFlow + Keras)
+Linear evaluation on a frozen encoder (TensorFlow + Keras).
 
-What this script does
-----------------------
-I freeze the pretrained encoder from my VICReg/Adaptive-VICReg run and train a
-single linear classifier on top of its features. This gives me a quick, apples-
-to-apples measure of representation quality without fine-tuning the backbone.
+Freezes a pretrained VICReg/Adaptive-VICReg encoder and trains a single
+linear classifier on top of its features, as a quick, apples-to-apples
+measure of representation quality without fine-tuning the backbone.
 
-I support multiple optimizers so I can probe sensitivity:
-  • SGD with Nesterov momentum (baseline I usually compare against)
-  • Adam (often converges faster on small heads)
-  • AdamW (decoupled weight decay; I fall back to TFA if native Keras is missing)
+Supports three optimizers for the head: SGD with Nesterov momentum, Adam,
+and AdamW (native Keras, falling back to TensorFlow Addons if unavailable).
 
-I also make checkpoint resolution robust: I can pass a direct file, a directory,
-or even a glob. If I accidentally point at the "full" trainer weights instead of
-the encoder-only weights, I attempt a by_name+skip_mismatch load automatically.
+Checkpoint resolution is robust to a direct file, a directory, or a glob; if
+`--encoder-ckpt` accidentally points at the full trainer weights instead of
+the encoder-only weights, a by_name+skip_mismatch load is attempted
+automatically.
 
-Artifacts
----------
-• CSV row appended to --out-csv with test accuracy and run hyperparameters.
+Writes one CSV row (test accuracy plus hyperparameters) to --out-csv.
 
-Example usage (why I do each flag)
-----------------------------------
-python3 scripts/eval_linear.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_2*/vicreg_encoder.weights.h5 \
-  --dataset cifar10 --image-size 32 --batch-size 512 \
-  --epochs 10 --lr 0.003 --l2 1e-4 \
-  --feat-dim 2048 \
-  --opt adamw \
-  --out-csv results/linear_eval.csv \
-  --method-name AdaptiveVICReg
-
-Notes:
-• I pass a glob for --encoder-ckpt so the script picks the newest match.
-• I use AdamW here because the head is tiny and AdamW often gives a small lift.
-• I keep L2 on the head even with AdamW; this is intentional for parity with my
-  prior runs. If I want “pure” decoupled WD only, I set --l2 0.
-
-Author: Nishant Kabra
-Date: 11/17/2025
+Example:
+  python3 scripts/eval_linear.py \
+    --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_2*/vicreg_encoder.weights.h5 \
+    --dataset cifar10 --image-size 32 --batch-size 512 \
+    --epochs 10 --lr 0.003 --l2 1e-4 \
+    --feat-dim 2048 \
+    --opt adamw \
+    --out-csv results/linear_eval.csv \
+    --method-name AdaptiveVICReg
 """
 
 from __future__ import annotations
@@ -48,41 +33,18 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-# Make local src/ importable so `from vicreg_tf import ...` resolves to my repo code.
+# Make local src/ importable so `from vicreg_tf import ...` resolves.
 _REPO = Path(__file__).resolve().parents[1]
 _SRC = _REPO / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from vicreg_tf import build_encoder  # I reuse the exact encoder builder used in pretrain
+from vicreg_tf import build_encoder
 from vicreg_tf import enable_memory_growth
 
 
 def _load_cifar(name: str):
-    """
-    Load CIFAR-10 or CIFAR-100 using tf.keras.datasets.
-
-    Why I wrote this
-    ----------------
-    For linear probing I don't need heavy tf.data pipelines; a simple dataset
-    loader with basic resize/normalize is enough. Keeping this in one place keeps
-    the rest of the script tidy.
-
-    Parameters
-    ----------
-    name : str
-        "cifar10" or "cifar100".
-
-    Returns
-    -------
-    tuple
-        ((x_train, y_train), (x_test, y_test), num_classes) where y arrays are squeezed.
-
-    Raises
-    ------
-    ValueError
-        If an unsupported dataset name is used.
-    """
+    """Load CIFAR-10 or CIFAR-100 via `keras.datasets`, returning ((x_train, y_train), (x_test, y_test), num_classes)."""
     if name == "cifar10":
         (xtr, ytr), (xte, yte) = keras.datasets.cifar10.load_data()
         num_classes = 10
@@ -95,32 +57,7 @@ def _load_cifar(name: str):
 
 
 def _make_ds(x, y, image_size: int, batch: int, shuffle: bool):
-    """
-    Build a minimal tf.data.Dataset with optional resize and prefetch.
-
-    My intent
-    ---------
-    I normalize to [0,1], optionally resize, and keep the pipeline simple and fast.
-    For linear eval the bottleneck is almost always the dense head training, not I/O.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Input images (uint8 [N,H,W,C] from keras.datasets).
-    y : np.ndarray
-        Integer labels [N].
-    image_size : int
-        Target spatial size (images are resized if not 32).
-    batch : int
-        Batch size for training/eval.
-    shuffle : bool
-        Whether to shuffle (I shuffle only for the training split).
-
-    Returns
-    -------
-    tf.data.Dataset
-        A batched, prefetched dataset of (image, label).
-    """
+    """Build a minimal batched, prefetched tf.data.Dataset, normalized to [0,1] and resized if `image_size != 32`."""
     x = tf.convert_to_tensor(x, tf.float32) / 255.0
     y = tf.convert_to_tensor(y, tf.int32)
 
@@ -128,7 +65,6 @@ def _make_ds(x, y, image_size: int, batch: int, shuffle: bool):
     if shuffle:
         ds = ds.shuffle(10000)
     if image_size != 32:
-        # I resize on the fly; cheap enough at CIFAR scale.
         ds = ds.map(
             lambda im, lab: (tf.image.resize(im, (image_size, image_size)), lab),
             num_parallel_calls=tf.data.AUTOTUNE,
@@ -138,24 +74,7 @@ def _make_ds(x, y, image_size: int, batch: int, shuffle: bool):
 
 
 def _newest(paths: list[str]) -> str | None:
-    """
-    Pick the newest existing path by mtime.
-
-    Why I need this
-    ---------------
-    My checkpoints often include timestamps. When I pass a glob or a directory,
-    I want the most recent result without hand-picking the exact file.
-
-    Parameters
-    ----------
-    paths : list[str]
-        Candidate file paths.
-
-    Returns
-    -------
-    str | None
-        The newest existing path or None if nothing exists.
-    """
+    """Return the most recently modified existing path, or None if none exist."""
     if not paths:
         return None
     paths = [p for p in paths if os.path.exists(p)]
@@ -167,45 +86,28 @@ def _newest(paths: list[str]) -> str | None:
 
 def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
     """
-    Resolve a robust encoder checkpoint path and any load() kwargs.
+    Resolve `spec` to an encoder checkpoint path plus `load_weights` kwargs.
 
-    My rules
-    --------
-    1) If `spec` includes wildcards, I expand and take the newest.
-    2) If `spec` is a file -> done.
-    3) If `spec` is a directory -> I search common filenames inside.
-    4) If `spec` doesn't exist -> I try its parent and then a sweep under checkpoints_tf.
-    5) If I happen to point at a *full* trainer weights file, I switch to
-       `by_name=True, skip_mismatch=True` so only encoder vars load.
+    Tries, in order: wildcard expansion (newest match); a direct file; known
+    filenames inside a directory; the same search under the parent
+    directory; then a recursive sweep under checkpoints_tf. If the resolved
+    file looks like a full trainer checkpoint rather than encoder-only,
+    returns `{"by_name": True, "skip_mismatch": True}` so only the matching
+    encoder variables load.
 
-    Parameters
-    ----------
-    spec : str
-        User-supplied checkpoint spec (file, dir, or glob).
-
-    Returns
-    -------
-    (path, load_kwargs) : (str, dict)
-        File path to pass to `load_weights` and any load kwargs I want to use.
-
-    Raises
-    ------
-    FileNotFoundError
-        If I cannot resolve a plausible weights file.
+    Raises:
+        FileNotFoundError: If no plausible weights file is found.
     """
     p = Path(spec)
 
-    # 1) Expand wildcards first.
     if any(ch in spec for ch in ["*", "?", "["]):
         hit = _newest(glob.glob(spec))
         if hit:
             return hit, {}
 
-    # 2) Direct file.
     if p.is_file():
         return str(p), {}
 
-    # 3) Directory: search known names inside.
     if p.is_dir():
         candidates = []
         candidates += glob.glob(str(p / "vicreg_encoder.weights.h5"))
@@ -218,7 +120,6 @@ def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
                 return hit, {"by_name": True, "skip_mismatch": True}
             return hit, {}
 
-    # 4) Parent dir fallback.
     parent = p.parent
     if parent.exists():
         candidates = []
@@ -232,7 +133,6 @@ def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
                 return hit, {"by_name": True, "skip_mismatch": True}
             return hit, {}
 
-    # 5) Last resort: scan the common root.
     root = _REPO / "checkpoints_tf"
     if root.exists():
         candidates = []
@@ -253,19 +153,6 @@ def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
 
 
 def parse_args():
-    """
-    CLI parser for my linear evaluation.
-
-    Why I expose these flags
-    ------------------------
-    I want to sweep optimizers and learning rates from the command line. I also
-    keep --feat-dim because my encoder width may change across experiments.
-
-    Returns
-    -------
-    argparse.Namespace
-        Parsed arguments with attributes matching the flags below.
-    """
     p = argparse.ArgumentParser()
     p.add_argument("--encoder-ckpt", type=str, required=True)
     p.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10")
@@ -277,40 +164,22 @@ def parse_args():
     p.add_argument("--feat-dim", type=int, default=2048)
     p.add_argument("--out-csv", type=str, required=True)
     p.add_argument("--method-name", type=str, default="VICReg")
-    # New: I can pick between sgd / adam / adamw without touching code.
     p.add_argument("--opt", choices=["sgd", "adam", "adamw"], default="sgd")
     return p.parse_args()
 
 
 def _make_optimizer(args):
     """
-    Construct the optimizer based on --opt.
+    Build the head optimizer from `args.opt`.
 
-    My decision logic
-    -----------------
-    • sgd  -> SGD with momentum and Nesterov (my default baseline).
-    • adam -> Plain Adam with the given learning rate.
-    • adamw-> Prefer native Keras AdamW; if missing, fall back to TFA's AdamW.
+    "adamw" prefers native `keras.optimizers.AdamW`, falling back to
+    TensorFlow Addons if unavailable, and reuses `args.l2` as its
+    `weight_decay`. Note the linear head's L2 regularizer stays active
+    regardless of optimizer, so AdamW runs get both L2 and decoupled weight
+    decay unless `--l2 0` is passed.
 
-    For AdamW I purposely reuse --l2 as the weight_decay value for a simple knob.
-    I still keep the linear head's L2 regularizer active by default, which means
-    both L2 on the head and decoupled WD when I pick AdamW. I do this for parity
-    with my historical comparisons (feel free to set --l2 0 if you want WD-only).
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed CLI args so I can read .opt, .lr, and .l2.
-
-    Returns
-    -------
-    keras.optimizers.Optimizer
-        The optimizer object to hand to model.compile().
-
-    Raises
-    ------
-    RuntimeError
-        If AdamW was requested but neither native nor TFA AdamW exists.
+    Raises:
+        RuntimeError: If "adamw" was requested but neither implementation is available.
     """
     if args.opt == "sgd":
         return keras.optimizers.SGD(learning_rate=args.lr, momentum=0.9, nesterov=True)
@@ -332,37 +201,15 @@ def _make_optimizer(args):
 
 
 def main():
-    """
-    Entry point: build data, freeze encoder, train linear head, log CSV.
-
-    What happens step-by-step
-    -------------------------
-    1) I enable GPU memory growth to avoid preallocating all VRAM.
-    2) I load CIFAR and build light tf.data pipelines.
-    3) I rebuild the encoder (same builder as pretrain) and load weights:
-       - I accept file/dir/glob and pick the newest sensible match.
-       - If I end up with a "full" trainer ckpt, I try by_name+skip_mismatch.
-    4) I freeze the encoder and attach a Dense(num_classes) head.
-    5) I compile with the requested optimizer and train for --epochs.
-    6) I evaluate on the test set and append a row to --out-csv.
-
-    I print the resolved checkpoint path up front so it's obvious what weights
-    I evaluated.
-    """
     args = parse_args()
     enable_memory_growth()
 
-    # Data
     (xtr, ytr), (xte, yte), num_classes = _load_cifar(args.dataset)
     ds_train = _make_ds(xtr, ytr, args.image_size, args.batch_size, shuffle=True)
     ds_test  = _make_ds(xte, yte, args.image_size, args.batch_size, shuffle=False)
 
-    # Frozen encoder + linear head
     enc = build_encoder(args.image_size, feat_dim=args.feat_dim)
 
-    # Robust checkpoint resolution + load (this fixes the “file not found” headaches).
-    ckpt_path, load_kw = _resolve_encoder_ckpt(args.encoder-ckpt if hasattr(args, "encoder-ckpt") else args.encoder_ckpt)
-    # ^ The hasattr guard ensures I don't crash if some shells transform dashes; args.encoder_ckpt is the standard.
     ckpt_path, load_kw = _resolve_encoder_ckpt(args.encoder_ckpt)
     print(f"[linear-eval] Loading encoder weights from: {ckpt_path}")
     try:
@@ -370,7 +217,7 @@ def main():
     except Exception as e:
         raise RuntimeError(
             f"Failed to load weights from {ckpt_path} with kwargs {load_kw}. "
-            f"If this was a full trainer checkpoint, I try by_name+skip_mismatch automatically. "
+            f"If this was a full trainer checkpoint, by_name+skip_mismatch is tried automatically. "
             f"Original error: {e}"
         ) from e
 
@@ -397,7 +244,6 @@ def main():
     test_metrics = model.evaluate(ds_test, verbose=0)
     test_acc = float(test_metrics[1])
 
-    # CSV row for report_metrics.py and for my own bookkeeping.
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
     header = ["method","dataset","epochs","batch","image_size","feat_dim","lr","l2","opt","test_acc"]
     row = [

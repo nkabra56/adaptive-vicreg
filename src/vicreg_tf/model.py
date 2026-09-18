@@ -1,35 +1,21 @@
 """
-Model and trainer definitions for VICReg / Adaptive-VICReg.
+Encoder/projector builders and the VICReg training loop.
 
-What lives here (my words)
---------------------------
-1) `build_encoder(image_size, feat_dim)`:
-   A lightweight CNN encoder that outputs a `feat_dim`-wide feature vector.
-   I keep it simple, CIFAR-friendly, and deterministic.
+`VICRegTrainer` runs the two-view forward pass, computes the VICReg loss
+components, and optimizes the encoder and projector. Two independent,
+optional mechanisms can be layered on top of plain VICReg, each behind its
+own flag:
 
-2) `build_projector(feat_in, proj_out, proj_layers)`:
-   A small MLP head (1-3 layers) that maps encoder features to projection space.
+- `adaptive_weights`: per-step sim/var/cov loss weights from
+  `schedules.AdaptiveReweighter` (EMA loss-magnitude balancing plus an
+  embedding-health reactive boost). This is what "Adaptive VICReg" means in
+  the README. When off, weights are constant (`w0`).
+- `adaptive_targets`: the variance floor `gamma` and redundancy target `nu`
+  become time-varying via `schedules.AdaptiveTargets`, instead of the
+  baseline constants `gamma=1.0, nu=0.0`. This changes what the loss targets,
+  not how the three terms are weighted against each other.
 
-3) `VICRegTrainer(keras.Model)`:
-   A custom Keras model that:
-     • runs the two-view forward pass,
-     • computes VICReg losses (alignment, variance, covariance),
-     • optionally *adapts* the variance floor `gamma` and corr target `nu`
-       over training progress (this is my **adaptive VICReg** implementation),
-     • applies schedules and records scalar metrics for logging.
-
-Baseline vs Adaptive
---------------------
-- Baseline VICReg is the exact same code path with:
-    gamma = 1.0, nu = 0.0            (hard-coded constants)
-  I get baseline by simply *omitting* `--adaptive` in the training script.
-
-- Adaptive VICReg (my method) switches `gamma` and `nu` to *time-varying*
-  signals driven by schedulers in `vicreg_tf.schedules.AdaptiveTargets`.
-  The switch is controlled by a boolean feature-flag passed from the CLI.
-
-Author: Nishant Kabra
-Date: 11/18/2025
+Baseline VICReg is the same code path with both flags off.
 """
 from __future__ import annotations
 
@@ -38,18 +24,12 @@ from typing import Optional, Tuple
 import tensorflow as tf
 from tensorflow import keras
 
-# Loss function (and weights container) live in vicreg_tf.losses.
 from .losses import vicreg_total, VICRegWeights
-
-# Schedules and adaptive targets are constructed by the trainer.
-from .schedules import WeightSchedules, AdaptiveTargets
+from .schedules import WeightSchedules, AdaptiveTargets, AdaptiveReweighter
 
 
-# =============================================================================
-# Encoder & Projector builders
-# =============================================================================
 def _conv_block(x, filters, k=3, s=1, name=None):
-    """A small helper: Conv -> BN -> ReLU block suited for CIFAR-sized inputs."""
+    """Conv -> BN -> ReLU block."""
     x = keras.layers.Conv2D(filters, k, strides=s, padding="same", use_bias=False, name=None if name is None else f"{name}_conv")(x)
     x = keras.layers.BatchNormalization(name=None if name is None else f"{name}_bn")(x)
     x = keras.layers.ReLU(name=None if name is None else f"{name}_relu")(x)
@@ -58,26 +38,12 @@ def _conv_block(x, filters, k=3, s=1, name=None):
 
 def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
     """
-    Build my CIFAR-friendly encoder.
-
-    I keep this deterministic and lean: a few Conv blocks, downsampling, GAP,
-    then a final Dense to `feat_dim`. This outputs a *feature vector* (no logits).
-
-    Parameters
-    ----------
-    image_size : int
-        Spatial size of inputs (e.g., 32 for CIFAR-10).
-    feat_dim : int
-        Output width of the feature vector.
-
-    Returns
-    -------
-    keras.Model
-        The encoder backbone producing a `[None, feat_dim]` feature vector.
+    Build the CIFAR-friendly CNN encoder: three conv stages, global average
+    pooling, then a Dense projection to `feat_dim`. Outputs a feature vector,
+    not logits.
     """
     inp = keras.Input(shape=(image_size, image_size, 3), name="enc_in")
 
-    # A tiny CNN: two convs per stage; stride=2 to downsample at stages 2 & 3.
     x = _conv_block(inp, 64, 3, 1, name="s1a")
     x = _conv_block(x,   64, 3, 1, name="s1b")
 
@@ -87,38 +53,14 @@ def build_encoder(image_size: int, feat_dim: int = 2048) -> keras.Model:
     x = _conv_block(x,  256, 3, 2, name="s3a")
     x = _conv_block(x,  256, 3, 1, name="s3b")
 
-    # Global Average Pooling collapses HxW into a single feature per channel.
     x = keras.layers.GlobalAveragePooling2D(name="gap")(x)
-
-    # Final Dense projects to the requested feat_dim.
     feat = keras.layers.Dense(feat_dim, use_bias=False, name="enc_out")(x)
 
     return keras.Model(inp, feat, name="encoder")
 
 
 def _mlp(feat_in: int, proj_out: int, proj_layers: int, name_prefix: str) -> keras.Sequential:
-    """
-    Construct a small MLP with 1-3 layers for the projector.
-
-    I deliberately avoid BatchNorm here to keep behavior simple and compatible
-    with variable batch sizes on smaller GPUs.
-
-    Parameters
-    ----------
-    feat_in : int
-        Input feature width from the encoder.
-    proj_out : int
-        Output width of the projection vector.
-    proj_layers : int
-        1, 2, or 3 layers.
-    name_prefix : str
-        Prefix used to make layer names unique across multiple builds.
-
-    Returns
-    -------
-    keras.Sequential
-        A small MLP mapping `feat_in` -> `proj_out`.
-    """
+    """Build a 1-3 layer MLP mapping `feat_in` to `proj_out`. No BatchNorm, to stay simple across batch sizes."""
     layers = []
     if proj_layers == 1:
         layers += [keras.layers.Dense(proj_out, activation=None, name=f"{name_prefix}_dense_out")]
@@ -127,7 +69,7 @@ def _mlp(feat_in: int, proj_out: int, proj_layers: int, name_prefix: str) -> ker
             keras.layers.Dense(feat_in, activation="relu", name=f"{name_prefix}_dense_h1"),
             keras.layers.Dense(proj_out, activation=None, name=f"{name_prefix}_dense_out"),
         ]
-    else:  # 3 or more -> clamp to 3
+    else:  # 3 or more, clamped to 3
         layers += [
             keras.layers.Dense(feat_in, activation="relu", name=f"{name_prefix}_dense_h1"),
             keras.layers.Dense(feat_in, activation="relu", name=f"{name_prefix}_dense_h2"),
@@ -137,12 +79,7 @@ def _mlp(feat_in: int, proj_out: int, proj_layers: int, name_prefix: str) -> ker
 
 
 def build_projector(feat_in: int, proj_out: int, proj_layers: int) -> keras.Model:
-    """
-    Wrap the MLP into a Keras Model for clarity.
-
-    I add a unique name prefix to avoid name clashes if the projector is rebuilt.
-    """
-    # Unique suffix helps avoid "layer name used twice" if graph is rebuilt in place.
+    """Wrap `_mlp` as a Keras Model, with a unique name suffix to avoid layer-name clashes on rebuild."""
     uniq = hex(id(object()))[-6:]
     inp = keras.Input(shape=(feat_in,), name=f"proj_in_{uniq}")
     mlp = _mlp(feat_in, proj_out, proj_layers, name_prefix=f"proj_{feat_in}_{proj_out}_{proj_layers}_{uniq}")
@@ -150,44 +87,25 @@ def build_projector(feat_in: int, proj_out: int, proj_layers: int) -> keras.Mode
     return keras.Model(inp, out, name=f"proj_{uniq}")
 
 
-# =============================================================================
-# Trainer: VICReg (baseline) + Adaptive targets (feature-flag on)
-# =============================================================================
 class VICRegTrainer(keras.Model):
     """
-    Keras Model wrapper that implements (Adaptive) VICReg training.
+    Custom Keras Model implementing (Adaptive) VICReg training.
 
-    Responsibilities (step-by-step)
-    -------------------------------
-    • Forward pass: run (x1, x2) through encoder->projector to get z1, z2.
-    • Loss: call `vicreg_total(z1, z2, weights, gamma, nu)`.
-      - `gamma` and `nu` come from my **adaptive** schedulers *iff* `adaptive=True`.
-      - Otherwise (`adaptive=False`) I use *constants* (gamma=1.0, nu=0.0) for baseline.
-    • Optimize: compute gradients on encoder+projector and apply opt step.
-    • Metrics: track and return loss terms so callbacks can log them.
-
-    Parameters
-    ----------
-    encoder : keras.Model
-        My backbone.
-    projector : keras.Model
-        My MLP head for projection space.
-    w0 : VICRegWeights
-        The base weights for (sim, var, cov) components of VICReg.
-    adaptive : bool
-        If True, enable time-varying gamma/nu via `AdaptiveTargets` (my method).
-        If False, run exact baseline VICReg using constants gamma=1.0, nu=0.0.
-    use_schedules : bool
-        Whether to scale *optimizer* lr/wd via external cosine schedules. Loss
-        weights (w0) are currently kept constant; you could extend them too.
-    steps_per_epoch : int
-        Steps in an epoch (for progress calculation).
-    epochs : int
-        Number of epochs (for global step and reporting).
-    base_lr : float
-        For logging and for schedules.
-    base_wd : float
-        For logging and for schedules.
+    Args:
+        encoder: Backbone model.
+        projector: MLP head mapping encoder features to projection space.
+        w0: Base weights for the (sim, var, cov) VICReg components.
+        adaptive_weights: If True, per-step sim/var/cov weights come from
+            `AdaptiveReweighter`. If False, weights are constant (`w0`).
+        adaptive_targets: If True, gamma/nu are time-varying via
+            `AdaptiveTargets`. If False, use the baseline constants
+            gamma=1.0, nu=0.0.
+        use_schedules: Whether to scale optimizer lr/wd via cosine schedules.
+        steps_per_epoch: Steps per epoch, used for progress calculation.
+        epochs: Total training epochs.
+        base_lr: Base learning rate, for schedules and logging.
+        base_wd: Base weight decay, for schedules and logging.
+        reweighter_kwargs: Optional overrides passed to `AdaptiveReweighter`.
     """
     def __init__(
         self,
@@ -195,35 +113,30 @@ class VICRegTrainer(keras.Model):
         encoder: keras.Model,
         projector: keras.Model,
         w0: VICRegWeights,
-        adaptive: bool,
+        adaptive_weights: bool = False,
+        adaptive_targets: bool = False,
         use_schedules: bool,
         steps_per_epoch: int,
         epochs: int,
         base_lr: float,
         base_wd: float,
+        reweighter_kwargs: Optional[dict] = None,
     ):
         super().__init__(name="vicreg_trainer")
         self.encoder = encoder
         self.projector = projector
-
-        # A copy of the user-provided base weights (sim/var/cov).
         self.w0 = w0
 
-        # Feature flags controlling *targets* (gamma/nu) and external LR/WD schedules.
-        self.adaptive = bool(adaptive)
+        self.adaptive_weights = bool(adaptive_weights)
+        self.adaptive_targets = bool(adaptive_targets)
         self.use_schedules = bool(use_schedules)
 
-        # Bookkeeping for step-based progress calculation.
         self.steps_per_epoch = int(steps_per_epoch)
         self.epochs = int(epochs)
         self.total_steps = int(self.steps_per_epoch * self.epochs)
         self.curr_step = tf.Variable(0, dtype=tf.int64, trainable=False)
 
-        # --------------------------
-        # (A) Loss weight schedules.
-        # --------------------------
-        # I use constant VICReg weights by default (weights() returns w0).
-        # You could wire these to cosine too (e.g., down-weight cov later).
+        # Constant VICReg weights; used only when adaptive_weights is False.
         self.schedules = WeightSchedules(
             w0=w0,
             use=self.use_schedules,
@@ -234,145 +147,126 @@ class VICRegTrainer(keras.Model):
             min_scale=0.0,
         )
 
-        # -------------------------------------------------------
-        # (B) Adaptive targets (my method) for gamma and nu.
-        # -------------------------------------------------------
-        # If `self.adaptive == True`, gamma/nu are time-varying. Otherwise,
-        # I will not read them from here in `train_step`; I will use constants.
-        self.targets = AdaptiveTargets(
-            use=self.adaptive,  # <── key feature-flag controlling adaptive behavior
-            # Schedulers are set to identity-like defaults (scale in [min,1]).
-            # You can tune warmup_frac/min_scale externally if desired.
+        # Only constructed (and only holds EMA state) when enabled.
+        self.reweighter = (
+            AdaptiveReweighter(w0=w0, **(reweighter_kwargs or {}))
+            if self.adaptive_weights
+            else None
         )
 
-        # Metric trackers (I keep simple Means so callbacks can read scalar logs).
+        self.targets = AdaptiveTargets(use=self.adaptive_targets)
+
         self.loss_tracker = keras.metrics.Mean(name="loss")
         self.align_tracker = keras.metrics.Mean(name="l_align")
         self.var_tracker = keras.metrics.Mean(name="l_var")
         self.cov_tracker = keras.metrics.Mean(name="l_cov")
+        # Realized weights, so adaptive_weights runs are diagnosable from the
+        # metrics history (did the reweighter actually move, and where to).
+        self.w_sim_tracker = keras.metrics.Mean(name="w_sim")
+        self.w_var_tracker = keras.metrics.Mean(name="w_var")
+        self.w_cov_tracker = keras.metrics.Mean(name="w_cov")
 
-    # Keras calls this to collect metrics it should reset each epoch.
     @property
     def metrics(self):
-        return [self.loss_tracker, self.align_tracker, self.var_tracker, self.cov_tracker]
+        """Metrics Keras should reset at the start of each epoch."""
+        return [
+            self.loss_tracker, self.align_tracker, self.var_tracker, self.cov_tracker,
+            self.w_sim_tracker, self.w_var_tracker, self.w_cov_tracker,
+        ]
 
     def compile(self, optimizer: keras.optimizers.Optimizer, **kwargs):
-        """Standard Keras compile; I only need an optimizer."""
         super().compile(**kwargs)
         self.optimizer = optimizer
 
     def train_step(self, data) -> dict:
-        """
-        One training step on a batch of *paired* views.
-
-        Expected `data` structure from my pipeline:
-        -------------------------------------------
-        data = (x1, x2) with shapes [B, H, W, 3] each (augmented independently).
-        """
-        # Accept both tuple/list and dict-like structures; keep it robust.
+        """One training step on a batch of paired views: data = (x1, x2), each [B, H, W, 3]."""
         if isinstance(data, (tuple, list)) and len(data) == 2:
             x1, x2 = data
         else:
-            # Last resort: try to index; this keeps errors informative.
             x1, x2 = data[0], data[1]
 
-        # Progress fraction in [0,1] based on global step.
         frac = tf.cast(self.curr_step, tf.float32) / tf.cast(self.total_steps, tf.float32)
 
-        # ---------------------------
-        # (1) Forward pass (no loss).
-        # ---------------------------
         with tf.GradientTape() as tape:
-            # Forward both views through encoder and projector (shared weights).
             h1 = self.encoder(x1, training=True)
             h2 = self.encoder(x2, training=True)
             z1 = self.projector(h1, training=True)
             z2 = self.projector(h2, training=True)
 
-            # -------------------------------
-            # (2) Adaptive targets (my method)
-            # -------------------------------
-            # This is the *only* place where adaptive/baseline differ.
-            # • adaptive == True  -> time-varying gamma/nu from self.targets
-            # • adaptive == False -> constants gamma=1.0, nu=0.0 (baseline VICReg)
-            gamma = self.targets.gamma(frac) if self.adaptive else tf.constant(1.0, tf.float32)
-            nu    = self.targets.nu(frac)    if self.adaptive else tf.constant(0.0, tf.float32)
+            gamma = self.targets.gamma(frac) if self.adaptive_targets else tf.constant(1.0, tf.float32)
+            nu    = self.targets.nu(frac)    if self.adaptive_targets else tf.constant(0.0, tf.float32)
 
-            # ---------------------------
-            # (3) VICReg loss computation
-            # ---------------------------
-            # `vicreg_total` returns total loss and a dict with the components.
-            # I pass *constant* weights (self.schedules.weights(frac) returns w0).
-            # You can wire weight scaling later by modifying WeightSchedules.weights.
-            total, parts = vicreg_total(
+            # Raw (unweighted) components. Weighting happens below, so
+            # adaptive_weights can see the raw magnitudes and the probe
+            # embedding before weights are chosen.
+            _, parts = vicreg_total(
                 z1, z2,
-                w=self.schedules.weights(frac),
+                w=VICRegWeights(sim=1.0, var=1.0, cov=1.0),
                 gamma=gamma,
                 nu=nu,
             )
 
-        # ---------------------------
-        # (4) Apply gradients (opt step)
-        # ---------------------------
+            # The only place adaptive_weights and baseline differ.
+            weights = (
+                self.reweighter(parts, z_probe=z1)
+                if self.adaptive_weights
+                else self.schedules.weights(frac)
+            )
+
+            total = (
+                weights["sim"] * parts["l_align"]
+                + weights["var"] * parts["l_var"]
+                + weights["cov"] * parts["l_cov"]
+            )
+
         vars = self.encoder.trainable_variables + self.projector.trainable_variables
         grads = tape.gradient(total, vars)
         self.optimizer.apply_gradients(zip(grads, vars))
 
-        # ---------------------------
-        # (5) Update scalar trackers
-        # ---------------------------
         self.loss_tracker.update_state(total)
         self.align_tracker.update_state(parts["l_align"])
         self.var_tracker.update_state(parts["l_var"])
         self.cov_tracker.update_state(parts["l_cov"])
+        self.w_sim_tracker.update_state(weights["sim"])
+        self.w_var_tracker.update_state(weights["var"])
+        self.w_cov_tracker.update_state(weights["cov"])
 
-        # Advance the global step counter (used for progress fraction).
         self.curr_step.assign_add(1)
 
-        # Keras displays/returns this mapping in logs and callbacks.
         return {
             "loss": self.loss_tracker.result(),
             "l_align": self.align_tracker.result(),
             "l_var": self.var_tracker.result(),
             "l_cov": self.cov_tracker.result(),
+            "w_sim": self.w_sim_tracker.result(),
+            "w_var": self.w_var_tracker.result(),
+            "w_cov": self.w_cov_tracker.result(),
         }
+
     def get_config(self):
         """
-        Return a JSON-serializable snapshot of my construction-time settings.
+        Minimal JSON-serializable snapshot of construction-time settings.
 
-        Why I implement this
-        --------------------
-        Keras warns when a subclassed Model has no `get_config()` because it
-        cannot serialize the constructor args. I'm only saving **weights**
-        (via `save_weights` / ModelCheckpoint with `save_weights_only=True`),
-        so Keras will not *use* this config to rebuild the model; it just needs
-        something serializable to stop warning.
-
-        What I include
-        --------------
-        Only plain Python types (bool/int/float/str/dict) – never Trackables
-        like the actual `encoder` / `projector` models or Optimizers.
-
-        Returns
-        -------
-        dict
-            A minimal, JSON-serializable dictionary describing run-time knobs.
+        Only weights are actually saved/restored (via `save_weights` /
+        `ModelCheckpoint(save_weights_only=True)`), so Keras never uses this
+        to rebuild the model; it only needs something serializable here to
+        stop warning about missing `get_config`. Excludes the encoder,
+        projector, and optimizer, since those aren't JSON-serializable and
+        are restored from weights instead.
         """
-        # Base hyperparameters: keep them JSON-serializable
         cfg = {
-            "class_name": self.__class__.__name__,          # helpful breadcrumb
-            "adaptive": bool(getattr(self, "adaptive", False)),
+            "class_name": self.__class__.__name__,
+            "adaptive_weights": bool(getattr(self, "adaptive_weights", False)),
+            "adaptive_targets": bool(getattr(self, "adaptive_targets", False)),
             "use_schedules": bool(getattr(self, "use_schedules", False)),
         }
 
-        # Loss weights (convert dataclass to plain dict of floats)
         try:
             w0 = getattr(self, "w0")
             cfg["w0"] = {"sim": float(w0.sim), "var": float(w0.var), "cov": float(w0.cov)}
         except Exception:
             cfg["w0"] = {"sim": 25.0, "var": 25.0, "cov": 1.0}
 
-        # Training duration in steps; safer than storing steps_per_epoch/epochs separately
         total_steps = getattr(self, "total_steps", None)
         if total_steps is not None:
             try:
@@ -380,7 +274,6 @@ class VICRegTrainer(keras.Model):
             except Exception:
                 pass
 
-        # Scheduler bases (if present). Fall back to attributes set in __init__.
         base_lr = None
         base_wd = None
         try:
@@ -399,30 +292,20 @@ class VICRegTrainer(keras.Model):
         cfg["base_lr"] = base_lr
         cfg["base_wd"] = base_wd
 
-        # NOTE: I deliberately do NOT include actual models/optimizers/callbacks,
-        # because they are not JSON-serializable and are restored from weights.
         return cfg
 
     @classmethod
     def from_config(cls, config):
         """
-        Rebuild a trainer from a config dict.
-
-        Important
-        ---------
-        My training workflow restores **weights** into an already-constructed
-        trainer that you build via your `build_encoder` / `build_projector`
-        helpers. Because `encoder` and `projector` are required and not
-        serializable into JSON, automatic reconstruction from this config is
-        intentionally **not** supported.
-
-        This method exists only to satisfy Keras' serialization contract and
-        prevent warnings during weight saving. If someone tries to call it,
-        I raise a clear error explaining the supported path.
+        Not supported: `encoder`/`projector` are required constructor args
+        and are not JSON-serializable, so a trainer can't be rebuilt from
+        `get_config()` alone. Build them explicitly, construct
+        `VICRegTrainer(encoder=..., projector=..., ...)`, then call
+        `load_weights(...)`. This method exists only to satisfy Keras'
+        serialization contract and avoid warnings during weight saving.
         """
         raise NotImplementedError(
             "VICRegTrainer cannot be constructed from config alone. "
             "Build encoder/projector explicitly, create VICRegTrainer(encoder=..., projector=..., ...), "
             "then call `load_weights(...)` if needed."
         )
-
