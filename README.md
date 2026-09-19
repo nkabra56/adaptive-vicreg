@@ -1,409 +1,171 @@
-# Adaptive VICReg in TensorFlow/Keras
+# Adaptive VICReg
 
-This repository contains a TensorFlow/Keras reimplementation of **VICReg** (Variance-Invariance-Covariance Regularization) and an experimental **Adaptive VICReg** variant that dynamically reweights the three loss terms during self-supervised training.
+A TensorFlow/Keras implementation of VICReg [1] with an experimental variant that adjusts the loss weights during training. It pretrains a small CNN encoder on CIFAR-10 [2] without labels, then evaluates it with a linear probe and a kNN classifier. Final project for CS 584, Fall 2025.
 
-The code is designed for **CIFAR-10** experiments and follows a typical modern ML research workflow:
+## How it works
 
-- End-to-end self-supervised pretraining (baseline VICReg and Adaptive VICReg)
-- Linear evaluation and non-parametric kNN evaluation on frozen features
-- Automated logging and report generation (loss curves, feature statistics, LaTeX-ready tables)
+VICReg trains an encoder by embedding two augmented views of each image and asking three things of the embeddings:
 
-> **Author:** Nishant Kabra  
-> **Status:** Research project / course final project
+- **Invariance:** the two views should map to nearby points.
+- **Variance:** every embedding dimension should keep some spread across the batch, which prevents collapse.
+- **Covariance:** different dimensions should be decorrelated.
 
----
+The paper weights the three terms 25, 25 and 1. This repo adds two optional mechanisms on top. Both are off by default, and with neither flag you get plain VICReg.
 
-## 1. Overview
+**`--adaptive`** picks the three weights again at every step, using two signals:
 
-Self-supervised representation learning has become a powerful alternative to supervised pretraining. VICReg [[1]](#references) proposes a non-contrastive objective that avoids collapse by combining:
+1. *Magnitude balancing.* A moving average of each raw loss term sets a multiplier (clipped to 0.2x-5x). Terms that are large compared to the others get smaller weights, so none dominates just because of its scale.
+2. *Embedding health.* Moving averages of the embedding's mean per-dimension std and mean squared off-diagonal correlation boost the variance weight when std falls below 1 and the covariance weight when correlation rises (up to 4x).
 
-- **Invariance:** embeddings of two augmented views of the same image should be close,
-- **Variance:** each feature dimension should have non-trivial variance across the batch,
-- **Covariance:** different feature dimensions should be decorrelated.
+**`--adaptive-targets`** changes what the loss aims for instead of how the terms are weighted. The correlation target `nu` decays from 1.0 to 0.0 over training, and the variance floor `gamma` stays at 1.0. It can be combined with `--adaptive`.
 
-The original VICReg paper uses fixed loss weights tuned for large-scale ImageNet pretraining. This repository explores whether **adaptive weighting** of these three terms can improve training dynamics and downstream performance in a smaller setting (CIFAR-10, compact ResNet-style encoder).
+The encoder is a six-layer CNN (three stages of two 3x3 conv, batch norm, ReLU blocks) with global average pooling and a linear layer. The projector is an MLP with 1 to 3 layers.
 
-### Key ideas
-
-- A clean TensorFlow/Keras implementation of VICReg with configurable backbone and projector.
-- An **Adaptive VICReg** loss that combines two signals to rebalance the sim/var/cov loss weights online:
-  1. **EMA magnitude balancing**: an exponential moving average of each raw loss term's magnitude.
-     Terms that are large relative to the others get down-weighted, and vice versa, so no term
-     dominates the gradient purely because of its numeric scale.
-  2. **Embedding-health reactive boost**: EMAs of the projection embedding's average per-dimension
-     std and average squared off-diagonal correlation. If std drifts below target (collapse risk)
-     or correlation drifts above target (redundancy risk), the variance/covariance weight is
-     boosted until the statistic recovers.
-- A separate, optional **target-schedule** mechanism (`--adaptive-targets`) ramps the variance
-  floor `gamma` and redundancy target `nu` over training instead of holding them at the baseline
-  constants (`gamma=1.0`, `nu=0.0`). It can be combined with `--adaptive` or used on its own.
-- A consistent pipeline for:
-  - baseline VICReg pretraining,
-  - Adaptive VICReg pretraining,
-  - linear evaluation,
-  - kNN evaluation,
-  - automatic plotting and LaTeX table generation.
-
----
-
-## 2. Repository structure
-
-The main components are:
-
-```text
-.
-├── scripts/
-│   ├── train_vicreg.py       # Self-supervised pretraining (baseline + adaptive)
-│   ├── resume_pretrain.py    # Resume / extend a pretraining run
-│   ├── eval_linear.py        # Linear probe evaluation on frozen encoder
-│   └── knn_eval.py           # kNN evaluation on frozen encoder
-├── src/
-│   └── vicreg_tf/
-│       ├── data.py           # CIFAR-10 dataset + tf.data pipelines
-│       ├── augment.py        # SSL data augmentations
-│       ├── model.py          # Encoder + projector definitions
-│       ├── losses.py         # VICReg and Adaptive VICReg losses
-│       ├── schedules.py      # LR/WD schedules + adaptive weighting/targets
-│       ├── report_metrics.py # Plotting + LaTeX-ready tables
-│       └── utils.py          # Seeding, GPU/mixed-precision, checkpoint helpers
-├── tests/                    # pytest unit tests for losses.py / schedules.py
-├── requirements.txt
-├── requirements-dev.txt      # requirements.txt + pytest
-└── README.md                 # This file
-```
-
-Checkpoints and results are written under:
-
-- `checkpoints_tf/`: model weights and training history,
-- `results/`: CSV logs for linear and kNN evaluation,
-- `reports/`: plots and LaTeX-ready tables generated by `report_metrics.py`.
-
----
-
-## 3. Installation
-
-Create and activate a Python virtual environment, then install the dependencies:
+## Setup
 
 ```bash
-git clone git@github.com:nkabra56/adaptive-vicreg-cs584-final-proj.git
-cd adaptive-vicreg-cs584-final-proj
+git clone https://github.com/nkabra56/adaptive-vicreg.git
+cd adaptive-vicreg
 
 python3 -m venv .venv
-source .venv/bin/activate           # on Windows: .venv\Scripts\activate
-
-pip install --upgrade pip
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-TensorFlow 2.15/2.16 (pinned in `requirements.txt`) require **Python 3.9-3.12**. There is no
-TensorFlow wheel for newer Python versions yet, so make sure the interpreter used for the venv is
-in that range.
+You need TensorFlow 2.15 or newer, on a Python version that TensorFlow release supports. The code was developed on TF 2.17 (NVIDIA NGC container), and the tests also pass on TF 2.20 with Python 3.13. A GPU makes pretraining much faster but isn't required.
 
-For running the test suite (`tests/`), use `requirements-dev.txt` instead, which adds `pytest`:
+### Docker
+
+The `Dockerfile` builds on NVIDIA's `nvcr.io/nvidia/tensorflow:25.02-tf2-py3` image (TF 2.17, CUDA 12.8), which is what the GPU runs in [EXPERIMENTS.md](EXPERIMENTS.md) used. The repo is mounted at run time, and mounting `.cache_keras` keeps the CIFAR-10 download between runs:
 
 ```bash
-pip install -r requirements-dev.txt
-pytest tests/
+docker build -t adaptive-vicreg:ngc .
+docker run --gpus all -it --rm \
+  -v "$(pwd):/workspace" -v "$(pwd)/.cache_keras:/root/.keras" -w /workspace \
+  adaptive-vicreg:ngc bash
 ```
 
-A CUDA-capable GPU is strongly recommended for pretraining but not strictly required.
+## Usage
 
----
+Run everything from the repository root. Each script's `--help` lists all options.
 
-## 4. Usage
-
-All commands below assume the working directory is the repository root and the virtual environment is activated.
-
-### 4.1 Pretraining: baseline VICReg vs Adaptive VICReg
-
-The main entry point is `scripts/train_vicreg.py`.
-
-#### Baseline VICReg (fixed weights)
+### Pretraining
 
 ```bash
 python3 scripts/train_vicreg.py \
-  --dataset cifar10 \
-  --image-size 32 \
-  --epochs 100 \
-  --batch-size 512 \
-  --feat-dim 2048 \
-  --proj-out 4096 \
-  --proj-layers 3 \
-  --lr 0.01 \
-  --wd 1e-6 \
-  --use-schedules \
-  --metrics-compute-on projector \
-  --metrics-probe-batch 256 \
-  --record-every 1 \
-  --model-dir checkpoints_tf \
-  --run-name pretrain-c10_baseline
+  --dataset cifar10 --epochs 100 --batch-size 256 \
+  --feat-dim 2048 --proj-out 4096 --proj-layers 3 \
+  --lr 0.01 --wd 1e-6 --use-schedules \
+  --model-dir checkpoints_tf --run-name pretrain-c10_baseline
 ```
 
-#### Adaptive VICReg (dynamic weights)
+Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
 
-```bash
-python3 scripts/train_vicreg.py \
-  --dataset cifar10 \
-  --image-size 32 \
-  --epochs 100 \
-  --batch-size 512 \
-  --feat-dim 2048 \
-  --proj-out 4096 \
-  --proj-layers 3 \
-  --lr 0.01 \
-  --wd 1e-6 \
-  --adaptive \
-  --use-schedules \
-  --metrics-compute-on projector \
-  --metrics-probe-batch 256 \
-  --record-every 1 \
-  --model-dir checkpoints_tf \
-  --run-name pretrain-c10_adaptive
-```
+Each run writes to `checkpoints_tf/<run-name>_<timestamp>/`:
 
-`--adaptive` enables the loss-weight reweighter described above (`--ema-decay`, `--var-boost-k`,
-`--cov-boost-k` tune it). The target-schedule mechanism is independent: add `--adaptive-targets`
-to also ramp gamma/nu, on either the baseline or adaptive-weights run. Pass `--seed <int>` to any
-of these commands for a reproducible run (seeds Python/NumPy/TF).
+- `vicreg_full.weights.h5`: trainer weights (encoder, projector, optimizer) at the lowest training loss.
+- `vicreg_encoder.weights.h5`: the encoder weights from that same checkpoint. This is the file the evaluation scripts load.
+- `train_config.json`: the hyperparameters used.
+- `metrics/history.jsonl`: one record per epoch with the loss terms, the loss weights, and embedding statistics.
 
-Each run creates a subfolder under `checkpoints_tf/` containing:
-
-- `vicreg_full.weights.h5`: full trainer weights (encoder, projector, optimizer),
-- `vicreg_encoder.weights.h5`: encoder-only weights used by downstream tasks,
-- `train_config.json`: configuration snapshot,
-- `metrics/history.jsonl`: per-epoch metrics and statistics.
-
-### 4.2 Resuming a pretraining run
-
-If a long run gets interrupted, you can resume or extend it via `scripts/resume_pretrain.py`.
-Pass the same `--adaptive`/`--adaptive-targets`/`--feat-dim` values used for the original run so
-the rebuilt trainer matches the checkpoint. Note that `--bn-freeze-steps` is accepted but currently
-a no-op: `VICRegTrainer` has no BN-freeze mechanism implemented yet.
+### Resuming a run
 
 ```bash
 python3 scripts/resume_pretrain.py \
-  --ckpt checkpoints_tf/pretrain-c10_baseline_*/vicreg_full.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 256 \
-  --proj-out 4096 \
-  --proj-layers 3 \
-  --epochs 200 \
-  --initial-epoch 80 \
-  --lr 0.01 \
-  --resume-lr 0.003 \
-  --wd 1e-6 \
-  --warmup-steps 500 \
-  --bn-freeze-steps 200
+  --ckpt checkpoints_tf/<run>/vicreg_full.weights.h5 \
+  --initial-epoch 80 --epochs 200 --resume-lr 0.003
 ```
 
-- `--initial-epoch` is where the original run stopped.
-- `--epochs` is the new final epoch.
-- `--resume-lr` is the learning rate used after resuming.
+`--initial-epoch` is the epoch the original run stopped at and `--epochs` is the epoch to train up to. Pass the same `--feat-dim`, `--proj-out`, `--proj-layers`, `--adaptive` and `--adaptive-targets` values as the original run.
 
-### 4.3 Linear evaluation (frozen encoder)
+### Linear evaluation
 
-Use `scripts/eval_linear.py` to train a linear classifier on top of a frozen encoder.
-
-Example (CIFAR-10, AdamW head):
+Trains one linear layer on frozen encoder features and appends a row with the test accuracy and hyperparameters to a CSV.
 
 ```bash
 python3 scripts/eval_linear.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_baseline_*/vicreg_encoder.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 512 \
-  --epochs 10 \
-  --lr 0.003 \
-  --l2 1e-4 \
-  --feat-dim 2048 \
-  --opt adamw \
-  --out-csv results/pretrain-c10_baseline/linear_eval.csv \
-  --method-name VICReg
+  --encoder-ckpt checkpoints_tf/<run>/vicreg_encoder.weights.h5 \
+  --epochs 10 --lr 0.003 --l2 1e-4 --opt adamw \
+  --out-csv results/<run>/linear_eval.csv --method-name VICReg
 ```
 
-For Adaptive VICReg, just change the checkpoint path and method name:
+### kNN evaluation
 
-```bash
-python3 scripts/eval_linear.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_adaptive_*/vicreg_encoder.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 512 \
-  --epochs 10 \
-  --lr 0.003 \
-  --l2 1e-4 \
-  --feat-dim 2048 \
-  --opt adamw \
-  --out-csv results/pretrain-c10_adaptive/linear_eval.csv \
-  --method-name AdaptiveVICReg
-```
-
-The script writes epoch-wise accuracy and loss to the specified CSV.
-
-### 4.4 kNN evaluation
-
-`scripts/knn_eval.py` computes features for the CIFAR-10 train/test sets and performs kNN classification with temperature-scaled soft voting.
-
-Example:
+Classifies each test image by a temperature-weighted vote among its `k` nearest training images (cosine similarity on the encoder features) and appends a row to a CSV.
 
 ```bash
 python3 scripts/knn_eval.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_baseline_*/vicreg_encoder.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 512 \
-  --feat-dim 2048 \
-  --k 200 \
-  --temperature 0.1 \
-  --out-csv results/pretrain-c10_baseline/knn_eval.csv \
-  --method-name VICReg
+  --encoder-ckpt checkpoints_tf/<run>/vicreg_encoder.weights.h5 \
+  --k 200 --temperature 0.1 \
+  --out-csv results/<run>/knn_eval.csv --method-name VICReg
 ```
 
-For Adaptive VICReg, change the checkpoint and output path:
+Both evaluation scripts need the encoder-only weights file, and `--feat-dim` must match pretraining. Use `--method-name` to label the row, for example `VICReg` or `AdaptiveVICReg`.
 
-```bash
-python3 scripts/knn_eval.py \
-  --encoder-ckpt checkpoints_tf/pretrain-c10_adaptive_*/vicreg_encoder.weights.h5 \
-  --dataset cifar10 \
-  --image-size 32 \
-  --batch-size 512 \
-  --feat-dim 2048 \
-  --k 200 \
-  --temperature 0.1 \
-  --out-csv results/pretrain-c10_adaptive/knn_eval.csv \
-  --method-name AdaptiveVICReg
-```
-
----
-
-## 5. Generating plots and LaTeX tables
-
-`src/vicreg_tf/report_metrics.py` consumes:
-
-- the per-epoch JSONL logs,
-- linear evaluation CSVs,
-- kNN evaluation CSVs,
-
-and produces:
-
-- loss curves (`loss_total`, `loss_align`, `loss_var`, `loss_cov`),
-- embedding statistics (off-diagonal correlation, feature standard deviation),
-- LaTeX-ready CSVs / tables for linear and kNN results.
-
-Example: generate plots and tables for a single Adaptive VICReg run:
-
-```bash
-RUN_NAME=pretrain-c10_adaptive
-RUN_DIR=checkpoints_tf/${RUN_NAME}
-
-python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/${RUN_NAME} \
-  --history "name=AdaptiveVICReg,path=${RUN_DIR}/metrics/history.jsonl,config=${RUN_DIR}/train_config.json" \
-  --linear-csv "name=AdaptiveVICReg,path=results/${RUN_NAME}/linear_eval.csv" \
-  --knn-csv    "name=AdaptiveVICReg,path=results/${RUN_NAME}/knn_eval.csv"
-```
-
-To compare baseline vs adaptive in one call:
+### Plots and tables
 
 ```bash
 python3 src/vicreg_tf/report_metrics.py \
-  --out-dir reports/COMPARE_baseline_vs_adaptive \
-  --history "name=VICReg,path=checkpoints_tf/pretrain-c10_baseline_*/metrics/history.jsonl,config=checkpoints_tf/pretrain-c10_baseline_*/train_config.json" \
-  --history "name=AdaptiveVICReg,path=checkpoints_tf/pretrain-c10_adaptive_*/metrics/history.jsonl,config=checkpoints_tf/pretrain-c10_adaptive_*/train_config.json" \
-  --linear-csv "name=VICReg,path=results/pretrain-c10_baseline/linear_eval.csv" \
-  --linear-csv "name=AdaptiveVICReg,path=results/pretrain-c10_adaptive/linear_eval.csv" \
-  --knn-csv    "name=VICReg,path=results/pretrain-c10_baseline/knn_eval.csv" \
-  --knn-csv    "name=AdaptiveVICReg,path=results/pretrain-c10_adaptive/knn_eval.csv"
+  --out-dir reports/compare \
+  --history "name=VICReg,path=checkpoints_tf/<baseline-run>/metrics/history.jsonl" \
+  --history "name=AdaptiveVICReg,path=checkpoints_tf/<adaptive-run>/metrics/history.jsonl" \
+  --linear-csv "name=VICReg,path=results/<baseline-run>/linear_eval.csv" \
+  --linear-csv "name=AdaptiveVICReg,path=results/<adaptive-run>/linear_eval.csv" \
+  --knn-csv "name=VICReg,path=results/<baseline-run>/knn_eval.csv" \
+  --knn-csv "name=AdaptiveVICReg,path=results/<adaptive-run>/knn_eval.csv"
 ```
 
-The resulting figures and tables can be directly dropped into a paper or report.
+This writes loss curves (total, invariance, variance, covariance), embedding statistics, and linear and kNN result tables as CSV and PNG. Each run's `train_config.json` is found next to its metrics folder, and with two or more runs the report also plots kNN accuracy against batch size.
 
----
+## Tests
 
-## 6. Experimental results (CIFAR-10, 100 pretrain epochs)
+```bash
+pip install -r requirements-dev.txt
+pytest
+ruff check .
+```
 
-> **Note:** the numbers below are from an earlier implementation of "Adaptive VICReg" that, despite
-> the name, only ramped the `gamma`/`nu` *targets* (now `--adaptive-targets`); it did not reweight
-> the loss terms at all, contrary to what this README claimed at the time. The actual loss-term
-> reweighting mechanism (`--adaptive`, described in §1) is a new implementation and has not been
-> benchmarked yet. These results should be treated as **stale** until rerun against the corrected
-> mechanism; they are kept here for historical reference only.
+The suite takes about a minute on a CPU.
 
-Using a compact ResNet-style encoder and 100 epochs of self-supervised pretraining on CIFAR-10:
+## Repository layout
 
-- **Baseline VICReg (fixed weights)**  
-  - Linear probe top-1: **51.95%**  
-  - kNN top-1 (best over grid): **46.39%** (k = 50, temperature = 0.07)
+```text
+scripts/
+  train_vicreg.py           pretraining
+  resume_pretrain.py        resume or extend a run
+  eval_linear.py            linear probe on a frozen encoder
+  knn_eval.py               kNN evaluation on a frozen encoder
+  _extract_best_encoder.py  re-save the encoder from a run's best checkpoint
+src/vicreg_tf/
+  model.py                  encoder, projector, VICRegTrainer
+  losses.py                 VICReg loss terms
+  schedules.py              cosine schedules, adaptive targets, AdaptiveReweighter
+  callbacks.py              LR schedule, warmup, loss guard, metrics logger
+  data.py, augment.py       CIFAR tf.data pipelines and augmentations
+  utils.py                  seeding, device selection, checkpoint helpers
+  report_metrics.py         plots and tables
+tests/                      pytest suite
+```
 
-- **Adaptive VICReg (prior `--adaptive-targets`-only configuration)**  
-  - Linear probe top-1: **45.08%**  
-  - kNN top-1 (best over grid): **38.37%** (k = 50, temperature = 0.10)
+## Results
 
-The prior scheme produced slightly more decorrelated features (lower off-diagonal correlations)
-but did not outperform the fixed-weight baseline in downstream accuracy. Whether the new
-EMA-magnitude + embedding-health reweighting mechanism does better is an open question pending a
-fresh baseline/adaptive comparison.
+These numbers are from an earlier version in which "Adaptive VICReg" only scheduled the `gamma` and `nu` targets (now `--adaptive-targets`) and did not reweight the loss terms. The reweighting in `--adaptive` is newer and hasn't been benchmarked, so treat the table as history. Both runs used 100 pretraining epochs and batch size 512 on CIFAR-10.
 
----
+| Run | Linear probe top-1 | kNN top-1 (best over a k/temperature grid) |
+|---|---|---|
+| Baseline VICReg | 51.95% | 46.39% (k=50, T=0.07) |
+| Targets-only variant | 45.08% | 38.37% (k=50, T=0.10) |
 
-## 7. License
-This project is **not open source** in the usual MIT/GPL sense.
+The targets-only variant produced slightly more decorrelated features but didn't beat the baseline downstream. More recent baseline runs on a laptop GPU (batch size 256) reach 21.74% linear and 30.35% kNN top-1 and show a loss spike partway through training. Those runs and their analysis are in [EXPERIMENTS.md](EXPERIMENTS.md). Open issues and ideas are in [TASKS.md](TASKS.md).
 
-The code in this repository is distributed under a **custom non-commercial license**
-(see the `LICENSE` file for full terms). In summary:
+## License and citation
 
-- You may **view and study** the code and
-  **clone/download the repository** for personal, academic, or non-commercial
-  research use.
-- You may **not redistribute, sublicense, or publish** the code, in whole or in part,
-  without prior written permission from the author.
-- You may **not modify and redistribute** the code, or incorporate it into other
-  software projects, or use it for **commercial purposes**, without prior written
-  permission from the author.
+The code is under a custom non-commercial license (see [LICENSE](LICENSE)). You can view it, clone it, and use it for personal, academic or non-commercial research. Redistribution, publishing modified copies, and commercial use need written permission from the author.
 
-If you build on this work in academic research, please cite the original VICReg
-paper and the methods listed in the References section, and acknowledge this
-implementation (Nishant Kabra) and this repository where appropriate.
+If you build on this work, please cite VICReg and this repository ([citation.cff](citation.cff)).
 
----
+## References
 
-## 8. References
+[1] A. Bardes, J. Ponce and Y. LeCun. "VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning." ICLR 2022. [arXiv:2105.04906](https://arxiv.org/abs/2105.04906).
 
-<a name="references"></a>
-
-[1] A. Bardes, J. Ponce, and Y. LeCun,  
-**“VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning,”**  
-*International Conference on Learning Representations (ICLR)*, 2022.  
-arXiv: [2105.04906](https://arxiv.org/abs/2105.04906).
-
-[2] R. Shwartz-Ziv, R. Balestriero, K. Kawaguchi, T. G. J. Rudner, and Y. LeCun,  
-**“An Information-Theoretic Perspective on Variance-Invariance-Covariance Regularization,”**  
-*Advances in Neural Information Processing Systems (NeurIPS)*, 2023.
-
-[3] J. Zbontar, L. Jing, I. Misra, Y. LeCun, and S. Deny,  
-**“Barlow Twins: Self-Supervised Learning via Redundancy Reduction,”**  
-*International Conference on Machine Learning (ICML)*, 2021.
-
-[4] X. Chen and K. He,  
-**“Exploring Simple Siamese Representation Learning (SimSiam),”**  
-*Conference on Computer Vision and Pattern Recognition (CVPR)*, 2021.
-
-[5] J.-B. Grill et al.,  
-**“Bootstrap Your Own Latent: A New Approach to Self-Supervised Learning (BYOL),”**  
-*Advances in Neural Information Processing Systems (NeurIPS)*, 2020.
-
-[6] T. Chen, S. Kornblith, M. Norouzi, and G. Hinton,  
-**“A Simple Framework for Contrastive Learning of Visual Representations (SimCLR),”**  
-*International Conference on Machine Learning (ICML)*, 2020.
-
-[7] A. Krizhevsky,  
-**“Learning Multiple Layers of Features from Tiny Images,”**  
-Technical Report, University of Toronto, 2009. (CIFAR-10 dataset)
-
-[8] M. Abadi et al.,  
-**“TensorFlow: A System for Large-Scale Machine Learning,”**  
-*USENIX Symposium on Operating Systems Design and Implementation (OSDI)*, 2016.
-
-[9] F. Chollet and contributors,  
-**Keras**, GitHub repository, 2015. Available at: <https://keras.io>.
+[2] A. Krizhevsky. "Learning Multiple Layers of Features from Tiny Images." Technical report, University of Toronto, 2009 (CIFAR-10 and CIFAR-100).

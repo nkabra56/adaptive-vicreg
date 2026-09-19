@@ -1,44 +1,23 @@
-# Tasks
+# Open items
 
-Punch list compiled during a repo review pass on 2026-08-12. Update this file
-in place as items are resolved.
+## Known issues
 
-## Needs your input / external action
+- **Resuming.** `resume_pretrain.py --use-schedules` has no effect: no LR schedule is attached, so the rate stays constant after warmup. `--warmup-steps` is compared against the global step, which a resume sets to `initial_epoch * steps_per_epoch`, so warmup only happens when it is larger than that.
+- **Unstable baseline.** At batch size 256 the baseline recipe blows up around epoch 25 to 33 (see [EXPERIMENTS.md](EXPERIMENTS.md)). Things to try: a lower peak LR, a real warmup (`CosineWarmup` is built with `warmup_frac=0.0`), gradient clipping.
+- **Checkpointing.** `ModelCheckpoint` monitors the training loss, not a held-out metric, and keeps only the best-loss weights. Add an unconditional last-epoch checkpoint so both ends of a run can be compared.
+- **Full checkpoints.** The eval scripts need the encoder-only weights file. On Keras 3 a full trainer checkpoint won't load into an encoder, and `by_name` isn't supported for `.weights.h5` files. `scripts/_extract_best_encoder.py` writes an encoder-only file from a run directory.
 
-- [x] `citation.cff` `repository-code`/`license-url` pointed at placeholder
-      URLs. Resolved: filled in from `git remote` (`nkabra56/adaptive-vicreg-cs584-final-proj`).
-- [ ] `citation.cff` `orcid` is a placeholder (`0000-0000-0000-0000`). Left as
-      a visible placeholder per your choice; register a real ORCID and update
-      it later if you want one in the citation record.
-- [x] `.gitignore` references `ablations.md`, `slides.md`, and NGC container
-      scripts that aren't tracked in git. Resolved: none of these exist on
-      disk, so there's nothing to recover or worry about losing.
+## Experiments
 
-## Verification needed (run on your training machine, not doable in this sandbox)
+- Benchmark `--adaptive` against a stable baseline. The numbers in the README predate the current reweighter.
+- Ablate `--adaptive-targets`. Its default `nu` schedule starts at 1.0, which pulls off-diagonal correlation toward redundancy early in training.
 
-- [ ] `pytest tests/` has never actually executed. This dev sandbox's Python
-      (3.14) has no installable TensorFlow, so the test suite (losses,
-      schedules, `AdaptiveReweighter`) is only syntax-checked and
-      cross-validated in numpy so far.
-- [ ] Smoke test the new `AdaptiveReweighter` against real training
-      (`--epochs 1 --adaptive`) before trusting it on a full run.
-- [ ] README's "Experimental results" (section 6) are explicitly marked
-      stale, from the old, broken adaptive-targets-only mechanism. Needs a
-      fresh baseline vs. `--adaptive` comparison run.
+## Scope and tooling
 
-## Known scope gaps (not bugs, just unfinished scope)
-
-- [ ] `--bn-freeze-steps` in `resume_pretrain.py` is accepted but is a no-op.
-      `VICRegTrainer` has no BN-freeze mechanism implemented. Either build it
-      or drop the flag.
-- [ ] Dataset support is CIFAR-10/100 only (hardcoded 50k sample count in
-      `steps_for_dataset`).
-- [ ] Augmentation set is minimal relative to modern SSL recipes (no
-      random-resized-crop, Gaussian blur, or solarization).
-- [ ] Architecture is a single fixed CNN encoder. No ResNet-18/50 option, no
-      LARS optimizer (the original VICReg paper uses LARS for large-batch
-      training).
-- [ ] `ModelCheckpoint` monitors train `loss`, not a held-out validation
-      metric.
-- [ ] No CI configured. Tests exist but nothing runs them automatically on
-      push.
+- Only CIFAR-10 and CIFAR-100 are supported (the 50,000-image count is hardcoded in `steps_for_dataset`).
+- Augmentation is minimal: no random-resized-crop, Gaussian blur or solarization.
+- There is one fixed CNN encoder, with no ResNet option and no LARS optimizer (the VICReg paper uses LARS for large batches).
+- No CI, so the tests only run when someone runs them.
+- `report_metrics.py` is a command-line script that lives inside the `vicreg_tf` package. `scripts/` would suit it better.
+- `VicRegMetricsLogger` and `AdaptiveReweighter` each compute the embedding std and off-diagonal correlation on their own. They could share code, but merging them can change float rounding, so check that seeded runs still match first.
+- `citation.cff` has no ORCID. Add one if it should be in the citation record.
