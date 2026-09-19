@@ -11,9 +11,6 @@ from vicreg_tf.schedules import (
 )
 
 
-# ---------------------------------------------------------------------------
-# CosineWarmup / cosine_scaler
-# ---------------------------------------------------------------------------
 def test_cosine_warmup_endpoints_no_warmup():
     sched = CosineWarmup(warmup_frac=0.0, min_scale=0.0)
     assert abs(sched(0.0) - 1.0) < 1e-6
@@ -44,9 +41,6 @@ def test_cosine_scaler_from_step_and_total_steps():
     assert abs(val - 0.5) < 1e-6
 
 
-# ---------------------------------------------------------------------------
-# WeightSchedules: constant weights regardless of `use`/frac (current design)
-# ---------------------------------------------------------------------------
 def test_weight_schedules_weights_are_constant_w0():
     w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
     sched = WeightSchedules(w0=w0, use=True, base_lr=0.01, base_wd=1e-6, total_steps=1000)
@@ -63,9 +57,6 @@ def test_weight_schedules_lr_scales_with_use_flag():
     assert abs(sched_on.lr_at(50) - 0.05) < 1e-4  # ~half lr at 50% progress
 
 
-# ---------------------------------------------------------------------------
-# AdaptiveTargets: the separate, optional gamma/nu target schedule
-# ---------------------------------------------------------------------------
 def test_adaptive_targets_disabled_returns_baseline_constants():
     targets = AdaptiveTargets(use=False)
     assert float(targets.gamma(0.5)) == 1.0
@@ -88,9 +79,6 @@ def test_adaptive_targets_enabled_nu_ramps_from_one_to_zero():
     assert all(vals[i] >= vals[i + 1] - 1e-6 for i in range(len(vals) - 1))
 
 
-# ---------------------------------------------------------------------------
-# AdaptiveReweighter: the new "Adaptive VICReg" weighting mechanism
-# ---------------------------------------------------------------------------
 def _run_steps(rw, n, **kwargs):
     weights = None
     for _ in range(n):
