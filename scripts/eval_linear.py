@@ -1,50 +1,31 @@
+"""Linear evaluation of a frozen encoder on CIFAR-10 or CIFAR-100.
+
+Freezes a pretrained encoder, trains one linear layer on its features, and appends a CSV row with the
+test accuracy and hyperparameters. `--encoder-ckpt` can be an encoder weights file, a directory, or a
+glob (the newest match wins).
 """
-Linear evaluation on a frozen encoder (TensorFlow + Keras).
-
-Freezes a pretrained VICReg/Adaptive-VICReg encoder and trains a single
-linear classifier on top of its features, as a quick, apples-to-apples
-measure of representation quality without fine-tuning the backbone.
-
-Supports three optimizers for the head: SGD with Nesterov momentum, Adam,
-and AdamW (native Keras, falling back to TensorFlow Addons if unavailable).
-
-Checkpoint resolution is robust to a direct file, a directory, or a glob; if
-`--encoder-ckpt` accidentally points at the full trainer weights instead of
-the encoder-only weights, a by_name+skip_mismatch load is attempted
-automatically.
-
-Writes one CSV row (test accuracy plus hyperparameters) to --out-csv.
-
-Example:
-  python3 scripts/eval_linear.py \
-    --encoder-ckpt checkpoints_tf/pretrain-c10_checktrainer_2*/vicreg_encoder.weights.h5 \
-    --dataset cifar10 --image-size 32 --batch-size 512 \
-    --epochs 10 --lr 0.003 --l2 1e-4 \
-    --feat-dim 2048 \
-    --opt adamw \
-    --out-csv results/linear_eval.csv \
-    --method-name AdaptiveVICReg
-"""
-
 from __future__ import annotations
-import argparse, csv, os, sys, glob
+
+import argparse
+import csv
+import glob
+import os
+import sys
 from pathlib import Path
-import numpy as np
+
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO / "src"))
+
 import tensorflow as tf
 from tensorflow import keras
 
-# Make local src/ importable so `from vicreg_tf import ...` resolves.
-_REPO = Path(__file__).resolve().parents[1]
-_SRC = _REPO / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+from vicreg_tf import build_encoder, enable_memory_growth
 
-from vicreg_tf import build_encoder
-from vicreg_tf import enable_memory_growth
+_WEIGHT_PATTERNS = ("vicreg_encoder.weights.h5", "*encoder*.weights.h5", "vicreg_full.weights.h5", "*.weights.h5")
 
 
 def _load_cifar(name: str):
-    """Load CIFAR-10 or CIFAR-100 via `keras.datasets`, returning ((x_train, y_train), (x_test, y_test), num_classes)."""
+    """Return ((x_train, y_train), (x_test, y_test), num_classes) for CIFAR-10 or CIFAR-100."""
     if name == "cifar10":
         (xtr, ytr), (xte, yte) = keras.datasets.cifar10.load_data()
         num_classes = 10
@@ -57,7 +38,7 @@ def _load_cifar(name: str):
 
 
 def _make_ds(x, y, image_size: int, batch: int, shuffle: bool):
-    """Build a minimal batched, prefetched tf.data.Dataset, normalized to [0,1] and resized if `image_size != 32`."""
+    """Batched dataset scaled to [0, 1], resized if `image_size` isn't 32."""
     x = tf.convert_to_tensor(x, tf.float32) / 255.0
     y = tf.convert_to_tensor(y, tf.int32)
 
@@ -69,38 +50,45 @@ def _make_ds(x, y, image_size: int, batch: int, shuffle: bool):
             lambda im, lab: (tf.image.resize(im, (image_size, image_size)), lab),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
-    ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
-    return ds
+    return ds.batch(batch).prefetch(tf.data.AUTOTUNE)
 
 
 def _newest(paths: list[str]) -> str | None:
-    """Return the most recently modified existing path, or None if none exist."""
-    if not paths:
+    """The most recently modified path that exists, or None."""
+    existing = [p for p in paths if os.path.exists(p)]
+    return max(existing, key=os.path.getmtime) if existing else None
+
+
+def _search(root: Path, recursive: bool = False) -> tuple[str, dict] | None:
+    """Find the newest weights file under `root`, with the `load_weights` kwargs to use for it.
+
+    A file named like a full trainer checkpoint gets `by_name` and `skip_mismatch`.
+    """
+    candidates: list[str] = []
+    for pattern in _WEIGHT_PATTERNS:
+        pattern_path = str(root / "**" / pattern) if recursive else str(root / pattern)
+        candidates += glob.glob(pattern_path, recursive=recursive)
+    hit = _newest(candidates)
+    if hit is None:
         return None
-    paths = [p for p in paths if os.path.exists(p)]
-    if not paths:
-        return None
-    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return paths[0]
+    name = os.path.basename(hit)
+    if "full" in name and "encoder" not in name:
+        return hit, {"by_name": True, "skip_mismatch": True}
+    return hit, {}
 
 
 def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
-    """
-    Resolve `spec` to an encoder checkpoint path plus `load_weights` kwargs.
+    """Resolve `spec` to a weights file and the kwargs to pass to `load_weights`.
 
-    Tries, in order: wildcard expansion (newest match); a direct file; known
-    filenames inside a directory; the same search under the parent
-    directory; then a recursive sweep under checkpoints_tf. If the resolved
-    file looks like a full trainer checkpoint rather than encoder-only,
-    returns `{"by_name": True, "skip_mismatch": True}` so only the matching
-    encoder variables load.
+    Tried in order: a glob (newest match), an existing file, the weights files in a directory, the weights
+    files next to `spec`, then any weights file under checkpoints_tf/.
 
     Raises:
-        FileNotFoundError: If no plausible weights file is found.
+        FileNotFoundError: If nothing matches.
     """
     p = Path(spec)
 
-    if any(ch in spec for ch in ["*", "?", "["]):
+    if any(ch in spec for ch in "*?["):
         hit = _newest(glob.glob(spec))
         if hit:
             return hit, {}
@@ -109,95 +97,50 @@ def _resolve_encoder_ckpt(spec: str) -> tuple[str, dict]:
         return str(p), {}
 
     if p.is_dir():
-        candidates = []
-        candidates += glob.glob(str(p / "vicreg_encoder.weights.h5"))
-        candidates += glob.glob(str(p / "*encoder*.weights.h5"))
-        candidates += glob.glob(str(p / "vicreg_full.weights.h5"))
-        candidates += glob.glob(str(p / "*.weights.h5"))
-        hit = _newest(candidates)
-        if hit:
-            if "full" in os.path.basename(hit) and "encoder" not in os.path.basename(hit):
-                return hit, {"by_name": True, "skip_mismatch": True}
-            return hit, {}
+        found = _search(p)
+        if found:
+            return found
 
-    parent = p.parent
-    if parent.exists():
-        candidates = []
-        candidates += glob.glob(str(parent / "vicreg_encoder.weights.h5"))
-        candidates += glob.glob(str(parent / "*encoder*.weights.h5"))
-        candidates += glob.glob(str(parent / "vicreg_full.weights.h5"))
-        candidates += glob.glob(str(parent / "*.weights.h5"))
-        hit = _newest(candidates)
-        if hit:
-            if "full" in os.path.basename(hit) and "encoder" not in os.path.basename(hit):
-                return hit, {"by_name": True, "skip_mismatch": True}
-            return hit, {}
+    if p.parent.exists():
+        found = _search(p.parent)
+        if found:
+            return found
 
     root = _REPO / "checkpoints_tf"
     if root.exists():
-        candidates = []
-        candidates += glob.glob(str(root / "**" / "vicreg_encoder.weights.h5"), recursive=True)
-        candidates += glob.glob(str(root / "**" / "*encoder*.weights.h5"), recursive=True)
-        candidates += glob.glob(str(root / "**" / "vicreg_full.weights.h5"), recursive=True)
-        candidates += glob.glob(str(root / "**" / "*.weights.h5"), recursive=True)
-        hit = _newest(candidates)
-        if hit:
-            if "full" in os.path.basename(hit) and "encoder" not in os.path.basename(hit):
-                return hit, {"by_name": True, "skip_mismatch": True}
-            return hit, {}
+        found = _search(root, recursive=True)
+        if found:
+            return found
 
     raise FileNotFoundError(
         f"Could not resolve encoder checkpoint from spec: {spec}\n"
-        f"Tried direct path, directory search, parent search, and checkpoints_tf fallback."
+        "Tried the path itself, its directory, its parent directory and checkpoints_tf/."
     )
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--encoder-ckpt", type=str, required=True)
+    p = argparse.ArgumentParser(description="Linear evaluation of a frozen encoder.")
+    p.add_argument("--encoder-ckpt", type=str, required=True, help="Encoder weights file, directory or glob.")
     p.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10")
-    p.add_argument("--image-size", type=int, default=32)
+    p.add_argument("--image-size", type=int, default=32, help="Input size after resizing.")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=40, help="Epochs to train the linear layer.")
     p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--l2", type=float, default=0.0)
-    p.add_argument("--feat-dim", type=int, default=2048)
-    p.add_argument("--out-csv", type=str, required=True)
-    p.add_argument("--method-name", type=str, default="VICReg")
-    p.add_argument("--opt", choices=["sgd", "adam", "adamw"], default="sgd")
+    p.add_argument("--l2", type=float, default=0.0,
+                   help="L2 penalty on the linear layer. With --opt adamw it is also the weight decay.")
+    p.add_argument("--feat-dim", type=int, default=2048, help="Encoder feature width (must match training).")
+    p.add_argument("--out-csv", type=str, required=True, help="CSV to append a result row to.")
+    p.add_argument("--method-name", type=str, default="VICReg", help="Label written to the CSV.")
+    p.add_argument("--opt", choices=["sgd", "adam", "adamw"], default="sgd", help="Optimizer for the linear layer.")
     return p.parse_args()
 
 
 def _make_optimizer(args):
-    """
-    Build the head optimizer from `args.opt`.
-
-    "adamw" prefers native `keras.optimizers.AdamW`, falling back to
-    TensorFlow Addons if unavailable, and reuses `args.l2` as its
-    `weight_decay`. Note the linear head's L2 regularizer stays active
-    regardless of optimizer, so AdamW runs get both L2 and decoupled weight
-    decay unless `--l2 0` is passed.
-
-    Raises:
-        RuntimeError: If "adamw" was requested but neither implementation is available.
-    """
     if args.opt == "sgd":
         return keras.optimizers.SGD(learning_rate=args.lr, momentum=0.9, nesterov=True)
     if args.opt == "adam":
         return keras.optimizers.Adam(learning_rate=args.lr)
-    # adamw
-    try:
-        return keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.l2)
-    except Exception:
-        try:
-            import tensorflow_addons as tfa  # type: ignore
-            return tfa.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.l2)
-        except Exception as e:
-            raise RuntimeError(
-                "AdamW requested but neither keras.optimizers.AdamW nor "
-                "tensorflow_addons.optimizers.AdamW is available. "
-                "Use --opt adam or install TensorFlow Addons."
-            ) from e
+    return keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.l2)
 
 
 def main():
@@ -206,7 +149,7 @@ def main():
 
     (xtr, ytr), (xte, yte), num_classes = _load_cifar(args.dataset)
     ds_train = _make_ds(xtr, ytr, args.image_size, args.batch_size, shuffle=True)
-    ds_test  = _make_ds(xte, yte, args.image_size, args.batch_size, shuffle=False)
+    ds_test = _make_ds(xte, yte, args.image_size, args.batch_size, shuffle=False)
 
     enc = build_encoder(args.image_size, feat_dim=args.feat_dim)
 
@@ -215,11 +158,7 @@ def main():
     try:
         enc.load_weights(ckpt_path, **load_kw)
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to load weights from {ckpt_path} with kwargs {load_kw}. "
-            f"If this was a full trainer checkpoint, by_name+skip_mismatch is tried automatically. "
-            f"Original error: {e}"
-        ) from e
+        raise RuntimeError(f"Failed to load weights from {ckpt_path} with kwargs {load_kw}: {e}") from e
 
     enc.trainable = False
 
@@ -233,9 +172,8 @@ def main():
     )(feat)
     model = keras.Model(inp, logits, name="linear_eval")
 
-    opt = _make_optimizer(args)
     model.compile(
-        optimizer=opt,
+        optimizer=_make_optimizer(args),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
     )
@@ -245,7 +183,7 @@ def main():
     test_acc = float(test_metrics[1])
 
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
-    header = ["method","dataset","epochs","batch","image_size","feat_dim","lr","l2","opt","test_acc"]
+    header = ["method", "dataset", "epochs", "batch", "image_size", "feat_dim", "lr", "l2", "opt", "test_acc"]
     row = [
         args.method_name,
         args.dataset,

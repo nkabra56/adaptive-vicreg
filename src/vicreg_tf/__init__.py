@@ -1,42 +1,57 @@
-"""Re-exports the package's public API so scripts can `from vicreg_tf import ...` directly."""
+"""Public API of the package, so scripts can `from vicreg_tf import ...`."""
 
-from .model import build_encoder, build_projector, VICRegTrainer
-from .losses import (
-    invariance_loss,
-    variance_loss,
-    covariance_loss,
-    vicreg_total,
-    VICRegWeights,
-)
-from .schedules import AdaptiveTargets, AdaptiveReweighter, WeightSchedules, cosine_scaler, cosine_schedule
 from .augment import color_jitter, random_augment, two_view_map
-from .data import (
-    build_dataset,
-    build_cifar10,
-    build_cifar100,
-    steps_for_dataset,
-)
+from .callbacks import CosineScheduleCallback, LossExplosionGuard, VicRegMetricsLogger, WarmupLR
+from .data import build_cifar10, build_cifar100, build_dataset, steps_for_dataset, take_probe_batch
+from .losses import VICRegWeights, covariance_loss, invariance_loss, variance_loss, vicreg_total
+from .model import VICRegTrainer, build_encoder, build_projector
+from .schedules import AdaptiveReweighter, AdaptiveTargets, WeightSchedules, cosine_scaler
 from .utils import (
+    add_device_arg,
+    enable_memory_growth,
+    force_build_for_saving,
+    gpu_probe_ok,
+    preparse_device,
+    print_devices,
+    safe_load_trainer_weights,
+    select_device,
     set_global_seed,
     set_mixed_precision,
-    print_devices,
-    enable_memory_growth,
-    gpu_probe_ok,
-    force_build_for_saving,
-    safe_load_trainer_weights,
 )
 
 __all__ = [
-    # models
-    "build_encoder", "build_projector", "VICRegTrainer",
-    # losses
-    "invariance_loss", "variance_loss", "covariance_loss", "vicreg_total", "VICRegWeights",
-    # schedules
-    "AdaptiveTargets", "AdaptiveReweighter", "WeightSchedules", "cosine_schedule", "cosine_scaler",
-    # data & augment
-    "color_jitter", "random_augment", "two_view_map",
-    "build_dataset", "build_cifar10", "build_cifar100", "steps_for_dataset",
-    # utils
-    "set_global_seed", "set_mixed_precision", "print_devices", "enable_memory_growth", "gpu_probe_ok",
-    "force_build_for_saving", "safe_load_trainer_weights",
+    "AdaptiveReweighter",
+    "AdaptiveTargets",
+    "CosineScheduleCallback",
+    "LossExplosionGuard",
+    "VICRegTrainer",
+    "VICRegWeights",
+    "VicRegMetricsLogger",
+    "WarmupLR",
+    "WeightSchedules",
+    "add_device_arg",
+    "build_cifar10",
+    "build_cifar100",
+    "build_dataset",
+    "build_encoder",
+    "build_projector",
+    "color_jitter",
+    "cosine_scaler",
+    "covariance_loss",
+    "enable_memory_growth",
+    "force_build_for_saving",
+    "gpu_probe_ok",
+    "invariance_loss",
+    "preparse_device",
+    "print_devices",
+    "random_augment",
+    "safe_load_trainer_weights",
+    "select_device",
+    "set_global_seed",
+    "set_mixed_precision",
+    "steps_for_dataset",
+    "take_probe_batch",
+    "two_view_map",
+    "variance_loss",
+    "vicreg_total",
 ]

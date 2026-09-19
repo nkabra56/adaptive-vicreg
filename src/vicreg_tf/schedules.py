@@ -1,60 +1,45 @@
-"""
-Cosine LR/WD schedules, the optional gamma/nu target schedule, and the
-adaptive loss-weight reweighter.
+"""Cosine LR/WD schedules, the optional gamma/nu target schedule, and the adaptive loss-weight reweighter."""
 
-TensorFlow is an optional import here so these utilities can be unit tested
-and reasoned about independently of a TF installation where possible; the
-tensor code paths require it.
-"""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Union, Optional
+from typing import Optional, Union
 
-try:
-    import tensorflow as tf
-    _TF = True
-except Exception:
-    tf = None  # type: ignore
-    _TF = False
+import tensorflow as tf
 
+from .losses import VICRegWeights
 
-def _to_float(x: Union[float, int, "tf.Tensor"]) -> float:
-    """Convert to a Python float. Only safe to call in eager mode, never on a graph tensor."""
-    if _TF and tf.is_tensor(x):
-        return float(x.numpy())
-    return float(x)
+Scalar = Union[float, tf.Tensor]
 
 
 class CosineWarmup:
-    """
-    Linear warmup over `warmup_frac`, then cosine decay to `min_scale` by frac=1.
+    """Linear warmup over `warmup_frac`, then cosine decay to `min_scale` at frac=1.
 
-    Accepts a Python float or a TF tensor for `frac` and returns the same type,
-    so it is safe to call from both eager code and inside `tf.function`.
+    Takes a float or a tensor and returns the same kind, so it works in eager code and inside `tf.function`.
     """
+
     def __init__(self, warmup_frac: float = 0.0, min_scale: float = 0.0):
         self.warmup_frac = float(max(0.0, min(1.0, warmup_frac)))
-        self.min_scale   = float(max(0.0, min(1.0, min_scale)))
+        self.min_scale = float(max(0.0, min(1.0, min_scale)))
 
-    def __call__(self, frac: Union[float, "tf.Tensor"]) -> Union[float, "tf.Tensor"]:
-        if _TF and tf.is_tensor(frac):
+    def __call__(self, frac: Scalar) -> Scalar:
+        if tf.is_tensor(frac):
             f = tf.clip_by_value(tf.cast(frac, tf.float32), 0.0, 1.0)
             wf = tf.cast(self.warmup_frac, tf.float32)
 
             def _cosine_part():
                 t = (f - wf) / tf.maximum(1e-9, 1.0 - wf)
-                return 0.5 * (1.0 + tf.cos(tf.constant(3.141592653589793, tf.float32) * t))
+                return 0.5 * (1.0 + tf.cos(tf.constant(math.pi, tf.float32) * t))
 
             warm = tf.where(f < wf, f / tf.maximum(wf, 1e-9), _cosine_part())
             return tf.maximum(tf.cast(self.min_scale, tf.float32), warm)
 
-        f = float(max(0.0, min(1.0, _to_float(frac))))
+        f = float(max(0.0, min(1.0, float(frac))))
         if f < self.warmup_frac and self.warmup_frac > 0.0:
             warm = f / self.warmup_frac
         else:
             t = (f - self.warmup_frac) / max(1e-9, 1.0 - self.warmup_frac)
-            import math
             warm = 0.5 * (1.0 + math.cos(math.pi * t))
         return max(self.min_scale, warm)
 
@@ -62,42 +47,33 @@ class CosineWarmup:
 def cosine_scaler(
     step: Optional[int] = None,
     total_steps: Optional[int] = None,
-    t: Optional[Union[float, "tf.Tensor"]] = None,
+    t: Optional[Scalar] = None,
     warmup_frac: float = 0.0,
     min_scale: float = 0.0,
-):
-    """
-    Scalar in [min_scale, 1] following linear warmup then cosine decay.
+) -> Scalar:
+    """Warmup-then-cosine scale in [min_scale, 1].
 
-    Pass `t` directly as a fraction in [0, 1], or `step`/`total_steps` to have
-    the fraction computed for you.
+    Pass the progress fraction `t` directly, or `step` and `total_steps` to have it computed.
     """
     sched = CosineWarmup(warmup_frac=warmup_frac, min_scale=min_scale)
     if t is not None:
         return sched(t)
     if step is None or total_steps is None:
         raise ValueError("Provide either t or (step, total_steps).")
-    if _TF and tf.is_tensor(step):
+    if tf.is_tensor(step):
         frac = tf.cast(step, tf.float32) / tf.cast(total_steps, tf.float32)
     else:
         frac = float(step) / float(total_steps)
     return sched(frac)
 
 
-def cosine_schedule(*, step=None, total_steps=None, t=None, warmup_frac: float = 0.0, min_scale: float = 0.0):
-    """Alias for `cosine_scaler`, kept for backward compatibility."""
-    return cosine_scaler(step=step, total_steps=total_steps, t=t, warmup_frac=warmup_frac, min_scale=min_scale)
-
-
 @dataclass
 class WeightSchedules:
-    """
-    Holds LR/WD schedules and the (currently constant) VICReg component weights.
+    """LR/WD cosine schedules plus the constant loss weights `w0`.
 
-    `weights()` always returns `w0`; loss-term weighting is instead handled by
-    `AdaptiveReweighter` when `adaptive_weights=True` on the trainer.
+    `weights()` always returns `w0`. Loss reweighting is done by `AdaptiveReweighter`.
     """
-    w0: "VICRegWeights"
+    w0: VICRegWeights
     use: bool
     base_lr: float
     base_wd: float
@@ -106,100 +82,92 @@ class WeightSchedules:
     min_scale: float = 0.0
 
     def __post_init__(self):
-        from .losses import VICRegWeights
         if not isinstance(self.w0, VICRegWeights):
-            self.w0 = VICRegWeights(**self.w0)  # type: ignore[arg-type]
-        print(f"[schedules] total_steps={self.total_steps} base_lr={self.base_lr} base_wd={self.base_wd}")
+            self.w0 = VICRegWeights(**self.w0)
 
-    def lr_at(self, step: Union[int, "tf.Tensor"]) -> Union[float, "tf.Tensor"]:
+    def _scaled(self, base: float, step: Union[int, tf.Tensor]) -> Scalar:
         if not self.use:
-            return self.base_lr
-        scale = cosine_scaler(step=step, total_steps=self.total_steps, warmup_frac=self.warmup_frac, min_scale=self.min_scale)
-        return (tf.cast(self.base_lr, tf.float32) * scale) if _TF and tf.is_tensor(scale) else self.base_lr * float(scale)
+            return base
+        scale = cosine_scaler(
+            step=step, total_steps=self.total_steps, warmup_frac=self.warmup_frac, min_scale=self.min_scale
+        )
+        return tf.cast(base, tf.float32) * scale if tf.is_tensor(scale) else base * float(scale)
 
-    def wd_at(self, step: Union[int, "tf.Tensor"]) -> Union[float, "tf.Tensor"]:
-        if not self.use:
-            return self.base_wd
-        scale = cosine_scaler(step=step, total_steps=self.total_steps, warmup_frac=self.warmup_frac, min_scale=self.min_scale)
-        return (tf.cast(self.base_wd, tf.float32) * scale) if _TF and tf.is_tensor(scale) else self.base_wd * float(scale)
+    def lr_at(self, step: Union[int, tf.Tensor]) -> Scalar:
+        return self._scaled(self.base_lr, step)
 
-    def weights(self, frac: Union[float, "tf.Tensor"]) -> dict:
-        """Return the constant VICReg component weights (sim/var/cov)."""
+    def wd_at(self, step: Union[int, tf.Tensor]) -> Scalar:
+        return self._scaled(self.base_wd, step)
+
+    def weights(self, frac: Scalar) -> dict:
         return {"sim": self.w0.sim, "var": self.w0.var, "cov": self.w0.cov}
 
 
 @dataclass
 class AdaptiveTargets:
-    """
-    Optional time-varying variance floor (gamma) and redundancy target (nu).
+    """Optional time-varying variance floor (gamma) and correlation target (nu).
 
-    This is independent of `AdaptiveReweighter`: it changes what the loss
-    targets, not how the three components are weighted against each other.
-    When `use=False`, `gamma()`/`nu()` return the baseline constants
-    (1.0 and 0.0), matching plain VICReg exactly.
+    This is independent of `AdaptiveReweighter`: it changes what the loss aims for, not how the terms
+    are weighted. With `use=False` it returns the plain VICReg constants gamma=1.0 and nu=0.0.
+
+    By default gamma stays at 1.0 and nu decays from 1.0 to 0.0 along a cosine.
     """
     use: bool
     gamma_sched: CosineWarmup = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0, min_scale=1.0))
-    nu_sched: CosineWarmup    = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0, min_scale=0.0))
-    start: float = 1.0  # starting gamma, for interpolating [start, end]
-    end:   float = 1.0  # ending gamma; default 1.0 keeps gamma constant
+    nu_sched: CosineWarmup = field(default_factory=lambda: CosineWarmup(warmup_frac=0.0, min_scale=0.0))
+    start: float = 1.0
+    end: float = 1.0
 
-    def gamma(self, frac: Union[float, "tf.Tensor"]):
+    def gamma(self, frac: Scalar) -> Scalar:
+        """Interpolate from `start` to `end` following `gamma_sched`."""
         if not self.use:
-            return tf.constant(1.0, tf.float32) if _TF else 1.0
+            return tf.constant(1.0, tf.float32)
         base = self.gamma_sched(frac)
-        if _TF and tf.is_tensor(base):
-            return tf.cast(self.start, tf.float32) + (tf.cast(self.end, tf.float32) - tf.cast(self.start, tf.float32)) * base
+        if tf.is_tensor(base):
+            start, end = tf.cast(self.start, tf.float32), tf.cast(self.end, tf.float32)
+            return start + (end - start) * base
         return self.start + (self.end - self.start) * float(base)
 
-    def nu(self, frac: Union[float, "tf.Tensor"]):
+    def nu(self, frac: Scalar) -> Scalar:
         if not self.use:
-            return tf.constant(0.0, tf.float32) if _TF else 0.0
+            return tf.constant(0.0, tf.float32)
         base = self.nu_sched(frac)
-        if _TF and tf.is_tensor(base):
+        if tf.is_tensor(base):
+            # Numerically equal to `base`, but simplifying it moves a reported float32 loss by 1 ulp.
+            # Kept as written so seeded runs stay bit-identical to earlier ones.
             return tf.cast(0.0, tf.float32) + tf.cast(1.0, tf.float32) * base
         return float(base)
 
 
 class AdaptiveReweighter:
+    """Per-step sim/var/cov loss weights for Adaptive VICReg.
+
+    Two signals are combined:
+
+    * Loss-magnitude balancing. A bias-corrected EMA of each raw loss term gives a multiplier of
+      mean(EMA) / EMA(term), clipped to `mag_clip`, so no term dominates only because of its scale.
+    * Embedding-health boost (var and cov only). EMAs of the probe embedding's mean per-dimension std
+      and mean squared off-diagonal correlation raise the var weight when std falls below `std_target`
+      and the cov weight when correlation rises above `corr_target`, by at most `boost_clip`.
+
+    EMA inputs are passed through `tf.stop_gradient`, so gradients flow through weight * loss but not
+    through the weight computation.
+
+    Call once per step inside the GradientTape with the raw loss parts and a probe embedding (for
+    example `z1`). Returns {"sim": ..., "var": ..., "cov": ...}.
     """
-    Per-step VICReg component weights (sim/var/cov). This is the mechanism the
-    README calls "Adaptive VICReg". It combines two signals:
 
-    Loss-magnitude balancing: tracks a bias-corrected EMA of each raw loss
-    term (l_align/l_var/l_cov). A term whose EMA is large relative to the
-    other two gets down-weighted, and vice versa, so no term dominates the
-    gradient purely because it lives on a bigger numeric scale.
-
-    Embedding-health reactive boost (var/cov only): tracks EMAs of the probe
-    embedding's average per-dimension std and average squared off-diagonal
-    correlation. If std drifts below `std_target` (collapse risk) or
-    correlation drifts above `corr_target` (redundancy risk), the var/cov
-    weight is boosted multiplicatively until the statistic recovers.
-
-    Both EMAs are updated from `tf.stop_gradient`-ed values, so the weights
-    behave as step-varying scalars rather than a path gradients flow through:
-    the encoder is trained by the (weight * raw_loss) product, not by how the
-    weight itself was computed.
-
-    Call once per step, inside the GradientTape, with the raw (unweighted)
-    loss parts and a probe embedding (e.g. z1), to get the weight dict
-    {"sim": ..., "var": ..., "cov": ...}.
-    """
     def __init__(
         self,
-        w0: "VICRegWeights",
+        w0: VICRegWeights,
         decay: float = 0.98,
-        mag_clip: tuple = (0.2, 5.0),
+        mag_clip: tuple[float, float] = (0.2, 5.0),
         std_target: float = 1.0,
         corr_target: float = 0.0,
         k_std: float = 2.0,
         k_cov: float = 2.0,
-        boost_clip: tuple = (1.0, 4.0),
+        boost_clip: tuple[float, float] = (1.0, 4.0),
     ):
-        if not _TF:
-            raise RuntimeError("AdaptiveReweighter requires TensorFlow.")
-        from .losses import VICRegWeights
         if not isinstance(w0, VICRegWeights):
             w0 = VICRegWeights(**w0)
         self.w0 = w0
@@ -219,15 +187,15 @@ class AdaptiveReweighter:
         self.step_count = tf.Variable(0, trainable=False, dtype=tf.int64, name="reweighter_step")
 
     def _update_ema(self, var: tf.Variable, x: tf.Tensor) -> tf.Tensor:
+        """Update `var` and return its bias-corrected value."""
         decay = tf.cast(self.decay, tf.float32)
         var.assign(decay * var + (1.0 - decay) * tf.cast(x, tf.float32))
         t = tf.cast(self.step_count + 1, tf.float32)
         return var / (1.0 - tf.pow(decay, t))
 
-    def __call__(self, raw_losses: dict, z_probe: "tf.Tensor") -> dict:
+    def __call__(self, raw_losses: dict, z_probe: tf.Tensor) -> dict:
         eps = tf.constant(1e-8, tf.float32)
 
-        # Loss-magnitude balancing.
         ema_align = self._update_ema(self.ema_align, tf.stop_gradient(raw_losses["l_align"]))
         ema_var = self._update_ema(self.ema_var, tf.stop_gradient(raw_losses["l_var"]))
         ema_cov = self._update_ema(self.ema_cov, tf.stop_gradient(raw_losses["l_cov"]))
@@ -237,7 +205,6 @@ class AdaptiveReweighter:
         mag_var = tf.clip_by_value(mean_ema / (ema_var + eps), self.mag_lo, self.mag_hi)
         mag_cov = tf.clip_by_value(mean_ema / (ema_cov + eps), self.mag_lo, self.mag_hi)
 
-        # Embedding-health reactive boost.
         z = tf.convert_to_tensor(z_probe)
         if z.shape.rank is not None and z.shape.rank > 2:
             z = tf.reshape(z, [tf.shape(z)[0], -1])

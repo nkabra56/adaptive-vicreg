@@ -1,26 +1,20 @@
-"""
-Shared helpers for the training and evaluation scripts: seeding, mixed
-precision, GPU visibility/memory growth, a GPU kernel probe, forcing variable
-creation on subclassed models, and a resilient checkpoint loader.
-"""
+"""Seeding, precision, device selection and checkpoint helpers shared by the scripts."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import random
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
+DEVICE_CHOICES = ("auto", "gpu", "cpu")
+
 
 def set_global_seed(seed: int) -> None:
-    """
-    Seed Python's `random`, NumPy, and TF so a run is reproducible.
-
-    `tf.data` shuffle ops with `reshuffle_each_iteration=True` (used in
-    `data.py`) draw from the global TF seed, so this needs to run before the
-    dataset/model are built.
-    """
+    """Seed Python, NumPy and TF. Call before building the dataset: `tf.data` shuffling uses the global TF seed."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -29,35 +23,17 @@ def set_global_seed(seed: int) -> None:
 
 
 def set_mixed_precision(enable: bool) -> None:
-    """
-    Set the global Keras precision policy: "mixed_bfloat16" if `enable`,
-    else "float32". Defaults to float32 for reproducibility; mixed precision
-    can introduce numerical differences on some models or environments.
-    """
-    try:
-        from tensorflow.keras import mixed_precision as mp
-    except Exception:
-        mp = None
-
-    if mp is None:
-        print("[utils] Mixed precision is not available in this TF build.")
-        return
-
-    mp.set_global_policy("mixed_bfloat16" if enable else "float32")
-    print(f"[utils] Global policy set to: {mp.global_policy()}")
+    """Set the global precision policy to mixed_bfloat16 or float32."""
+    keras.mixed_precision.set_global_policy("mixed_bfloat16" if enable else "float32")
+    print(f"[utils] Global policy set to: {keras.mixed_precision.global_policy()}")
 
 
 def print_devices() -> None:
-    """Print visible physical GPUs, for a quick sanity check in a new environment."""
     print("[utils] Visible GPUs:", tf.config.list_physical_devices("GPU"))
 
 
 def enable_memory_growth() -> None:
-    """
-    Enable per-GPU memory growth so TF allocates VRAM on demand instead of
-    grabbing most of it at startup. Failures (driver quirks, permissions) are
-    logged as warnings, not raised.
-    """
+    """Let TF allocate GPU memory on demand. Failures are logged, not raised."""
     try:
         for gpu in tf.config.list_physical_devices("GPU"):
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -66,11 +42,7 @@ def enable_memory_growth() -> None:
 
 
 def gpu_probe_ok() -> bool:
-    """
-    Run a tiny Conv2D on /GPU:0 to confirm CUDA/cuDNN actually work, not just
-    that TF can see a GPU device. Returns False (and logs the error) on any
-    failure.
-    """
+    """Run a small Conv2D on /GPU:0 to check that CUDA and cuDNN work, not just that a GPU is visible."""
     try:
         with tf.device("/GPU:0"):
             x = tf.random.uniform([1, 16, 16, 3])
@@ -84,15 +56,51 @@ def gpu_probe_ok() -> bool:
         return False
 
 
+def add_device_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="'auto' probes the GPU and falls back to CPU; 'gpu' and 'cpu' force a device.",
+    )
+
+
+def preparse_device() -> str:
+    """Read --device from sys.argv and hide the GPUs for `cpu`.
+
+    Scripts call this at import time, before anything initializes CUDA.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    add_device_arg(parser)
+    args, _ = parser.parse_known_args()
+    if args.device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    return args.device
+
+
+def select_device(flag: str, tag: str) -> str:
+    """Turn a --device value into a TF device string, probing the GPU when `flag` is 'auto'."""
+    if flag == "cpu":
+        print(f"[{tag}] Forcing CPU mode per flag.")
+        return "/CPU:0"
+
+    print_devices()
+    enable_memory_growth()
+
+    if flag == "gpu":
+        print(f"[{tag}] Requested GPU; will not fall back.")
+        return "/GPU:0"
+
+    if gpu_probe_ok():
+        return "/GPU:0"
+    print(f"[{tag}] GPU probe failed; falling back to CPU.")
+    return "/CPU:0"
+
+
 def force_build_for_saving(
     trainer: keras.Model, encoder: keras.Model, projector: keras.Model, image_size: int
 ) -> None:
-    """
-    Run the encoder and projector on dummy inputs to materialize their
-    variables, then mark `trainer.built = True`. Subclassed Keras models
-    don't create variables until first called, so this is needed before
-    `save_weights` can be used right after construction.
-    """
+    """Create the encoder and projector variables with dummy inputs so `save_weights` works right after construction."""
     _ = encoder(tf.zeros([1, image_size, image_size, 3]), training=False)
     _ = projector(tf.zeros([1, encoder.output_shape[-1]]), training=False)
 
@@ -101,11 +109,7 @@ def force_build_for_saving(
 
 
 def safe_load_trainer_weights(trainer: keras.Model, ckpt_path: str) -> None:
-    """
-    Load weights into `trainer`, trying an exact structural match first and
-    falling back to `by_name=True, skip_mismatch=True` if that fails (e.g.
-    after a small architecture change), so compatible variables still load.
-    """
+    """Load `ckpt_path` into `trainer`, falling back to `by_name` with `skip_mismatch` if the structure differs."""
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
