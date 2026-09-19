@@ -39,9 +39,13 @@ class CosineScheduleCallback(keras.callbacks.Callback):
     Args:
         optimizer: Optimizer to update.
         total_steps: steps_per_epoch * epochs.
-        base_lr: Initial learning rate.
-        base_wd: Initial weight decay, or None to leave weight decay alone.
+        base_lr: Peak learning rate.
+        base_wd: Peak weight decay, or None to leave weight decay alone.
         verbose: If nonzero, print the current lr (and wd) at the start of each epoch.
+        warmup_frac: Fraction of `total_steps` spent ramping linearly up from zero before the cosine decay.
+        start_step: Step to begin at, so a resumed run continues the schedule where it stopped.
+        ramp_steps: For the first this many steps of this run, scale the scheduled value from 10% up to 100%.
+            This is the post-resume warmup, and it scales the schedule instead of fighting it.
     """
 
     def __init__(
@@ -51,6 +55,9 @@ class CosineScheduleCallback(keras.callbacks.Callback):
         base_lr: float,
         base_wd: Optional[float],
         verbose: int = 1,
+        warmup_frac: float = 0.0,
+        start_step: int = 0,
+        ramp_steps: int = 0,
     ) -> None:
         super().__init__()
         self.opt = optimizer
@@ -58,7 +65,10 @@ class CosineScheduleCallback(keras.callbacks.Callback):
         self.base_lr = float(base_lr)
         self.base_wd = None if base_wd is None else float(base_wd)
         self.verbose = int(verbose)
-        self._step = 0
+        self.warmup_frac = float(warmup_frac)
+        self._start = int(start_step)
+        self._step = self._start
+        self.ramp_steps = int(max(0, ramp_steps))
 
         if self.total_steps <= 0:
             raise ValueError("total_steps must be positive")
@@ -70,7 +80,10 @@ class CosineScheduleCallback(keras.callbacks.Callback):
 
     def on_train_batch_begin(self, batch: int, logs=None):
         step = min(self._step, self.total_steps)
-        scale = float(cosine_scaler(step=step, total_steps=self.total_steps))
+        scale = float(cosine_scaler(step=step, total_steps=self.total_steps, warmup_frac=self.warmup_frac))
+        elapsed = self._step - self._start
+        if elapsed < self.ramp_steps:
+            scale *= 0.1 + 0.9 * (elapsed + 1) / float(self.ramp_steps)
 
         _set_hparam(self.opt, "learning_rate", self.base_lr * scale)
         if self._scales_weight_decay():
@@ -89,19 +102,26 @@ class CosineScheduleCallback(keras.callbacks.Callback):
 
 
 class WarmupLR(keras.callbacks.Callback):
-    """Ramp the learning rate from 10% to 100% of `base_lr` over the first `warmup_steps` steps after a resume."""
+    """Ramp the learning rate from 10% to 100% of `base_lr` over the first `warmup_steps` steps of training.
+
+    Steps are counted from where this run starts, so a resumed run warms up too.
+    """
 
     def __init__(self, base_lr: float, warmup_steps: int):
         super().__init__()
         self.base_lr = float(base_lr)
         self.warmup_steps = int(max(0, warmup_steps))
+        self._first_step = None
 
     def on_train_batch_begin(self, batch, logs=None):
         if self.warmup_steps <= 0:
             return
         step = int(self.model.curr_step)
-        if step < self.warmup_steps:
-            scale = 0.1 + 0.9 * (step + 1) / float(self.warmup_steps)
+        if self._first_step is None:
+            self._first_step = step
+        elapsed = step - self._first_step
+        if elapsed < self.warmup_steps:
+            scale = 0.1 + 0.9 * (elapsed + 1) / float(self.warmup_steps)
             _set_hparam(self.model.optimizer, "learning_rate", self.base_lr * scale)
 
 

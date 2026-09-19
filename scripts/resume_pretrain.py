@@ -17,6 +17,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 from vicreg_tf import (
+    CosineScheduleCallback,
     LossExplosionGuard,
     VicRegMetricsLogger,
     VICRegTrainer,
@@ -53,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume-lr", type=float, default=None,
                    help="Learning rate to use after resuming. Defaults to --lr.")
     p.add_argument("--wd", type=float, default=1e-6, help="Weight decay.")
+    p.add_argument("--w-sim", type=float, default=25.0, help="Base weight of the invariance term.")
+    p.add_argument("--w-var", type=float, default=25.0, help="Base weight of the variance term.")
+    p.add_argument("--w-cov", type=float, default=1.0,
+                   help="Base weight of the covariance term. The paper sums squared covariances and divides "
+                        "by the embedding width, so its weight of 1 matches about --proj-out minus 1 here.")
     p.add_argument("--adaptive", action="store_true",
                    help="Adaptive loss weighting. Must match the run being resumed.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -61,12 +67,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--var-boost-k", type=float, default=2.0, help="Variance-weight boost strength (--adaptive only).")
     p.add_argument("--cov-boost-k", type=float, default=2.0, help="Covariance-weight boost strength (--adaptive only).")
     p.add_argument("--use-schedules", action="store_true",
-                   help="Accepted for compatibility with train_vicreg.py. It has no effect when resuming.")
+                   help="Apply the cosine LR and weight-decay schedule, continuing from --initial-epoch. "
+                        "The base LR is --resume-lr if given, else --lr.")
     p.add_argument("--initial-epoch", type=int, default=0, help="Epoch the original run stopped at.")
     p.add_argument("--epochs", type=int, default=100, help="Epoch to train up to.")
     p.add_argument("--model-dir", type=str, default="checkpoints_tf/resumed_run", help="Output directory.")
     p.add_argument("--clipnorm", type=float, default=1.0, help="Gradient clip norm. Use 0 to disable.")
-    p.add_argument("--warmup-steps", type=int, default=0, help="Linear LR warmup steps after resuming.")
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="Ramp the LR up linearly over this many steps after resuming.")
     p.add_argument("--loss-guard", type=float, default=1e12,
                    help="Cut the learning rate 10x when a batch loss exceeds this value.")
     p.add_argument("--metrics-probe-batch", type=int, default=256, help="Size of the fixed probe batch for stats.")
@@ -98,10 +106,6 @@ def main() -> None:
     run_dir = args.model_dir
     os.makedirs(run_dir, exist_ok=True)
 
-    if args.use_schedules:
-        print("[resume] WARNING: --use-schedules has no effect when resuming. "
-              "The learning rate stays constant after warmup.")
-
     with tf.device(device_str):
         encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
         projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
@@ -111,7 +115,7 @@ def main() -> None:
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
-            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.0),
+            w0=VICRegWeights(sim=args.w_sim, var=args.w_var, cov=args.w_cov),
             adaptive_weights=args.adaptive,
             adaptive_targets=args.adaptive_targets,
             use_schedules=args.use_schedules,
@@ -144,8 +148,22 @@ def main() -> None:
 
         sample_images = take_probe_batch(ds, size=args.metrics_probe_batch)
 
-        callbacks = [
-            WarmupLR(base_lr=base_lr, warmup_steps=args.warmup_steps),
+        callbacks = []
+        if args.use_schedules:
+            # Continue the cosine schedule from --initial-epoch. The post-resume warmup scales the schedule.
+            callbacks.append(
+                CosineScheduleCallback(
+                    optimizer=opt,
+                    total_steps=steps_per_epoch * args.epochs,
+                    base_lr=base_lr,
+                    base_wd=args.wd,
+                    start_step=args.initial_epoch * steps_per_epoch,
+                    ramp_steps=args.warmup_steps,
+                )
+            )
+        else:
+            callbacks.append(WarmupLR(base_lr=base_lr, warmup_steps=args.warmup_steps))
+        callbacks += [
             LossExplosionGuard(threshold=float(args.loss_guard), factor=0.1),
             keras.callbacks.ModelCheckpoint(
                 filepath=ckpt_path, save_weights_only=True, monitor="loss", save_best_only=True, verbose=1

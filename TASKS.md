@@ -2,9 +2,8 @@
 
 ## Known issues
 
-- **Resuming.** `resume_pretrain.py --use-schedules` has no effect: no LR schedule is attached, so the rate stays constant after warmup. `--warmup-steps` is compared against the global step, which a resume sets to `initial_epoch * steps_per_epoch`, so warmup only happens when it is larger than that.
 - **Unstable baseline.** At batch size 256 the baseline recipe blows up around epoch 25 to 33 (see [EXPERIMENTS.md](EXPERIMENTS.md)). Things to try: a lower peak LR, a real warmup (`CosineWarmup` is built with `warmup_frac=0.0`), gradient clipping.
-- **Checkpointing.** `ModelCheckpoint` monitors the training loss, not a held-out metric, and keeps only the best-loss weights. Add an unconditional last-epoch checkpoint so both ends of a run can be compared.
+- **Checkpointing.** The best-loss checkpoint is chosen by training loss, not a held-out metric. The last epoch is saved too, so both ends of a run can be compared.
 - **Full checkpoints.** The eval scripts need the encoder-only weights file. On Keras 3 a full trainer checkpoint won't load into an encoder, and `by_name` isn't supported for `.weights.h5` files. `scripts/_extract_best_encoder.py` writes an encoder-only file from a run directory.
 
 ## Experiments

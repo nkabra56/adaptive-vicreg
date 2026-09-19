@@ -26,6 +26,25 @@ def test_device_defaults_to_auto(monkeypatch, script):
     assert module.parse_args().device == "auto"
 
 
+def test_train_flags_default_to_the_old_behavior(monkeypatch):
+    module = importlib.import_module("train_vicreg")
+    monkeypatch.setattr(sys, "argv", ["train_vicreg"])
+    args = module.parse_args()
+    assert (args.warmup_epochs, args.clipnorm, args.stop_epoch) == (0.0, 0.0, None)
+    assert (args.w_sim, args.w_var, args.w_cov) == (25.0, 25.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--warmup-epochs", "2"], ["--stop-epoch", "0"], ["--epochs", "10", "--stop-epoch", "11"]],
+)
+def test_train_rejects_inconsistent_flags(monkeypatch, extra):
+    module = importlib.import_module("train_vicreg")
+    monkeypatch.setattr(sys, "argv", ["train_vicreg", *extra])
+    with pytest.raises(SystemExit):
+        module.parse_args()
+
+
 def _touch(path, mtime):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"x")

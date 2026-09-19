@@ -4,10 +4,12 @@
 With neither flag this is baseline VICReg. The README has example commands.
 
 By default a run writes to `<model-dir>/<run-name>_<timestamp>/`:
-  vicreg_full.weights.h5     best-loss weights (encoder, projector, optimizer)
-  vicreg_encoder.weights.h5  encoder-only weights taken from that same checkpoint, used by the eval scripts
-  train_config.json          hyperparameters
-  metrics/history.jsonl      one JSON record per epoch, read by report_metrics.py
+  vicreg_full.weights.h5          best-loss weights (encoder, projector, optimizer)
+  vicreg_encoder.weights.h5       encoder-only weights taken from that same checkpoint, used by the eval scripts
+  vicreg_full_last.weights.h5     trainer weights after the most recent epoch
+  vicreg_encoder_last.weights.h5  encoder-only weights at the end of training
+  train_config.json               hyperparameters
+  metrics/history.jsonl           one JSON record per epoch, read by report_metrics.py
 """
 from __future__ import annotations
 
@@ -58,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--proj-layers", type=int, default=3, help="Projector depth (1, 2 or 3).")
     p.add_argument("--lr", type=float, default=0.01, help="Base learning rate.")
     p.add_argument("--wd", type=float, default=1e-6, help="Weight decay.")
+    p.add_argument("--w-sim", type=float, default=25.0, help="Base weight of the invariance term.")
+    p.add_argument("--w-var", type=float, default=25.0, help="Base weight of the variance term.")
+    p.add_argument("--w-cov", type=float, default=1.0,
+                   help="Base weight of the covariance term. The paper sums squared covariances and divides "
+                        "by the embedding width, so its weight of 1 matches about --proj-out minus 1 here.")
     p.add_argument("--adaptive", action="store_true",
                    help="Reweight the loss terms every step (Adaptive VICReg). Omit for constant weights.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -70,6 +77,13 @@ def parse_args() -> argparse.Namespace:
                    help="Boost strength for the covariance weight when off-diagonal correlation rises above "
                         "target (--adaptive only).")
     p.add_argument("--use-schedules", action="store_true", help="Apply cosine LR and weight-decay schedules per step.")
+    p.add_argument("--warmup-epochs", type=float, default=0.0,
+                   help="Ramp the LR up linearly over this many epochs before the cosine decay. "
+                        "Needs --use-schedules.")
+    p.add_argument("--clipnorm", type=float, default=0.0,
+                   help="Clip each gradient tensor to this norm. 0 turns clipping off.")
+    p.add_argument("--stop-epoch", type=int, default=None,
+                   help="Stop after this epoch but keep the LR schedule sized for --epochs. For screening runs.")
     p.add_argument("--model-dir", type=str, default="checkpoints_tf", help="Root output directory.")
     p.add_argument("--run-name", type=str, default=None, help="Run folder prefix. A timestamp is appended.")
     p.add_argument("--ckpt-out", type=str, default=None,
@@ -81,7 +95,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None,
                    help="Seed Python, NumPy and TF. Omit for a nondeterministic run.")
     add_device_arg(p)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.warmup_epochs and not args.use_schedules:
+        p.error("--warmup-epochs needs --use-schedules")
+    if args.stop_epoch is not None and not 1 <= args.stop_epoch <= args.epochs:
+        p.error("--stop-epoch must be between 1 and --epochs")
+    return args
 
 
 def main() -> None:
@@ -109,6 +128,8 @@ def main() -> None:
         os.makedirs(out_dir, exist_ok=True)
         full_ckpt = os.path.join(out_dir, "vicreg_full.weights.h5")
         enc_ckpt = os.path.join(out_dir, "vicreg_encoder.weights.h5")
+    last_full_ckpt = full_ckpt.replace(".weights.h5", "_last.weights.h5")
+    last_enc_ckpt = enc_ckpt.replace(".weights.h5", "_last.weights.h5")
 
     with open(os.path.join(out_dir, "train_config.json"), "w") as f:
         json.dump(
@@ -123,12 +144,18 @@ def main() -> None:
                 "proj_layers": args.proj_layers,
                 "lr": args.lr,
                 "wd": args.wd,
+                "w_sim": args.w_sim,
+                "w_var": args.w_var,
+                "w_cov": args.w_cov,
                 "adaptive": args.adaptive,
                 "adaptive_targets": args.adaptive_targets,
                 "ema_decay": args.ema_decay,
                 "var_boost_k": args.var_boost_k,
                 "cov_boost_k": args.cov_boost_k,
                 "use_schedules": args.use_schedules,
+                "warmup_epochs": args.warmup_epochs,
+                "clipnorm": args.clipnorm,
+                "stop_epoch": args.stop_epoch,
                 "seed": args.seed,
             },
             f,
@@ -141,12 +168,16 @@ def main() -> None:
     with tf.device(device_str):
         encoder = build_encoder(args.image_size, feat_dim=args.feat_dim)
         projector = build_projector(args.feat_dim, args.proj_out, args.proj_layers)
-        opt = keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.wd)
+        opt = keras.optimizers.AdamW(
+            learning_rate=args.lr,
+            weight_decay=args.wd,
+            clipnorm=args.clipnorm if args.clipnorm > 0 else None,
+        )
 
         trainer = VICRegTrainer(
             encoder=encoder,
             projector=projector,
-            w0=VICRegWeights(sim=25.0, var=25.0, cov=1.0),
+            w0=VICRegWeights(sim=args.w_sim, var=args.w_var, cov=args.w_cov),
             adaptive_weights=args.adaptive,
             adaptive_targets=args.adaptive_targets,
             use_schedules=args.use_schedules,
@@ -175,6 +206,7 @@ def main() -> None:
                 save_best_only=True,
                 verbose=1,
             ),
+            keras.callbacks.ModelCheckpoint(filepath=last_full_ckpt, save_weights_only=True, verbose=0),
             keras.callbacks.TerminateOnNaN(),
             VicRegMetricsLogger(
                 run_dir=out_dir,
@@ -193,16 +225,20 @@ def main() -> None:
                     total_steps=steps_per_epoch * args.epochs,
                     base_lr=args.lr,
                     base_wd=args.wd,
+                    warmup_frac=args.warmup_epochs / args.epochs,
                 ),
             )
 
         trainer.fit(
             ds,
-            epochs=args.epochs,
+            epochs=args.stop_epoch or args.epochs,
             steps_per_epoch=steps_per_epoch,
             callbacks=cbs,
             verbose=1,
         )
+
+        # The in-memory state is the end of training. Save it before the best checkpoint is reloaded.
+        encoder.save_weights(last_enc_ckpt)
 
         # ModelCheckpoint keeps the best-loss weights on disk. Reload them so the encoder snapshot comes
         # from that checkpoint and not from whatever state the last epoch left in memory.
@@ -213,6 +249,7 @@ def main() -> None:
         f"[train] Done.\n"
         f"  Encoder -> {enc_ckpt}\n"
         f"  Full    -> {full_ckpt}\n"
+        f"  Last    -> {last_enc_ckpt}, {last_full_ckpt}\n"
         f"  Config  -> {os.path.join(out_dir, 'train_config.json')}\n"
         f"  Metrics -> {os.path.join(out_dir, 'metrics', 'history.jsonl')}"
     )

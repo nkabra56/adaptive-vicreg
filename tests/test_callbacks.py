@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import tensorflow as tf
 from tensorflow import keras
@@ -39,6 +40,43 @@ def test_cosine_callback_leaves_weight_decay_alone_without_base_wd():
     assert float(opt.weight_decay) == pytest.approx(1e-4)
 
 
+def test_cosine_callback_warms_up_from_zero_then_decays():
+    opt = keras.optimizers.AdamW(learning_rate=0.1)
+    cb = CosineScheduleCallback(opt, total_steps=100, base_lr=0.1, base_wd=None, verbose=0, warmup_frac=0.1)
+    lrs = []
+    for step in range(60):
+        cb.on_train_batch_begin(step)
+        lrs.append(float(opt.learning_rate))
+    assert lrs[0] == pytest.approx(0.0)
+    assert lrs[5] == pytest.approx(0.05)
+    assert lrs[10] == pytest.approx(0.1)
+    assert lrs[10] > lrs[30] > lrs[59]
+
+
+def test_cosine_callback_start_step_continues_a_resumed_schedule():
+    fresh = keras.optimizers.AdamW(learning_rate=0.1)
+    fresh_cb = CosineScheduleCallback(fresh, total_steps=10, base_lr=0.1, base_wd=None, verbose=0)
+    for step in range(6):
+        fresh_cb.on_train_batch_begin(step)
+
+    resumed = keras.optimizers.AdamW(learning_rate=0.1)
+    resumed_cb = CosineScheduleCallback(resumed, total_steps=10, base_lr=0.1, base_wd=None, verbose=0, start_step=5)
+    resumed_cb.on_train_batch_begin(0)
+    assert float(resumed.learning_rate) == pytest.approx(float(fresh.learning_rate))
+
+
+def test_cosine_callback_ramp_scales_the_schedule_after_a_resume():
+    opt = keras.optimizers.AdamW(learning_rate=0.1)
+    cb = CosineScheduleCallback(opt, total_steps=10, base_lr=0.1, base_wd=None, verbose=0, start_step=5, ramp_steps=4)
+    scheduled = 0.1 * 0.5 * (1 + np.cos(np.pi * np.arange(5, 10) / 10))
+    lrs = []
+    for step in range(5):
+        cb.on_train_batch_begin(step)
+        lrs.append(float(opt.learning_rate))
+    ramp = [0.1 + 0.9 * (i + 1) / 4 for i in range(4)] + [1.0]
+    assert lrs == pytest.approx(list(scheduled * ramp))
+
+
 def test_cosine_callback_rejects_nonpositive_total_steps():
     with pytest.raises(ValueError):
         CosineScheduleCallback(keras.optimizers.AdamW(0.1), total_steps=0, base_lr=0.1, base_wd=None)
@@ -46,6 +84,20 @@ def test_cosine_callback_rejects_nonpositive_total_steps():
 
 def test_warmup_ramps_from_ten_percent_to_full_and_then_stops():
     model = _stub_model()
+    cb = WarmupLR(base_lr=0.01, warmup_steps=4)
+    cb.set_model(model)
+    lrs = []
+    for _ in range(6):
+        cb.on_train_batch_begin(0)
+        lrs.append(float(model.optimizer.learning_rate))
+        model.curr_step.assign_add(1)
+    assert lrs[:4] == pytest.approx([0.01 * (0.1 + 0.9 * (i + 1) / 4) for i in range(4)])
+    assert lrs[4] == lrs[5] == pytest.approx(0.01)
+
+
+def test_warmup_counts_from_where_training_restarts():
+    model = _stub_model()
+    model.curr_step.assign(1000)  # a resumed run starts far past the warmup length
     cb = WarmupLR(base_lr=0.01, warmup_steps=4)
     cb.set_model(model)
     lrs = []

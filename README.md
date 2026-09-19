@@ -59,12 +59,13 @@ python3 scripts/train_vicreg.py \
   --model-dir checkpoints_tf --run-name pretrain-c10_baseline
 ```
 
-Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
+Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. `--warmup-epochs N` (with `--use-schedules`) ramps the LR up before the cosine decay, `--clipnorm X` clips gradients, and `--stop-epoch N` stops early while keeping the LR schedule sized for `--epochs`. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
 
 Each run writes to `checkpoints_tf/<run-name>_<timestamp>/`:
 
 - `vicreg_full.weights.h5`: trainer weights (encoder, projector, optimizer) at the lowest training loss.
 - `vicreg_encoder.weights.h5`: the encoder weights from that same checkpoint. This is the file the evaluation scripts load.
+- `vicreg_full_last.weights.h5` and `vicreg_encoder_last.weights.h5`: the state after the final epoch, so the end of a run can be compared with the best-loss checkpoint.
 - `train_config.json`: the hyperparameters used.
 - `metrics/history.jsonl`: one record per epoch with the loss terms, the loss weights, and embedding statistics.
 
@@ -76,7 +77,7 @@ python3 scripts/resume_pretrain.py \
   --initial-epoch 80 --epochs 200 --resume-lr 0.003
 ```
 
-`--initial-epoch` is the epoch the original run stopped at and `--epochs` is the epoch to train up to. Pass the same `--feat-dim`, `--proj-out`, `--proj-layers`, `--adaptive` and `--adaptive-targets` values as the original run.
+`--initial-epoch` is the epoch the original run stopped at and `--epochs` is the epoch to train up to. With `--use-schedules` the cosine schedule continues from that epoch, and `--warmup-steps N` ramps the LR up over the first N steps after resuming. Pass the same `--feat-dim`, `--proj-out`, `--proj-layers`, `--adaptive` and `--adaptive-targets` values as the original run.
 
 ### Linear evaluation
 
