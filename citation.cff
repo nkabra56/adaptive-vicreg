@@ -10,10 +10,9 @@ authors:
   - family-names: Kabra
     given-names: Nishant
     affiliation: "Illinois Institute of Technology"
-    orcid: "0000-0000-0000-0000"
 
-repository-code: "https://github.com/nkabra56/adaptive-vicreg-cs584-final-proj"
-license-url: "https://github.com/nkabra56/adaptive-vicreg-cs584-final-proj/blob/main/LICENSE"
+repository-code: "https://github.com/nkabra56/adaptive-vicreg"
+license-url: "https://github.com/nkabra56/adaptive-vicreg/blob/main/LICENSE"
 keywords:
   - self-supervised learning
   - VICReg
@@ -22,9 +21,7 @@ keywords:
   - CIFAR-10
 
 abstract: >
-  This repository contains a TensorFlow/Keras reimplementation of VICReg
-  (Variance-Invariance-Covariance Regularization) and an experimental Adaptive
-  VICReg variant that dynamically reweights the three loss terms during
-  self-supervised pretraining on CIFAR-10. It includes scripts for pretraining,
-  linear evaluation, kNN evaluation, and automatic generation of plots and
-  LaTeX-ready tables.
+  A TensorFlow/Keras implementation of VICReg (Variance-Invariance-Covariance
+  Regularization) with an experimental adaptive variant that reweights the three
+  loss terms during self-supervised pretraining on CIFAR-10. Includes scripts for
+  pretraining, linear and kNN evaluation, and plotting.

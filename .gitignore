@@ -6,11 +6,14 @@
 Thumbs.db
 .vscode/
 .idea/
+.pytest_cache/
+.ruff_cache/
 checkpoints_tf/
 artifacts/
 logs/
 results/
 .venv-ngc/
+.cache_keras/
 .config/
 reports/
 ngcContainer.sh
