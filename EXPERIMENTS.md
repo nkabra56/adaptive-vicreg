@@ -102,10 +102,91 @@ This can't be verified. `ModelCheckpoint(save_best_only=True)` only writes the b
 
 Run 2 (fix applied, later best epoch, no bug compounding it) is the best result so far but is still well below the README's numbers. That is consistent with finding 3 (the best-by-loss checkpoints this recipe picks are undertrained on decorrelation) plus the batch size 256 against 512 difference. Raw CSVs: `results/pretrain-c10_baseline/{linear_eval_fixed, knn_eval_fixed}.csv`.
 
+## Screening study (2026-09-19)
+
+Goal: find out why the baseline is unstable and whether anything in the recipe explains the low accuracy, before comparing baseline with `--adaptive`. Every run used the current code in the NGC container, batch size 256, `--seed 0`, `--use-schedules`, and a 100-epoch schedule stopped at epoch 40 with `--stop-epoch 40`. Unless noted, `--lr 0.01` and `--w-cov 1`, as in runs 1 and 2. kNN is k=200, T=0.1 on the epoch-40 encoder. "Stable" was fixed before the runs: after epoch 3, `avg_std` never above 5 and the epoch loss never more than 3x the previous epoch. Runs are in `checkpoints_tf/screen-*`.
+
+| Arm | Change from the default | Outcome | `corr^2` at the end | kNN top-1 |
+|---|---|---|---|---|
+| control | none | stable by the criterion, but collapsed | 1.0000 | 28.19% |
+| warmup5 | `--warmup-epochs 5` | collapsed by epoch 17, NaN at epoch 19 | 1.0000 | n/a |
+| clip1 | `--clipnorm 1.0` | NaN in epoch 2 | n/a | n/a |
+| lr003 | `--lr 0.003` | stable, no spikes (max `loss/align` 0.59), collapsed | 0.9991 | 29.12% |
+| wcov4095 | `--w-cov 4095` | unstable: epoch-1 spike, 4.2x loss jump at epoch 22, `avg_std` drifts to 0.65 | 0.0274 | 25.48% |
+| wcov4095-warmup5 | `--w-cov 4095 --warmup-epochs 5` | unstable: 12.3x jump at epoch 4, `avg_std` up to 227, then settles | 0.0182 | 27.18% |
+| **wcov4095-lr003-warmup5** | `--w-cov 4095 --lr 0.003 --warmup-epochs 5` | **stable** (max `loss/align` 0.77, worst jump 1.0x, `avg_std` settles at 1.05) | **0.0059** | **53.63%** |
+
+`corr^2` is `stats/avg_offdiag_corr_sq` on the projector output. The criterion was checked against runs 1 and 2 first: it flags both (epoch 25 and epoch 34).
+
+### Finding 6: the covariance term is about D times weaker than the paper's
+
+`covariance_loss` is the mean of squared off-diagonal correlations over D(D-1) entries. VICReg sums the squared covariances and divides by D, so the same weight of 1 is about D-1 times stronger in the paper (4095 for `--proj-out 4096`). On synthetic correlated embeddings the ratio is 81, 611 and 4,639 at D = 64, 512 and 4096. At weight 1 the term is negligible against invariance and variance. That fits every earlier run: `loss/cov` stuck near 2 (its maximum) and `avg_offdiag_corr_sq` stuck at 1.0, so the projector output was rank 1. It also fits finding 3. `--w-cov 4095` is now available as a flag; `--w-cov 1` stays the default so old runs reproduce.
+
+### Finding 7: neither fix works alone
+
+Only the covariance fix (wcov4095) decorrelates the projector but adds spikes and lowers kNN accuracy. Only the lower LR (lr003) is calm but stays collapsed. Together with a 5-epoch warmup they give a stable, decorrelated run, and the encoder reaches 53.63% kNN at epoch 40, against 25 to 29% for every other arm. That already beats the 46.39% (best over a grid) that the README reported for a finished 100-epoch run. Caveat: one seed, half a schedule, and batch size 256 here against 512 there is still an unresolved confound in that comparison.
+
+### Finding 8: a rank-1 projector doesn't make the encoder useless
+
+The control's projector was fully collapsed and its encoder still reached 28% kNN. The eval scripts read the 2048-d encoder features, not the projector output. So `corr^2` on the projector is a health signal, not an accuracy predictor. The covariance fix alone did not raise accuracy either (25.48%).
+
+### Finding 9: the epoch-1 spike was always there
+
+The epoch-1 mean loss was 4.34e3 in run 1 and 5.92e3 in run 2 (from their `history.jsonl`), and 3.22e3 in the control here, against a best loss of about 4.5. With LR 0.01 and no warmup, `loss/align` explodes within the first two steps (358,569 mean loss at step 2 in a 2-epoch check). With LR 0.003 and a 5-epoch warmup the epoch-1 loss was 157.
+
+### Finding 10: two runs went NaN, and the cause is not isolated
+
+`warmup5` first collapsed (`avg_std` 0.70 then 0.56, `corr^2` 1.000 at epochs 17 and 18) and then produced NaN at epoch 19, batch 74. `clip1` produced NaN in epoch 2, batch 141, right after a 4,319 epoch-1 loss. Gradient clipping did not prevent it. One untested hypothesis: `variance_loss` uses `tf.math.reduce_std` with no epsilon, so a constant embedding dimension gives a non-finite gradient, whereas reference VICReg uses `sqrt(var + 1e-4)`. The recipe that avoids the collapse also avoided NaN in all 40 epochs, so this was not pursued.
+
+## Final comparison: baseline vs `--adaptive` (2026-09-19)
+
+Recipe from the screening study: batch 256, `--use-schedules --warmup-epochs 5 --lr 0.003 --w-cov 4095`, 100 epochs. Two runs at `--seed 0`: baseline (no extra flags) and `--adaptive` (only that flag, not `--adaptive-targets`, so the reweighter is the one variable). Evaluated both the best-loss and last-epoch encoders (linear probe, 10 epochs AdamW; kNN, k=200, T=0.1). Runs are `checkpoints_tf/final-baseline-s0_20260919-1640` and `checkpoints_tf/final-adaptive-s0_20260919-1732`.
+
+| Method | Encoder | Linear top-1 | kNN top-1 |
+|---|---|---|---|
+| VICReg (baseline) | best-loss (epoch 96) | **61.44%** | **56.52%** |
+| VICReg (baseline) | last (epoch 100) | 61.26% | 56.55% |
+| AdaptiveVICReg | best-loss (epoch 96) | 31.04% | 35.59% |
+| AdaptiveVICReg | last (epoch 100) | 31.01% | 35.35% |
+
+Baseline nearly doubles `--adaptive` on both metrics, and both baseline numbers clear the README's historical 51.95% linear / 46.39% kNN (batch 512, different hardware, old recipe). Best-loss and last-epoch agree with each other to within 0.3 points for both methods, so at this recipe the choice of checkpoint no longer matters much, unlike in runs 1 and 2.
+
+### Finding 11: `--adaptive` collapses variance regardless of `--w-cov`
+
+At epoch 100 the adaptive run's logged weights were `w_sim=125.00` (5.00x `w0.sim`, the loss-magnitude clip's ceiling), `w_cov=20650.78` (5.04x `w0.cov`, also at the ceiling once the embedding-health boost is folded in), and `w_var=23.81` (0.95x `w0.var`, just under the constant-weight baseline). `stats/avg_std` stayed at 0.093 for the whole run (baseline: 1.142), so the projection never left its collapsed state even though `--adaptive` exists specifically to react to collapse. Oddly, `avg_offdiag_corr_sq` was even lower than baseline's (0.0043 vs 0.0053): the huge `w_cov` did decorrelate the (collapsed) projection, it just didn't help the encoder.
+
+Mechanism: `AdaptiveReweighter`'s magnitude balancing sets each term's multiplier to `mean(EMAs) / that term's EMA`, clipped to `[0.2, 5.0]`. Once std is collapsed, `l_var` (bounded above by `relu(gamma - std)` near `gamma=1`) is naturally much larger than `l_align` and `l_cov` (both near zero once alignment is satisfied and correlations are small), so magnitude balancing alone pushes `w_var` down and `w_sim`/`w_cov` up to the 5x ceiling, whatever `w0` is. The embedding-health boost is meant to counter this for variance, but it multiplies the already-shrunk `mag_var` and is itself capped at 4x, so in the worst case it can only bring `w_var` back to roughly baseline, never above it. The two terms that are already satisfied get 5x more weight, and the one term that needs fixing gets no more than it would without any reweighting. That is a fixed point: once collapsed, there is no path back.
+
+This does not depend on the covariance-scale fix in finding 6. Feeding the reweighter magnitudes representative of this collapsed regime (`l_align` and `l_cov` near zero, `l_var` near its ceiling of about 2, the shape both runs show in their first few epochs) at both `w0.cov=1` and `w0.cov=4095` gives the same weight ratios in both cases (`w_sim` 5.00x; `w_var` 0.35x with a healthy probe, 0.99x with a collapsed one; `w_cov` 5.03-5.04x). Only the absolute `w_cov` scales with `w0.cov`; the ratios, and so the failure mode, are unchanged. This is a property of the reweighter itself, not an interaction with the `--w-cov` fix.
+
+Caveat: baseline used one seed here (seed 0). A second baseline seed turned out to matter a great deal; see finding 12. A second `--adaptive` seed was not run. Given the mechanism above is close to deterministic once the embedding collapses, a second seed is unlikely to change the direction of that result, but it hasn't been checked.
+
+### Finding 12: the fixed recipe reduces the instability, it doesn't eliminate it
+
+A second baseline seed (`--seed 1`) was queued for a noise estimate. The container running it was interrupted after epoch 62 (host issue, not a code bug: `vicreg_full.weights.h5` was mid-overwrite and came out corrupted, while the separately-written `vicreg_full_last.weights.h5` from the same epoch was intact and unaffected). It was resumed from there with `resume_pretrain.py` to epoch 100 (`checkpoints_tf/final-baseline-s1_resumed`), which continued smoothly with no discontinuity at the resume point (loss 75.44 at epoch 61, 74.83 at epoch 63, declining steadily to 64.59 at epoch 100).
+
+But this seed was already in trouble long before the resume. Comparing its logged history against seed 0's, at epoch 10 both were similar (`l_var` 0.91 vs 0.68, `avg_std` 0.55 vs 0.66). At **epoch 14**, seed 1's loss jumped from 78.7 to 858.1 and `avg_std` spiked to 210.5, the same kind of event as findings 1 and 4, just smaller (finding 1's spike reached 14,767). By epoch 15 `avg_std` had already crashed back down to 0.96 and `l_var` to 0.047, and it never recovered from there: for the rest of training (including after the resume, through epoch 100) `l_var` stayed between 0.89 and 0.27 and `avg_std` stayed between 0.88 and 0.54, never approaching seed 0's 0.04 / 1.1.
+
+Downstream, this seed reached only 37.0% linear and 34.9% kNN top-1 (best-loss checkpoint), against seed 0's 61.4% / 56.5%, a result almost as far below seed 0's baseline as `--adaptive` was in finding 11.
+
+| Method | Seed | Encoder | Linear top-1 | kNN top-1 |
+|---|---|---|---|---|
+| VICReg (baseline) | 0 | best-loss | 61.44% | 56.52% |
+| VICReg (baseline) | 1 | best-loss (post-resume) | 37.0% | 34.88% |
+| AdaptiveVICReg | 0 | best-loss | 31.04% | 35.59% |
+
+This means the fixed recipe (finding 7) makes the instability smaller and less frequent, not gone: it still fired for one of the two seeds tried, at about 1/70th the severity (`avg_std` peaked at 210.5, not 14,767) and without diverging to NaN. A single stable-looking seed is not enough to trust a recipe. The comparison in finding 11 used only seed 0 for baseline; that comparison's *mechanism* is independently verified (the CPU-only synthetic test), so it does not depend on this seed being representative, but the specific 56.5% number might be closer to a lucky draw than a typical one.
+
+One more thing surfaced while resuming: `resume_pretrain.py` calls `safe_load_trainer_weights` before `trainer.compile()`, so the freshly constructed AdamW optimizer never receives the saved momentum and variance state; a resumed run's optimizer restarts cold at whatever step it resumes from, even though the LR schedule correctly continues from that step. The loss trajectory is smooth across the resume point, so it caused no visible blowup, but a smooth loss curve can't rule out a subtler effect on where the run eventually converges, and there is no non-resumed control here to check against. A "resumed" run is not quite the same as an uninterrupted one, and it would be worth fixing (compile before loading, or load into an already-compiled trainer) before relying on resumed runs for results that need to match a continuous run exactly.
+
 ## Next steps
 
-1. **Add an unconditional final or periodic checkpoint** (finding 5), so the end state of a run can always be compared with best-by-loss.
-2. **Investigate the instability** (findings 1 and 4). Try a lower peak LR, a real warmup (`--use-schedules` currently builds `CosineWarmup` with `warmup_frac=0.0`, so there is no warmup at all), or gradient clipping, and see whether it can be prevented or delayed. Finding 5 hints that it may sometimes help by breaking the redundant-features plateau. If so, the better question is how to checkpoint past it, not how to prevent it.
-3. **Compare full trajectories.** Once a run's whole trajectory (not just best-by-loss) can be evaluated, compare epoch 100 with best-by-loss, and both with the README's 51.95% / 46.39% baseline. Batch size 256 against 512 remains a confound.
-4. **Run `--adaptive` only after there is a well-understood baseline.** Since `main` was merged, `--adaptive` is the loss-weight reweighter, and the old `nu` mechanism is now `--adaptive-targets`. By default that starts `nu` at 1.0 and decays it to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it. That may be a second reason the earlier adaptive results underperformed, so ablate it before trusting a run that uses `--adaptive-targets`.
-5. **Feed stable baseline and adaptive runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
+1. **Done: unconditional last-epoch checkpoint.**
+2. **Done: the instability.** LR 0.003, a 5-epoch warmup and `--w-cov 4095` together give a stable, decorrelated run (screening study). The NaN hypothesis in finding 10 is still untested.
+3. **Done: baseline vs `--adaptive` at the fixed recipe (seed 0).** `--adaptive` fails for a specific, reproducible reason (finding 11) that does not depend on which seed hit it, verified with a CPU-only synthetic test. Whether seed 0's *baseline* number (56.5% kNN) is typical is less certain: see finding 12.
+4. **Done: a second baseline seed.** It hit a smaller version of the same instability at epoch 14 and landed at 34.9% kNN, below `--adaptive`'s kNN number though still ahead on linear (finding 12). The recipe from finding 7 reduces the instability, it doesn't remove it. More seeds (of both baseline and `--adaptive`) are needed to know the failure rate and get real error bars, and the instability itself (findings 1, 4, 12) is still not understood well enough to prevent, only to make less likely.
+5. **Fix or redesign `AdaptiveReweighter`.** One option: don't let magnitude balancing push `w_var` below `w0.var` at all, for example by clipping its multiplier to `[1.0, 5.0]` instead of `[0.2, 5.0]`, so a collapse can only increase pressure on the variance term, never decrease it. That only closes this one path, though; the deeper mismatch is that magnitude balancing weighs each term by its raw loss value, not by its actual weighted contribution to the gradient, so a differently-scaled `w0` could still trigger the same failure mode through a different route.
+6. **Fix `resume_pretrain.py`'s optimizer reset.** It loads weights before calling `trainer.compile()`, so a resumed run's optimizer state is not actually restored (finding 12). Compile first, or load into an already-compiled trainer.
+7. **Ablate `--adaptive-targets`.** Its default `nu` schedule starts at 1.0 and decays to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it.
+8. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
+9. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.

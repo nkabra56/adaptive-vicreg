@@ -19,6 +19,8 @@ The paper weights the three terms 25, 25 and 1. This repo adds two optional mech
 
 **`--adaptive-targets`** changes what the loss aims for instead of how the terms are weighted. The correlation target `nu` decays from 1.0 to 0.0 over training, and the variance floor `gamma` stays at 1.0. It can be combined with `--adaptive`.
 
+In a full 100-epoch comparison `--adaptive` performed much worse than plain VICReg at the same seed: 35.6% against 56.5% kNN top-1 with everything else held fixed. Once the variance term collapses, magnitude balancing sees its raw loss as large relative to the other two and pushes its weight down (while pushing invariance and covariance up to their 5x ceiling), so there is no mechanism to recover. This weight-assignment behavior is verified independent of the covariance weight's scale, though only one `--adaptive` seed has been run, so whether a run always reaches this collapsed state is not yet confirmed; see finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 The encoder is a six-layer CNN (three stages of two 3x3 conv, batch norm, ReLU blocks) with global average pooling and a linear layer. The projector is an MLP with 1 to 3 layers.
 
 ## Setup
@@ -55,9 +57,11 @@ Run everything from the repository root. Each script's `--help` lists all option
 python3 scripts/train_vicreg.py \
   --dataset cifar10 --epochs 100 --batch-size 256 \
   --feat-dim 2048 --proj-out 4096 --proj-layers 3 \
-  --lr 0.01 --wd 1e-6 --use-schedules \
+  --lr 0.003 --wd 1e-6 --use-schedules --warmup-epochs 5 --w-cov 4095 \
   --model-dir checkpoints_tf --run-name pretrain-c10_baseline
 ```
+
+The last three flags matter. The paper sums the squared covariances and divides by the embedding width, while `losses.py` takes their mean, so a covariance weight of 1 here is about `--proj-out` times weaker than the paper's. `--w-cov 4095` restores the paper's scale for `--proj-out 4096`. On its own that spiked, and a high LR on its own left the projector collapsed. Together with a 5-epoch warmup they were the only stable, decorrelated setup in the screening runs ([EXPERIMENTS.md](EXPERIMENTS.md)). The script defaults (`--lr 0.01`, `--w-cov 1`, no warmup) still reproduce the earlier runs.
 
 Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. `--warmup-epochs N` (with `--use-schedules`) ramps the LR up before the cosine decay, `--clipnorm X` clips gradients, and `--stop-epoch N` stops early while keeping the LR schedule sized for `--epochs`. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
 
@@ -150,14 +154,35 @@ tests/                      pytest suite
 
 ## Results
 
-These numbers are from an earlier version in which "Adaptive VICReg" only scheduled the `gamma` and `nu` targets (now `--adaptive-targets`) and did not reweight the loss terms. The reweighting in `--adaptive` is newer and hasn't been benchmarked, so treat the table as history. Both runs used 100 pretraining epochs and batch size 512 on CIFAR-10.
+These numbers are from an earlier version in which "Adaptive VICReg" only scheduled the `gamma` and `nu` targets (now `--adaptive-targets`) and did not reweight the loss terms, so treat the table as history; the current `--adaptive` reweighter is benchmarked separately below. Both runs used 100 pretraining epochs and batch size 512 on CIFAR-10.
 
 | Run | Linear probe top-1 | kNN top-1 (best over a k/temperature grid) |
 |---|---|---|
 | Baseline VICReg | 51.95% | 46.39% (k=50, T=0.07) |
 | Targets-only variant | 45.08% | 38.37% (k=50, T=0.10) |
 
-The targets-only variant produced slightly more decorrelated features but didn't beat the baseline downstream. More recent baseline runs on a laptop GPU (batch size 256) reach 21.74% linear and 30.35% kNN top-1 and show a loss spike partway through training. Those runs and their analysis are in [EXPERIMENTS.md](EXPERIMENTS.md). Open issues and ideas are in [TASKS.md](TASKS.md).
+The targets-only variant produced slightly more decorrelated features but didn't beat the baseline downstream.
+
+### Recent runs (laptop GPU, batch size 256)
+
+The first baseline runs with the default settings reached 21.74% linear and 30.35% kNN top-1 and spiked in the loss partway through training. A screening study (100-epoch schedule stopped at epoch 40, one seed, kNN with k=200 and T=0.1) then compared changes to the recipe:
+
+| Setup | Projector `corr^2` | kNN top-1 at epoch 40 |
+|---|---|---|
+| Default (`--lr 0.01`, `--w-cov 1`) | 1.000 (collapsed) | 28.19% |
+| `--lr 0.003` only | 0.999 (collapsed) | 29.12% |
+| `--w-cov 4095` only | 0.027 (spiky) | 25.48% |
+| `--lr 0.003 --warmup-epochs 5 --w-cov 4095` | 0.006 (stable) | **53.63%** |
+
+Only the combined setup was both stable and decorrelated in that screening run. A full 100-epoch comparison at two seeds told a more complicated story:
+
+| Method | Seed | Linear top-1 | kNN top-1 |
+|---|---|---|---|
+| VICReg (baseline) | 0 | **61.44%** | **56.52%** |
+| VICReg (baseline) | 1 | 37.0% | 34.9% |
+| AdaptiveVICReg (`--adaptive`) | 0 | 31.04% | 35.59% |
+
+Seed 0's baseline clears the historical numbers above. Seed 1 hit a smaller version of the same instability that findings 1 and 4 describe, around epoch 14, and never fully recovered, landing above `--adaptive` on linear but below it on kNN. So the recipe above makes the instability far less severe and less frequent, it doesn't eliminate it: a single stable-looking run isn't enough to trust a recipe. `--adaptive`'s failure is traced to a specific mechanism in the reweighter, verified with a code-level test rather than just observed in one run, though only for one `--adaptive` seed (finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md)). The full analysis, including finding 12 on the second seed, is there too. Open issues and ideas are in [TASKS.md](TASKS.md).
 
 ## License and citation
 
