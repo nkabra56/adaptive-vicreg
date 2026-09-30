@@ -179,14 +179,42 @@ This means the fixed recipe (finding 7) makes the instability smaller and less f
 
 One more thing surfaced while resuming: `resume_pretrain.py` calls `safe_load_trainer_weights` before `trainer.compile()`, so the freshly constructed AdamW optimizer never receives the saved momentum and variance state; a resumed run's optimizer restarts cold at whatever step it resumes from, even though the LR schedule correctly continues from that step. The loss trajectory is smooth across the resume point, so it caused no visible blowup, but a smooth loss curve can't rule out a subtler effect on where the run eventually converges, and there is no non-resumed control here to check against. A "resumed" run is not quite the same as an uninterrupted one, and it would be worth fixing (compile before loading, or load into an already-compiled trainer) before relying on resumed runs for results that need to match a continuous run exactly.
 
+## Five-seed baseline sweep (2026-09-30)
+
+Three more baseline seeds (2, 3, 4) at the same recipe as finding 12 (`--lr 0.003 --warmup-epochs 5 --w-cov 4095`, batch 256, 100 epochs), to get an actual failure-rate estimate instead of one extra data point. Runs are `checkpoints_tf/baseline-s{2,3,4}_*`.
+
+| Seed | Instability event | Encoder | Linear top-1 | kNN top-1 |
+|---|---|---|---|---|
+| 0 | none | best-loss | 61.44% | 56.52% |
+| 1 | epoch 14, `avg_std` to 210.5, never recovered | best-loss (post-resume) | 37.0% | 34.88% |
+| 2 | none | best-loss | **62.42%** | **59.64%** |
+| 2 | none | last (epoch 100) | 62.74% | 59.59% |
+| 3 | epoch 14, `avg_std` to 3.05, partial recovery | best-loss | 44.11% | 38.52% |
+| 3 | epoch 14, `avg_std` to 3.05, partial recovery | last (epoch 100) | 28.79% | 30.64% |
+| 4 | epoch 17, `avg_std` to 3.08, partial recovery | best-loss | 44.78% | 40.04% |
+| 4 | epoch 17, `avg_std` to 3.08, partial recovery | last (epoch 100) | 26.63% | 27.52% |
+
+### Finding 13: the instability hits most runs, at wildly different severities, and isn't tied to a specific epoch
+
+Three of five seeds (1, 3, 4) hit an instability event; only seeds 0 and 2 stayed clean. That is a 60% failure rate on five runs, not the occasional exception finding 12 left open.
+
+Seeds 1 and 3 both spiked at epoch 14, which looked like it might be schedule-related, but seed 4 spiked at epoch 17. Nothing in `callbacks.py` or `schedules.py` keys any behavior to a specific epoch once the 5-epoch warmup ends, so the epoch-14 repeat was coincidence, not a schedule boundary.
+
+Severity varies by close to two orders of magnitude. Seed 1's spike reached `avg_std` 210.5 (peak `loss/align` 9.06 was not logged for seed 1's spike epoch itself, only `avg_std` and total loss). Seeds 3 and 4 peaked at `avg_std` 3.05 and 3.08, about 1/69th of seed 1's peak and roughly 1/4,800th of finding 1's original 14,767 spike, yet still large enough to leave a lasting mark: in both seed 3 and seed 4, `l_var` (0.87-0.86 pre-spike) settled into a plateau around 1.06-1.11 for the rest of training instead of continuing to decay toward the near-zero values seeds 0 and 2 reach, and `avg_std` settled around 0.44-0.47 instead of climbing toward 1.05. The recovery is real (loss and `avg_std` both drop sharply within one to two epochs of the peak) but incomplete, and the model never gets back on the healthy trajectory.
+
+This also reopens what finding 12 observed about best-loss and last-epoch agreeing once the recipe was fixed. That held for seed 0 (within 0.3 points) and again for seed 2 here (within 0.3-0.4 points), but not for the two seeds that partially recovered: seed 3 dropped from 38.52% kNN (best-loss) to 30.64% (last), and seed 4 from 40.04% to 27.52%. Once a run partially recovers rather than staying clean or collapsing outright, it keeps drifting after the point `ModelCheckpoint` calls best, so the two snapshots diverge again.
+
+The underlying cause is still the open question from findings 1, 4 and 10. Five runs is enough to say the fixed recipe is unstable more often than not, not enough to say why, or to rule out that batch size 256 (against the paper's much larger batches) is itself part of the cause.
+
 ## Next steps
 
 1. **Done: unconditional last-epoch checkpoint.**
-2. **Done: the instability.** LR 0.003, a 5-epoch warmup and `--w-cov 4095` together give a stable, decorrelated run (screening study). The NaN hypothesis in finding 10 is still untested.
-3. **Done: baseline vs `--adaptive` at the fixed recipe (seed 0).** `--adaptive` fails for a specific, reproducible reason (finding 11) that does not depend on which seed hit it, verified with a CPU-only synthetic test. Whether seed 0's *baseline* number (56.5% kNN) is typical is less certain: see finding 12.
-4. **Done: a second baseline seed.** It hit a smaller version of the same instability at epoch 14 and landed at 34.9% kNN, below `--adaptive`'s kNN number though still ahead on linear (finding 12). The recipe from finding 7 reduces the instability, it doesn't remove it. More seeds (of both baseline and `--adaptive`) are needed to know the failure rate and get real error bars, and the instability itself (findings 1, 4, 12) is still not understood well enough to prevent, only to make less likely.
+2. **Done: the instability, partially.** LR 0.003, a 5-epoch warmup and `--w-cov 4095` together were the only stable, decorrelated setup in the screening study, but a 5-seed sweep shows the fix reduces severity, not frequency: 3 of 5 seeds still hit an instability event (finding 13). The NaN hypothesis in finding 10 is still untested.
+3. **Done: baseline vs `--adaptive` at the fixed recipe (seed 0).** `--adaptive` fails for a specific, reproducible reason (finding 11) that does not depend on which seed hit it, verified with a CPU-only synthetic test. Whether seed 0's *baseline* number (56.5% kNN) is typical is less certain: see findings 12 and 13.
+4. **Done: a five-seed baseline sweep.** 3 of 5 seeds hit an instability event, at severities ranging over two orders of magnitude (finding 13). The instability itself (findings 1, 4, 10, 12, 13) is still not understood well enough to prevent, only to describe. A second `--adaptive` seed is still needed to know if its failure mode is as consistent as the mechanism in finding 11 suggests.
 5. **Fix or redesign `AdaptiveReweighter`.** One option: don't let magnitude balancing push `w_var` below `w0.var` at all, for example by clipping its multiplier to `[1.0, 5.0]` instead of `[0.2, 5.0]`, so a collapse can only increase pressure on the variance term, never decrease it. That only closes this one path, though; the deeper mismatch is that magnitude balancing weighs each term by its raw loss value, not by its actual weighted contribution to the gradient, so a differently-scaled `w0` could still trigger the same failure mode through a different route.
 6. **Fix `resume_pretrain.py`'s optimizer reset.** It loads weights before calling `trainer.compile()`, so a resumed run's optimizer state is not actually restored (finding 12). Compile first, or load into an already-compiled trainer.
 7. **Ablate `--adaptive-targets`.** Its default `nu` schedule starts at 1.0 and decays to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it.
 8. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
 9. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
+10. **Investigate whether batch size 256 is itself part of the instability.** Every run in this log used 256 (an 8 GB GPU limit); the paper's batch sizes are much larger. Not yet tested as a variable on its own.

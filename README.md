@@ -174,15 +174,18 @@ The first baseline runs with the default settings reached 21.74% linear and 30.3
 | `--w-cov 4095` only | 0.027 (spiky) | 25.48% |
 | `--lr 0.003 --warmup-epochs 5 --w-cov 4095` | 0.006 (stable) | **53.63%** |
 
-Only the combined setup was both stable and decorrelated in that screening run. A full 100-epoch comparison at two seeds told a more complicated story:
+Only the combined setup was both stable and decorrelated in that screening run. A full 100-epoch comparison, now at five baseline seeds and one `--adaptive` seed, told a more complicated story:
 
 | Method | Seed | Linear top-1 | kNN top-1 |
 |---|---|---|---|
-| VICReg (baseline) | 0 | **61.44%** | **56.52%** |
+| VICReg (baseline) | 0 | 61.44% | 56.52% |
 | VICReg (baseline) | 1 | 37.0% | 34.9% |
+| VICReg (baseline) | 2 | **62.42%** | **59.64%** |
+| VICReg (baseline) | 3 | 44.11% | 38.52% |
+| VICReg (baseline) | 4 | 44.78% | 40.04% |
 | AdaptiveVICReg (`--adaptive`) | 0 | 31.04% | 35.59% |
 
-Seed 0's baseline clears the historical numbers above. Seed 1 hit a smaller version of the same instability that findings 1 and 4 describe, around epoch 14, and never fully recovered, landing above `--adaptive` on linear but below it on kNN. So the recipe above makes the instability far less severe and less frequent, it doesn't eliminate it: a single stable-looking run isn't enough to trust a recipe. `--adaptive`'s failure is traced to a specific mechanism in the reweighter, verified with a code-level test rather than just observed in one run, though only for one `--adaptive` seed (finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md)). The full analysis, including finding 12 on the second seed, is there too. Open issues and ideas are in [TASKS.md](TASKS.md).
+Seeds 0 and 2 clear the historical numbers above and reached a healthy end state; seeds 1, 3 and 4 all hit a smaller version of the instability that findings 1 and 4 describe, at different epochs (14, 14 and 17) and at very different severities, then either never recovered (seed 1) or recovered partway and plateaued well below the clean seeds (seeds 3 and 4). That is 3 of 5 seeds, so the recipe above makes the instability smaller when it happens, it does not make it rare: a single stable-looking run isn't enough to trust a recipe, and by this sample it fails more often than not. `--adaptive`'s failure is traced to a specific mechanism in the reweighter, verified with a code-level test rather than just observed in one run, though only one `--adaptive` seed has been run (finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md)). The full analysis, including finding 13 on the five-seed sweep, is there too. Open issues and ideas are in [TASKS.md](TASKS.md).
 
 ## License and citation
 
