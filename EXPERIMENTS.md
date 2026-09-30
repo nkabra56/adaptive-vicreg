@@ -228,17 +228,53 @@ It does not by itself explain the large-but-finite spikes in findings 1, 4, 12 a
 
 `variance_loss` now takes an optional `eps` (default 0, the original formula, bit-identical to before), threaded through as `--var-eps` in `train_vicreg.py` and `resume_pretrain.py`. No run has used a nonzero value yet.
 
+## Fix verification and ablations (2026-09-30)
+
+Eight runs at the fixed recipe (`--lr 0.003 --warmup-epochs 5 --w-cov 4095 --use-schedules`, 100 epochs unless noted), testing the two fixes above and three open ablations from `TASKS.md`. Runs are `checkpoints_tf/{adaptive-fixed,targets,batch128,vareps}-*`.
+
+| Run | Seed | Linear (best) | kNN (best) | Linear (last) | kNN (last) |
+|---|---|---|---|---|---|
+| `--adaptive`, fixed reweighter | 0 | 46.43% | 45.22% | 46.87% | 45.23% |
+| `--adaptive`, fixed reweighter | 1 | 41.82% | 38.82% | 41.65% | 38.84% |
+| `--adaptive-targets` | 0 | 45.57% | 38.54% | **58.82%** | **53.44%** |
+| `--adaptive-targets` | 1 | 43.99% | 36.75% | **57.05%** | **51.88%** |
+| Baseline, batch 128 | 0 | 55.78% | **60.02%** | 55.79% | 60.01% |
+| Baseline, batch 128 | 1 | 34.53% | 35.51% | 35.06% | 35.40% |
+| Baseline, `--var-eps 1e-4`, seed 3's recipe, stopped at epoch 30 | 3 | 46.10% | 40.77% | 24.50% | 25.93% |
+| Baseline, `--var-eps 1e-4`, seed 4's recipe, stopped at epoch 30 | 4 | 45.68% | 40.57% | 26.17% | 29.49% |
+
+### Finding 15: the reweighter fix ends the collapse, but `--adaptive` still trails baseline
+
+Both fixed-reweighter seeds stayed healthy for the entire run: `avg_std` climbed past 1.0 by epoch 10 and held there (seed 0: 1.068 at epoch 100; seed 1: 1.125), `l_var` settled near 0 (0.003 and 0.019), nothing like finding 11's `avg_std` 0.093 for the whole run. Seed 0 improved from the broken reweighter's 31.04% / 35.59% to 46.43% / 45.22%, a real fix. Seed 1, run at the same seed where *plain baseline* catastrophically failed (finding 13's 37.0% / 34.9%), actually beat that baseline number (41.82% / 38.82%) while staying collapse-free itself.
+
+But neither fixed-reweighter seed approaches a clean baseline run's 61-62% linear / 56-60% kNN. Looking at `loss/w_sim` over the run: magnitude balancing pushes it down to about 8.4 (0.34x `w0.sim`) for most of training and keeps it there, once `l_align` becomes large relative to the now-healthy `l_var` and `l_cov`. The fix closes the specific trap in finding 11 (a collapsed embedding no longer gets its variance weight lowered), but the same raw-loss-value balancing now suppresses the invariance term instead, once that's the largest raw loss. Fixing one term's floor didn't fix the underlying design: the reweighter still treats "largest raw loss" as "this term needs less weight," which is backwards whenever that term is the one the model hasn't finished optimizing rather than one that's already collapsed.
+
+### Finding 16: `--adaptive-targets`'s decaying `nu` makes "best loss" pick the least-decorrelated checkpoint
+
+Both `--adaptive-targets` seeds show a large best-loss-vs-last-epoch gap (about 13 and 13 points linear, 15 and 15 points kNN), much bigger than any clean baseline run's gap. The cause is in `targets-s0`'s own history: at epoch 6, loss is 1.95 (the run's lowest) with `avg_offdiag_corr_sq` at **0.989**, a nearly fully redundant projector. By epoch 100, loss has risen to 49.8, its highest point in the run, with `avg_offdiag_corr_sq` down to **0.0055**, a well-decorrelated one. `nu` (the correlation target) decays from 1.0 to 0.0 over training, so `l_cov = mean((corr - nu)^2)` stays near zero while `nu` is still near 1 and correlations are still near 1, then grows as the model is pushed toward genuine decorrelation and `nu` falls. Loss goes up exactly as the representation gets better. `ModelCheckpoint(monitor="loss")` has no way to know this and picks the early, redundant epoch every time.
+
+Read from the last epoch instead, `--adaptive-targets` performs close to a clean baseline run (58.82% / 53.44% and 57.05% / 51.88%, against baseline's 61-62% / 56-60%), which is a much more favorable comparison than the best-loss numbers suggested. This is the same failure mode `TASKS.md`'s "Checkpointing" item already names in general (loss isn't a held-out metric), but here it isn't just an early-training artifact (finding 3): the schedule makes loss systematically anti-correlated with representation quality for the entire run.
+
+### Finding 17: batch size 128 still fails for one of two seeds, with a different shape than the spike
+
+Seed 0 at batch 128 ran cleanly and reached the best kNN top-1 of any run so far (60.02%, best-loss and last-epoch agreeing to 0.01 points). Seed 1 did not: instead of a sharp one-epoch spike like findings 1, 4, 12 and 13, `avg_std` declined gradually from 0.81 (epoch 10) to 0.42 (epoch 25) while `l_var` rose gradually from 0.62 to 1.09 over the same stretch, no single epoch standing out the way loss jumps by 10x+ in the spike cases. It partially recovered by epoch 100 (`avg_std` 0.91, `l_var` 0.33) but landed at 34.53-35.51%, in the same range as the other failed runs. Two seeds is nowhere near enough to say whether batch size changes the failure rate, but it is enough to say a smaller batch doesn't prevent failure, and that failure can look qualitatively different (a slow drift instead of a spike-and-partial-recovery).
+
+### Finding 18: `--var-eps` does not prevent the spikes it wasn't built for
+
+Re-running seed 3's and seed 4's exact recipes and seeds with `--var-eps 1e-4` added, both spiked again at the identical epoch (14), with `loss/align` reaching 4.21 and 13.90 (against the original runs' 9.06 and 9.89, so the epsilon didn't consistently reduce severity either). This confirms finding 14's caveat: `--var-eps` fixes the non-finite gradient at *exact* collapse (relevant to finding 10's two NaN runs), but the large-but-finite spikes in findings 1, 4, 12, 13 and 17 have a different, still-unidentified cause. The root cause of the instability itself remains open.
+
 ## Next steps
 
 1. **Done: unconditional last-epoch checkpoint.**
 2. **Done: the instability, partially.** LR 0.003, a 5-epoch warmup and `--w-cov 4095` together were the only stable, decorrelated setup in the screening study, but a 5-seed sweep shows the fix reduces severity, not frequency: 3 of 5 seeds still hit an instability event (finding 13). The NaN hypothesis in finding 10 is still untested.
 3. **Done: baseline vs `--adaptive` at the fixed recipe (seed 0).** `--adaptive` fails for a specific, reproducible reason (finding 11) that does not depend on which seed hit it, verified with a CPU-only synthetic test. Whether seed 0's *baseline* number (56.5% kNN) is typical is less certain: see findings 12 and 13.
 4. **Done: a five-seed baseline sweep.** 3 of 5 seeds hit an instability event, at severities ranging over two orders of magnitude (finding 13). The instability itself (findings 1, 4, 10, 12, 13) is still not understood well enough to prevent, only to describe. A second `--adaptive` seed is still needed to know if its failure mode is as consistent as the mechanism in finding 11 suggests.
-5. **Done, pending re-run: `AdaptiveReweighter`'s variance floor.** The multiplier that could push `w_var` below `w0.var` is now clipped to `[1.0, 5.0]` instead of `[0.2, 5.0]`. Verified against finding 11's synthetic collapsed-regime test; not yet verified in an actual training run.
-6. **Done, pending re-run: `resume_pretrain.py`'s optimizer reset.** The optimizer is now compiled and built before its weights load, so a resumed run's momentum and variance state actually restores. Verified with a checkpoint round-trip test; the effect on a real resumed run's final result hasn't been re-checked (finding 12's resumed run predates the fix).
-7. **Pending: a second `--adaptive` seed, now with the fix from item 5.** Needed to know if `--adaptive`'s failure mode is as consistent as the mechanism in finding 11 suggests, and whether the fix actually helps.
-8. **Pending: ablate `--adaptive-targets`.** Its default `nu` schedule starts at 1.0 and decays to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it.
-9. **Pending: try `--var-eps 1e-4`.** Finding 14 confirms `reduce_std`'s gradient is non-finite at exact collapse and an epsilon fixes that, but no run has tried it yet against a recipe known to spike (seeds 1, 3 or 4's).
-10. **Pending: investigate whether batch size 256 is itself part of the instability.** Every run in this log used 256 (an 8 GB GPU limit); the paper's batch sizes are much larger.
-11. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
-12. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
+5. **Done: `AdaptiveReweighter`'s variance floor.** Two seeds confirm it ends the collapse (finding 15). `--adaptive` still trails baseline, now because magnitude balancing suppresses the invariance weight instead, once that's the largest raw term. The reweighter's core design (weighing terms by raw loss value) still needs a rethink, not just another floor.
+6. **Done: `resume_pretrain.py`'s optimizer reset.** Verified with a checkpoint round-trip test (`tests/test_model.py`). No real resumed run has re-tested this against the original, but the mechanism is directly confirmed, not just reasoned about.
+7. **Done: `--adaptive-targets` ablation.** Its apparent underperformance was mostly a checkpoint-selection artifact: the decaying `nu` makes loss rise as the representation genuinely improves, so best-loss picks a nearly redundant early epoch. Read from the last epoch, it performs close to baseline (finding 16).
+8. **Done: `--var-eps 1e-4` against two recipes known to spike.** It did not prevent either spike (finding 18). The epsilon fixes finding 10's NaN cases, not the large-but-finite spikes; their cause is still open.
+9. **Partially done: batch size 128 as an instability variable.** One of two seeds failed, with a different (gradual, not spiky) failure shape (finding 17). Two seeds isn't enough to compare failure rates against batch 256's five-seed sample.
+10. **Open: the instability's root cause.** Still unexplained after 9 baseline-recipe seeds across two batch sizes and one ruled-out hypothesis (finding 18). Nothing tried so far (warmup, covariance scale, batch size, an epsilon) has stopped it, only sometimes changed its shape or severity.
+11. **Open: redesign `AdaptiveReweighter`'s magnitude balancing.** It weighs each term by its raw loss value, not by whether that term still needs optimizing. Finding 15 shows this keeps causing new failure modes (invariance suppression) even after the specific variance-collapse trap is closed.
+12. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
+13. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
