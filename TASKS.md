@@ -16,7 +16,7 @@
 
 - Redesign `AdaptiveReweighter`'s magnitude balancing so it reflects whether a term still needs optimizing, not just its current raw loss value. Closing the variance floor (finding 15) just moved the same failure onto the invariance term.
 - Find the instability's actual root cause. Ruled out so far: the `--var-eps` epsilon hypothesis (finding 18) and (on 2 seeds) batch size 128 (finding 17). Nothing tried yet has stopped it, only changed its shape or severity.
-- Feed the comparison runs into `report_metrics.py` for the plots and tables described in the README.
+- **Done: fed all 12 tracked runs into `report_metrics.py`**, output at `reports/full_comparison/` (gitignored, regenerate with the command in EXPERIMENTS.md's "Comparison report" section).
 
 ## Scope and tooling
 

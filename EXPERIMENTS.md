@@ -263,6 +263,43 @@ Seed 0 at batch 128 ran cleanly and reached the best kNN top-1 of any run so far
 
 Re-running seed 3's and seed 4's exact recipes and seeds with `--var-eps 1e-4` added, both spiked again at the identical epoch (14), with `loss/align` reaching 4.21 and 13.90 (against the original runs' 9.06 and 9.89, so the epsilon didn't consistently reduce severity either). This confirms finding 14's caveat: `--var-eps` fixes the non-finite gradient at *exact* collapse (relevant to finding 10's two NaN runs), but the large-but-finite spikes in findings 1, 4, 12, 13 and 17 have a different, still-unidentified cause. The root cause of the instability itself remains open.
 
+## Comparison report
+
+`src/vicreg_tf/report_metrics.py` was run over all 12 tracked runs above (five baseline seeds, the original broken `--adaptive` seed, the two fixed-reweighter seeds, both `--adaptive-targets` seeds, both batch-128 seeds), writing overlaid loss and embedding-stats plots plus summary tables to `reports/full_comparison/` (gitignored). The `stats/avg_std` overlay makes findings 11, 13, 15 and 17 visible on one plot: the broken `--adaptive` run flat at 0.1, the spiked seeds' sharp jump before settling near 0.45-0.5, and the clean and fixed-reweighter runs all converging near 1.0-1.15.
+
+Seed 1's history spans two files (the original run through epoch 61 and the resumed run from epoch 63, with epoch 62 missing from both, lost the same way finding 12 describes) and was concatenated before plotting; this merge is a report-time step only, the two original files are untouched. To regenerate:
+
+```bash
+python3 -c "
+import json
+rows = []
+for p in ['checkpoints_tf/final-baseline-s1_20260919-1824/metrics/history.jsonl',
+          'checkpoints_tf/final-baseline-s1_resumed/metrics/history.jsonl']:
+    with open(p) as f:
+        rows += [json.loads(l) for l in f]
+rows.sort(key=lambda r: r['epoch'])
+with open('/tmp/seed1_merged_history.jsonl', 'w') as f:
+    for r in rows:
+        f.write(json.dumps(r) + '\n')
+"
+python3 src/vicreg_tf/report_metrics.py --out-dir reports/full_comparison \
+  --history "name=VICReg-seed0,path=checkpoints_tf/final-baseline-s0_20260919-1640/metrics/history.jsonl" \
+  --history "name=VICReg-seed1,path=/tmp/seed1_merged_history.jsonl,config=checkpoints_tf/final-baseline-s1_20260919-1824/train_config.json" \
+  --history "name=VICReg-seed2,path=checkpoints_tf/baseline-s2_20260930-0415/metrics/history.jsonl" \
+  --history "name=VICReg-seed3,path=checkpoints_tf/baseline-s3_20260930-0515/metrics/history.jsonl" \
+  --history "name=VICReg-seed4,path=checkpoints_tf/baseline-s4_20260930-0613/metrics/history.jsonl" \
+  --history "name=AdaptiveVICReg-broken-seed0,path=checkpoints_tf/final-adaptive-s0_20260919-1732/metrics/history.jsonl" \
+  --history "name=AdaptiveVICReg-fixed-seed0,path=checkpoints_tf/adaptive-fixed-s0_20260930-1314/metrics/history.jsonl" \
+  --history "name=AdaptiveVICReg-fixed-seed1,path=checkpoints_tf/adaptive-fixed-s1_20260930-1417/metrics/history.jsonl" \
+  --history "name=AdaptiveTargets-seed0,path=checkpoints_tf/targets-s0_20260930-1518/metrics/history.jsonl" \
+  --history "name=AdaptiveTargets-seed1,path=checkpoints_tf/targets-s1_20260930-1607/metrics/history.jsonl" \
+  --history "name=Baseline-batch128-seed0,path=checkpoints_tf/batch128-s0_20260930-1657/metrics/history.jsonl" \
+  --history "name=Baseline-batch128-seed1,path=checkpoints_tf/batch128-s1_20260930-1803/metrics/history.jsonl" \
+  # --linear-csv and --knn-csv for each run follow the same name=...,path=... pattern, pointing at
+  # each run's linear_eval_best.csv / knn_eval_best.csv, except AdaptiveTargets-seed{0,1}, which use
+  # linear_eval_last.csv / knn_eval_last.csv per finding 16.
+```
+
 ## Next steps
 
 1. **Done: unconditional last-epoch checkpoint.**
@@ -277,4 +314,4 @@ Re-running seed 3's and seed 4's exact recipes and seeds with `--var-eps 1e-4` a
 10. **Open: the instability's root cause.** Still unexplained after 9 baseline-recipe seeds across two batch sizes and one ruled-out hypothesis (finding 18). Nothing tried so far (warmup, covariance scale, batch size, an epsilon) has stopped it, only sometimes changed its shape or severity.
 11. **Open: redesign `AdaptiveReweighter`'s magnitude balancing.** It weighs each term by its raw loss value, not by whether that term still needs optimizing. Finding 15 shows this keeps causing new failure modes (invariance suppression) even after the specific variance-collapse trap is closed.
 12. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
-13. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
+13. **Done: fed all 12 tracked runs into `report_metrics.py`.** See the "Comparison report" section above for the command and what the plots show.
