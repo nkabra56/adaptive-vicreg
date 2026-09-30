@@ -206,15 +206,39 @@ This also reopens what finding 12 observed about best-loss and last-epoch agreei
 
 The underlying cause is still the open question from findings 1, 4 and 10. Five runs is enough to say the fixed recipe is unstable more often than not, not enough to say why, or to rule out that batch size 256 (against the paper's much larger batches) is itself part of the cause.
 
+## Fix for finding 11 (`AdaptiveReweighter` variance floor)
+
+Applied in `schedules.py`: magnitude balancing's clip range for the variance multiplier is now `[1.0, 5.0]` (a separate `var_mag_clip`, overridable), instead of sharing `[0.2, 5.0]` with sim and cov. So this signal can raise `w_var` above `w0.var` but never lower it below, which was the specific fixed point finding 11 describes (a collapsed embedding makes `l_var` the dominant raw term, and the old code read that as a reason to lower its weight). Sim and cov keep the original `[0.2, 5.0]` range. Verified with new unit tests in `tests/test_schedules.py` that feed the reweighter the same collapsed-regime magnitudes finding 11's synthetic test used, and check `w_var` never drops below `w0.var`.
+
+This closes one path into the fixed point, not the mechanism itself: magnitude balancing still weighs each term by its raw loss value, not by its actual contribution to the gradient. It hasn't been re-run yet; a second `--adaptive` seed with the fix applied is next, to see whether it actually prevents (or just delays) the collapse in a real run rather than only in the synthetic test.
+
+## Fix for finding 12 (resume optimizer state)
+
+Applied in `resume_pretrain.py`: the optimizer is now compiled and its slot variables explicitly built (`opt.build(encoder.trainable_variables + projector.trainable_variables)`) before `safe_load_trainer_weights` runs, not after. Previously `trainer.compile(optimizer=opt)` ran after the load call, so at load time `trainer` had no `optimizer` attribute at all, meaning none of the checkpoint's saved momentum and variance state could ever have been restored.
+
+This is confirmed directly, not just reasoned about: loading into a compiled-but-unbuilt optimizer (the old order) makes Keras print its own warning that it is skipping the optimizer's variables because the counts don't match, while building the slots first restores every one of them to the exact saved value (`tests/test_model.py::test_optimizer_state_survives_checkpoint_when_built_before_load` and the paired negative-case test). Finding 12's resumed run was affected by this: its optimizer did restart cold at the resume point. The loss curve stayed smooth there regardless, so this does not change that run's read, only removes the open question of why the state wasn't restored.
+
+## Fix for finding 10 (partial): a `--var-eps` flag
+
+### Finding 14: `reduce_std`'s gradient is undefined at exact collapse
+
+A direct test (`tests/test_losses.py::test_variance_loss_default_gradient_is_not_finite_at_full_collapse`) confirms `tf.math.reduce_std`'s gradient is non-finite when every embedding dimension has std exactly 0, while `sqrt(var + 1e-4)` gives a finite gradient in the same state. This is half of finding 10's untested hypothesis, now confirmed at the math level: both of finding 10's NaN runs (`warmup5`, `clip1`) reached full collapse (`corr^2` 1.0) shortly before going NaN, so a non-finite variance-loss gradient at that point is a plausible mechanism.
+
+It does not by itself explain the large-but-finite spikes in findings 1, 4, 12 and 13, since those never produced NaN and a real embedding landing at exactly 0 std is unlikely. A near-zero (not exactly zero) std could still produce a very large, merely finite, gradient through the same term, which an epsilon should also dampen, but that is a different claim and hasn't been checked.
+
+`variance_loss` now takes an optional `eps` (default 0, the original formula, bit-identical to before), threaded through as `--var-eps` in `train_vicreg.py` and `resume_pretrain.py`. No run has used a nonzero value yet.
+
 ## Next steps
 
 1. **Done: unconditional last-epoch checkpoint.**
 2. **Done: the instability, partially.** LR 0.003, a 5-epoch warmup and `--w-cov 4095` together were the only stable, decorrelated setup in the screening study, but a 5-seed sweep shows the fix reduces severity, not frequency: 3 of 5 seeds still hit an instability event (finding 13). The NaN hypothesis in finding 10 is still untested.
 3. **Done: baseline vs `--adaptive` at the fixed recipe (seed 0).** `--adaptive` fails for a specific, reproducible reason (finding 11) that does not depend on which seed hit it, verified with a CPU-only synthetic test. Whether seed 0's *baseline* number (56.5% kNN) is typical is less certain: see findings 12 and 13.
 4. **Done: a five-seed baseline sweep.** 3 of 5 seeds hit an instability event, at severities ranging over two orders of magnitude (finding 13). The instability itself (findings 1, 4, 10, 12, 13) is still not understood well enough to prevent, only to describe. A second `--adaptive` seed is still needed to know if its failure mode is as consistent as the mechanism in finding 11 suggests.
-5. **Fix or redesign `AdaptiveReweighter`.** One option: don't let magnitude balancing push `w_var` below `w0.var` at all, for example by clipping its multiplier to `[1.0, 5.0]` instead of `[0.2, 5.0]`, so a collapse can only increase pressure on the variance term, never decrease it. That only closes this one path, though; the deeper mismatch is that magnitude balancing weighs each term by its raw loss value, not by its actual weighted contribution to the gradient, so a differently-scaled `w0` could still trigger the same failure mode through a different route.
-6. **Fix `resume_pretrain.py`'s optimizer reset.** It loads weights before calling `trainer.compile()`, so a resumed run's optimizer state is not actually restored (finding 12). Compile first, or load into an already-compiled trainer.
-7. **Ablate `--adaptive-targets`.** Its default `nu` schedule starts at 1.0 and decays to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it.
-8. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
-9. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.
-10. **Investigate whether batch size 256 is itself part of the instability.** Every run in this log used 256 (an 8 GB GPU limit); the paper's batch sizes are much larger. Not yet tested as a variable on its own.
+5. **Done, pending re-run: `AdaptiveReweighter`'s variance floor.** The multiplier that could push `w_var` below `w0.var` is now clipped to `[1.0, 5.0]` instead of `[0.2, 5.0]`. Verified against finding 11's synthetic collapsed-regime test; not yet verified in an actual training run.
+6. **Done, pending re-run: `resume_pretrain.py`'s optimizer reset.** The optimizer is now compiled and built before its weights load, so a resumed run's momentum and variance state actually restores. Verified with a checkpoint round-trip test; the effect on a real resumed run's final result hasn't been re-checked (finding 12's resumed run predates the fix).
+7. **Pending: a second `--adaptive` seed, now with the fix from item 5.** Needed to know if `--adaptive`'s failure mode is as consistent as the mechanism in finding 11 suggests, and whether the fix actually helps.
+8. **Pending: ablate `--adaptive-targets`.** Its default `nu` schedule starts at 1.0 and decays to 0.0, so for most of training it pushes off-diagonal correlation toward redundancy instead of away from it.
+9. **Pending: try `--var-eps 1e-4`.** Finding 14 confirms `reduce_std`'s gradient is non-finite at exact collapse and an epsilon fixes that, but no run has tried it yet against a recipe known to spike (seeds 1, 3 or 4's).
+10. **Pending: investigate whether batch size 256 is itself part of the instability.** Every run in this log used 256 (an 8 GB GPU limit); the paper's batch sizes are much larger.
+11. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
+12. **Feed the runs into `src/vicreg_tf/report_metrics.py`** for the comparison plots and tables described in the README.

@@ -41,6 +41,40 @@ def test_variance_loss_accepts_tensor_gamma():
     assert abs(float(loss) - 0.7) < 1e-6
 
 
+def test_variance_loss_default_eps_matches_reduce_std_exactly():
+    rng = np.random.default_rng(0)
+    z = tf.constant(rng.normal(size=(64, 16)).astype("float32"))
+    default = float(variance_loss(z, gamma=1.0))
+    explicit_zero = float(variance_loss(z, gamma=1.0, eps=0.0))
+    assert default == explicit_zero
+
+
+def test_variance_loss_default_gradient_is_not_finite_at_full_collapse():
+    # This is finding 10's untested hypothesis: tf.math.reduce_std's gradient is undefined
+    # (0/0) at std == 0, unlike reference VICReg's sqrt(var + eps).
+    z = tf.Variable(tf.zeros([64, 16]))
+    with tf.GradientTape() as tape:
+        loss = variance_loss(z, gamma=1.0)
+    grad = tape.gradient(loss, z)
+    assert not bool(tf.reduce_all(tf.math.is_finite(grad)))
+
+
+def test_variance_loss_eps_gives_a_finite_gradient_at_full_collapse():
+    z = tf.Variable(tf.zeros([64, 16]))  # every dim std == 0, reduce_std's gradient there is undefined
+    with tf.GradientTape() as tape:
+        loss = variance_loss(z, gamma=1.0, eps=1e-4)
+    grad = tape.gradient(loss, z)
+    assert bool(tf.reduce_all(tf.math.is_finite(grad)))
+
+
+def test_variance_loss_eps_barely_changes_the_value_away_from_collapse():
+    rng = np.random.default_rng(0)
+    z = tf.constant(rng.normal(size=(4096, 16)).astype("float32"))  # std ~= 1.0, far from zero
+    without_eps = float(variance_loss(z, gamma=0.5))
+    with_eps = float(variance_loss(z, gamma=0.5, eps=1e-4))
+    assert abs(without_eps - with_eps) < 1e-3
+
+
 def test_covariance_loss_near_zero_for_independent_features():
     rng = np.random.default_rng(0)
     z = tf.constant(rng.normal(size=(8192, 8)).astype("float32"))

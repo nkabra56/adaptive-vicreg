@@ -158,6 +158,26 @@ def test_reweighter_respects_clip_bounds_under_extreme_inputs():
     assert 0.2 * w0.sim <= float(weights["sim"]) <= 5.0 * w0.sim * 4.0
 
 
+def test_reweighter_var_multiplier_never_drops_below_w0_even_when_dominant():
+    # A collapsed embedding makes l_var the largest raw term. Magnitude balancing must not use
+    # that as a reason to lower w_var below w0.var: that is the fixed point finding 11 describes.
+    w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
+    rw = AdaptiveReweighter(w0=w0, decay=0.9)
+    weights = _run_steps(
+        rw, 200, l_align=0.03, l_var=1.9, l_cov=0.02, z_probe=_collapsed_probe()
+    )
+    assert float(weights["var"]) >= w0.var - 1e-4
+
+
+def test_reweighter_var_mag_clip_override_restores_old_floor():
+    w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
+    rw = AdaptiveReweighter(w0=w0, decay=0.9, var_mag_clip=(0.2, 5.0))
+    weights = _run_steps(
+        rw, 200, l_align=0.03, l_var=1.9, l_cov=0.02, z_probe=_healthy_probe()
+    )
+    assert float(weights["var"]) < w0.var
+
+
 def test_reweighter_works_inside_tf_function():
     # This mirrors how train_step actually calls it (traced once by Keras .fit()).
     w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)

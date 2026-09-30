@@ -104,11 +104,13 @@ class VICRegTrainer(keras.Model):
         base_lr: float,
         base_wd: float,
         reweighter_kwargs: Optional[dict] = None,
+        var_eps: float = 0.0,
     ):
         super().__init__(name="vicreg_trainer")
         self.encoder = encoder
         self.projector = projector
         self.w0 = w0
+        self.var_eps = float(var_eps)
 
         self.adaptive_weights = bool(adaptive_weights)
         self.adaptive_targets = bool(adaptive_targets)
@@ -178,6 +180,7 @@ class VICRegTrainer(keras.Model):
                 w=VICRegWeights(sim=1.0, var=1.0, cov=1.0),
                 gamma=gamma,
                 nu=nu,
+                var_eps=self.var_eps,
             )
 
             weights = (
@@ -234,6 +237,7 @@ class VICRegTrainer(keras.Model):
             "min_scale": float(self.schedules.min_scale),
             "base_lr": float(self.schedules.base_lr),
             "base_wd": float(self.schedules.base_wd),
+            "var_eps": self.var_eps,
         }
 
     @classmethod

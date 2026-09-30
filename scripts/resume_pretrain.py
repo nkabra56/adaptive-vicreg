@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-cov", type=float, default=1.0,
                    help="Base weight of the covariance term. The paper sums squared covariances and divides "
                         "by the embedding width, so its weight of 1 matches about --proj-out minus 1 here.")
+    p.add_argument("--var-eps", type=float, default=0.0,
+                   help="Epsilon added under the square root in the variance loss. Must match the run being "
+                        "resumed.")
     p.add_argument("--adaptive", action="store_true",
                    help="Adaptive loss weighting. Must match the run being resumed.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -128,10 +131,10 @@ def main() -> None:
                 "k_std": args.var_boost_k,
                 "k_cov": args.cov_boost_k,
             },
+            var_eps=args.var_eps,
         )
 
         force_build_for_saving(trainer, encoder, projector, args.image_size)
-        safe_load_trainer_weights(trainer, args.ckpt)
 
         opt = keras.optimizers.AdamW(
             learning_rate=base_lr,
@@ -139,6 +142,12 @@ def main() -> None:
             clipnorm=args.clipnorm if args.clipnorm > 0 else None,
         )
         trainer.compile(optimizer=opt)
+        # Create the optimizer's slot variables (momentum, variance) now, with the right shapes,
+        # so load_weights below actually restores them from the checkpoint instead of finding no
+        # optimizer state to load into and silently starting cold.
+        opt.build(encoder.trainable_variables + projector.trainable_variables)
+
+        safe_load_trainer_weights(trainer, args.ckpt)
 
         # curr_step is a tf.Variable. Assigning a plain int would replace it and break train_step's
         # assign_add, so use .assign().

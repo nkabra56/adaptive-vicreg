@@ -32,6 +32,7 @@ def test_train_flags_default_to_the_old_behavior(monkeypatch):
     args = module.parse_args()
     assert (args.warmup_epochs, args.clipnorm, args.stop_epoch) == (0.0, 0.0, None)
     assert (args.w_sim, args.w_var, args.w_cov) == (25.0, 25.0, 1.0)
+    assert args.var_eps == 0.0
 
 
 @pytest.mark.parametrize(

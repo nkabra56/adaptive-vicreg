@@ -145,7 +145,11 @@ class AdaptiveReweighter:
     Two signals are combined:
 
     * Loss-magnitude balancing. A bias-corrected EMA of each raw loss term gives a multiplier of
-      mean(EMA) / EMA(term), clipped to `mag_clip`, so no term dominates only because of its scale.
+      mean(EMA) / EMA(term), so no term dominates only because of its scale. Sim and cov are clipped
+      to `mag_clip`; var is clipped to `var_mag_clip`, which floors at 1.0 by default so magnitude
+      balancing can only raise the variance weight above `w0.var`, never lower it. A collapsed
+      embedding makes `l_var` the largest raw term, and lowering its weight in that state is exactly
+      the wrong direction: it removes pressure from the one term that needs it, with no way back.
     * Embedding-health boost (var and cov only). EMAs of the probe embedding's mean per-dimension std
       and mean squared off-diagonal correlation raise the var weight when std falls below `std_target`
       and the cov weight when correlation rises above `corr_target`, by at most `boost_clip`.
@@ -162,6 +166,7 @@ class AdaptiveReweighter:
         w0: VICRegWeights,
         decay: float = 0.98,
         mag_clip: tuple[float, float] = (0.2, 5.0),
+        var_mag_clip: Optional[tuple[float, float]] = None,
         std_target: float = 1.0,
         corr_target: float = 0.0,
         k_std: float = 2.0,
@@ -173,6 +178,7 @@ class AdaptiveReweighter:
         self.w0 = w0
         self.decay = float(decay)
         self.mag_lo, self.mag_hi = mag_clip
+        self.var_mag_lo, self.var_mag_hi = var_mag_clip if var_mag_clip is not None else (1.0, self.mag_hi)
         self.std_target = float(std_target)
         self.corr_target = float(corr_target)
         self.k_std = float(k_std)
@@ -202,7 +208,7 @@ class AdaptiveReweighter:
 
         mean_ema = (ema_align + ema_var + ema_cov) / 3.0
         mag_sim = tf.clip_by_value(mean_ema / (ema_align + eps), self.mag_lo, self.mag_hi)
-        mag_var = tf.clip_by_value(mean_ema / (ema_var + eps), self.mag_lo, self.mag_hi)
+        mag_var = tf.clip_by_value(mean_ema / (ema_var + eps), self.var_mag_lo, self.var_mag_hi)
         mag_cov = tf.clip_by_value(mean_ema / (ema_cov + eps), self.mag_lo, self.mag_hi)
 
         z = tf.convert_to_tensor(z_probe)

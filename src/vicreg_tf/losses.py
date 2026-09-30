@@ -29,16 +29,24 @@ def invariance_loss(z1: tf.Tensor, z2: tf.Tensor) -> tf.Tensor:
     return tf.reduce_mean(tf.square(z1 - z2))
 
 
-def variance_loss(z: tf.Tensor, gamma) -> tf.Tensor:
+def variance_loss(z: tf.Tensor, gamma, eps: float = 0.0) -> tf.Tensor:
     """mean(relu(gamma - std)) over feature dimensions, so each dimension keeps a std of at least `gamma`.
 
-    `gamma` may be a float or a tensor.
+    `gamma` may be a float or a tensor. `eps` adds a floor to the variance before the square root
+    (`std = sqrt(var + eps)`, as in reference VICReg) instead of `tf.math.reduce_std`'s plain
+    `sqrt(var)`, which has an undefined gradient at var == 0. 0 (the default) keeps the original
+    `reduce_std` formula exactly, for bit-identical results with every existing recipe.
     """
     z = tf.convert_to_tensor(z)
     if z.shape.rank is not None and z.shape.rank > 2:
         z = tf.reshape(z, [tf.shape(z)[0], -1])
 
-    std = tf.math.reduce_std(z, axis=0)
+    if eps:
+        mean = tf.reduce_mean(z, axis=0, keepdims=True)
+        var = tf.reduce_mean(tf.square(z - mean), axis=0)
+        std = tf.sqrt(var + tf.cast(eps, var.dtype))
+    else:
+        std = tf.math.reduce_std(z, axis=0)
     # No float(gamma) here: it can be a symbolic tensor inside train_step.
     gamma_t = tf.cast(tf.convert_to_tensor(gamma), std.dtype)
     return tf.reduce_mean(tf.nn.relu(gamma_t - std))
@@ -73,6 +81,7 @@ def vicreg_total(
     w: VICRegWeights | dict,
     gamma=1.0,
     nu=0.0,
+    var_eps: float = 0.0,
 ) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
     """Weighted VICReg loss and its unweighted components.
 
@@ -81,6 +90,7 @@ def vicreg_total(
         w: Weights for the (sim, var, cov) terms, as a `VICRegWeights` or a dict.
         gamma: Variance floor. Float or tensor.
         nu: Target for off-diagonal correlations. Float or tensor.
+        var_eps: Passed through to `variance_loss`. 0 (the default) keeps the original formula.
 
     Returns:
         The weighted total, and the unweighted terms keyed "l_align", "l_var", "l_cov".
@@ -95,7 +105,7 @@ def vicreg_total(
     cov_w = tf.cast(tf.convert_to_tensor(cov_w), tf.float32)
 
     align = invariance_loss(z1, z2)
-    var = variance_loss(z1, gamma) + variance_loss(z2, gamma)
+    var = variance_loss(z1, gamma, var_eps) + variance_loss(z2, gamma, var_eps)
     cov = covariance_loss(z1, nu) + covariance_loss(z2, nu)
 
     total = sim_w * align + var_w * var + cov_w * cov

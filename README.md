@@ -14,12 +14,12 @@ The paper weights the three terms 25, 25 and 1. This repo adds two optional mech
 
 **`--adaptive`** picks the three weights again at every step, using two signals:
 
-1. *Magnitude balancing.* A moving average of each raw loss term sets a multiplier (clipped to 0.2x-5x). Terms that are large compared to the others get smaller weights, so none dominates just because of its scale.
+1. *Magnitude balancing.* A moving average of each raw loss term sets a multiplier. Sim and cov are clipped to 0.2x-5x; var is clipped to 1x-5x, so this signal alone can raise the variance weight but never lower it below the base weight. Terms that are large compared to the others otherwise get smaller weights, so none dominates just because of its scale.
 2. *Embedding health.* Moving averages of the embedding's mean per-dimension std and mean squared off-diagonal correlation boost the variance weight when std falls below 1 and the covariance weight when correlation rises (up to 4x).
 
 **`--adaptive-targets`** changes what the loss aims for instead of how the terms are weighted. The correlation target `nu` decays from 1.0 to 0.0 over training, and the variance floor `gamma` stays at 1.0. It can be combined with `--adaptive`.
 
-In a full 100-epoch comparison `--adaptive` performed much worse than plain VICReg at the same seed: 35.6% against 56.5% kNN top-1 with everything else held fixed. Once the variance term collapses, magnitude balancing sees its raw loss as large relative to the other two and pushes its weight down (while pushing invariance and covariance up to their 5x ceiling), so there is no mechanism to recover. This weight-assignment behavior is verified independent of the covariance weight's scale, though only one `--adaptive` seed has been run, so whether a run always reaches this collapsed state is not yet confirmed; see finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md).
+In a 100-epoch comparison `--adaptive` performed much worse than plain VICReg at the same seed: 35.6% against 56.5% kNN top-1 with everything else held fixed. Before the fix described above, magnitude balancing could lower the variance weight below baseline once the variance term was large relative to the other two, which is exactly the state of a collapsed embedding, leaving no mechanism to recover. That fixed point is closed now (the variance multiplier can no longer go below 1x), but it hasn't been re-run yet to confirm the fix actually helps; see finding 11 in [EXPERIMENTS.md](EXPERIMENTS.md) for the original mechanism and the code-level test behind it.
 
 The encoder is a six-layer CNN (three stages of two 3x3 conv, batch norm, ReLU blocks) with global average pooling and a linear layer. The projector is an MLP with 1 to 3 layers.
 
@@ -63,7 +63,7 @@ python3 scripts/train_vicreg.py \
 
 The last three flags matter. The paper sums the squared covariances and divides by the embedding width, while `losses.py` takes their mean, so a covariance weight of 1 here is about `--proj-out` times weaker than the paper's. `--w-cov 4095` restores the paper's scale for `--proj-out 4096`. On its own that spiked, and a high LR on its own left the projector collapsed. Together with a 5-epoch warmup they were the only stable, decorrelated setup in the screening runs ([EXPERIMENTS.md](EXPERIMENTS.md)). The script defaults (`--lr 0.01`, `--w-cov 1`, no warmup) still reproduce the earlier runs.
 
-Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. `--warmup-epochs N` (with `--use-schedules`) ramps the LR up before the cosine decay, `--clipnorm X` clips gradients, and `--stop-epoch N` stops early while keeping the LR schedule sized for `--epochs`. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
+Add `--adaptive` for Adaptive VICReg, `--adaptive-targets` for the target schedule, `--seed N` for a reproducible run, and `--device cpu` to force the CPU. `--warmup-epochs N` (with `--use-schedules`) ramps the LR up before the cosine decay, `--clipnorm X` clips gradients, and `--stop-epoch N` stops early while keeping the LR schedule sized for `--epochs`. `--var-eps X` adds an epsilon under the variance loss's square root (`sqrt(var + eps)`, as in reference VICReg) instead of the default plain `sqrt(var)`, which has an undefined gradient at a fully collapsed dimension; 0 (the default) keeps the original formula. The results below used `--batch-size 512`, which ran out of memory on an 8 GB GPU.
 
 Each run writes to `checkpoints_tf/<run-name>_<timestamp>/`:
 

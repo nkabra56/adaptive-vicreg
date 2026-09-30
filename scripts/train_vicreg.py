@@ -65,6 +65,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-cov", type=float, default=1.0,
                    help="Base weight of the covariance term. The paper sums squared covariances and divides "
                         "by the embedding width, so its weight of 1 matches about --proj-out minus 1 here.")
+    p.add_argument("--var-eps", type=float, default=0.0,
+                   help="Epsilon added under the square root in the variance loss (std = sqrt(var + eps)), "
+                        "as in reference VICReg. 0 keeps the original tf.math.reduce_std formula, which has "
+                        "an undefined gradient at var == 0.")
     p.add_argument("--adaptive", action="store_true",
                    help="Reweight the loss terms every step (Adaptive VICReg). Omit for constant weights.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -147,6 +151,7 @@ def main() -> None:
                 "w_sim": args.w_sim,
                 "w_var": args.w_var,
                 "w_cov": args.w_cov,
+                "var_eps": args.var_eps,
                 "adaptive": args.adaptive,
                 "adaptive_targets": args.adaptive_targets,
                 "ema_decay": args.ema_decay,
@@ -190,6 +195,7 @@ def main() -> None:
                 "k_std": args.var_boost_k,
                 "k_cov": args.cov_boost_k,
             },
+            var_eps=args.var_eps,
         )
         trainer.compile(optimizer=opt)
 

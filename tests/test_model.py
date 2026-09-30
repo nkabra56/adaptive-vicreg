@@ -89,6 +89,46 @@ def test_checkpoint_roundtrip_restores_encoder_weights(tmp_path):
         np.testing.assert_array_equal(expected, restored)
 
 
+def test_optimizer_state_survives_checkpoint_when_built_before_load(tmp_path):
+    # Mirrors the fix in resume_pretrain.py: the optimizer's slot variables (momentum, variance)
+    # must exist, with the right shapes, before load_weights runs, or there is nothing for the
+    # checkpoint's saved optimizer state to load into.
+    trainer, enc = _trainer()
+    trainer.fit(_pairs(), epochs=1, steps_per_epoch=3, verbose=0)  # give AdamW real, nonzero momentum
+    path = str(tmp_path / "full.weights.h5")
+    trainer.save_weights(path)
+    saved_opt_values = [v.numpy() for v in trainer.optimizer.variables]
+    assert any(np.any(v != 0) for v in saved_opt_values)  # not just comparing zeros below
+
+    fresh, fresh_enc = _trainer()
+    fresh.optimizer.build(fresh_enc.trainable_variables + fresh.projector.trainable_variables)
+    safe_load_trainer_weights(fresh, path)
+    restored_opt_values = [v.numpy() for v in fresh.optimizer.variables]
+
+    assert len(restored_opt_values) == len(saved_opt_values)
+    for expected, restored in zip(saved_opt_values, restored_opt_values):
+        np.testing.assert_array_equal(expected, restored)
+
+
+def test_optimizer_state_is_unavailable_to_load_without_building_first(tmp_path):
+    # The bug this guards against: compiling a fresh optimizer and loading weights straight away,
+    # without building its slot variables first, leaves no optimizer state for the checkpoint to
+    # restore into, even though the checkpoint has some.
+    trainer, enc = _trainer()
+    trainer.fit(_pairs(), epochs=1, steps_per_epoch=3, verbose=0)
+    path = str(tmp_path / "full.weights.h5")
+    trainer.save_weights(path)
+    saved_opt_values = trainer.optimizer.variables
+
+    fresh, _ = _trainer()  # compiled, never built or fit
+    # A compiled-but-unbuilt AdamW only has its two base variables (iteration, learning_rate),
+    # none of the per-weight momentum and velocity slots the checkpoint actually has state for.
+    before = len(fresh.optimizer.variables)
+    assert before < len(saved_opt_values)
+    safe_load_trainer_weights(fresh, path)
+    assert len(fresh.optimizer.variables) == before  # nothing was restored; still no slots to hold it
+
+
 def test_safe_load_reports_a_missing_checkpoint(tmp_path):
     trainer, _ = _trainer()
     with pytest.raises(FileNotFoundError):
