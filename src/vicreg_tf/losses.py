@@ -29,13 +29,21 @@ def invariance_loss(z1: tf.Tensor, z2: tf.Tensor) -> tf.Tensor:
     return tf.reduce_mean(tf.square(z1 - z2))
 
 
-def variance_loss(z: tf.Tensor, gamma, eps: float = 0.0) -> tf.Tensor:
+def variance_loss(z: tf.Tensor, gamma, eps: float = 0.0, gamma_hi: float = 0.0) -> tf.Tensor:
     """mean(relu(gamma - std)) over feature dimensions, so each dimension keeps a std of at least `gamma`.
 
     `gamma` may be a float or a tensor. `eps` adds a floor to the variance before the square root
     (`std = sqrt(var + eps)`, as in reference VICReg) instead of `tf.math.reduce_std`'s plain
     `sqrt(var)`, which has an undefined gradient at var == 0. 0 (the default) keeps the original
     `reduce_std` formula exactly, for bit-identical results with every existing recipe.
+
+    `gamma_hi`, if nonzero, adds a soft ceiling: `relu(std - gamma_hi)`, so a dimension whose std
+    grows past `gamma_hi` gets pulled back down. The one-sided version has exactly zero gradient
+    once `std >= gamma`, so nothing in the loss resists `std` growing arbitrarily large once the
+    floor is already satisfied; a run that drifts into that state (see EXPERIMENTS.md finding 24)
+    has no restoring force from this term at all. 0 (the default) disables the ceiling, matching
+    the original formula exactly. Must be a plain float, not a tensor, and greater than `gamma` to
+    have any effect in the ordinary case.
     """
     z = tf.convert_to_tensor(z)
     if z.shape.rank is not None and z.shape.rank > 2:
@@ -49,7 +57,11 @@ def variance_loss(z: tf.Tensor, gamma, eps: float = 0.0) -> tf.Tensor:
         std = tf.math.reduce_std(z, axis=0)
     # No float(gamma) here: it can be a symbolic tensor inside train_step.
     gamma_t = tf.cast(tf.convert_to_tensor(gamma), std.dtype)
-    return tf.reduce_mean(tf.nn.relu(gamma_t - std))
+    loss = tf.nn.relu(gamma_t - std)
+    if gamma_hi:
+        gamma_hi_t = tf.cast(gamma_hi, std.dtype)
+        loss = loss + tf.nn.relu(std - gamma_hi_t)
+    return tf.reduce_mean(loss)
 
 
 def covariance_loss(z: tf.Tensor, nu) -> tf.Tensor:
@@ -82,6 +94,7 @@ def vicreg_total(
     gamma=1.0,
     nu=0.0,
     var_eps: float = 0.0,
+    var_gamma_hi: float = 0.0,
 ) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
     """Weighted VICReg loss and its unweighted components.
 
@@ -91,6 +104,7 @@ def vicreg_total(
         gamma: Variance floor. Float or tensor.
         nu: Target for off-diagonal correlations. Float or tensor.
         var_eps: Passed through to `variance_loss`. 0 (the default) keeps the original formula.
+        var_gamma_hi: Passed through to `variance_loss`. 0 (the default) disables the soft ceiling.
 
     Returns:
         The weighted total, and the unweighted terms keyed "l_align", "l_var", "l_cov".
@@ -105,7 +119,10 @@ def vicreg_total(
     cov_w = tf.cast(tf.convert_to_tensor(cov_w), tf.float32)
 
     align = invariance_loss(z1, z2)
-    var = variance_loss(z1, gamma, var_eps) + variance_loss(z2, gamma, var_eps)
+    var = (
+        variance_loss(z1, gamma, var_eps, var_gamma_hi)
+        + variance_loss(z2, gamma, var_eps, var_gamma_hi)
+    )
     cov = covariance_loss(z1, nu) + covariance_loss(z2, nu)
 
     total = sim_w * align + var_w * var + cov_w * cov

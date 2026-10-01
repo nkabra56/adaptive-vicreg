@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--var-eps", type=float, default=0.0,
                    help="Epsilon added under the square root in the variance loss. Must match the run being "
                         "resumed.")
+    p.add_argument("--var-gamma-hi", type=float, default=0.0,
+                   help="Soft ceiling on the variance loss. Must match the run being resumed.")
     p.add_argument("--adaptive", action="store_true",
                    help="Adaptive loss weighting. Must match the run being resumed.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -135,6 +137,7 @@ def main() -> None:
                 "k_cov": args.cov_boost_k,
             },
             var_eps=args.var_eps,
+            var_gamma_hi=args.var_gamma_hi,
         )
 
         force_build_for_saving(trainer, encoder, projector, args.image_size)

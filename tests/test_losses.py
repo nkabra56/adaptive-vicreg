@@ -41,6 +41,40 @@ def test_variance_loss_accepts_tensor_gamma():
     assert abs(float(loss) - 0.7) < 1e-6
 
 
+def test_variance_loss_gamma_hi_disabled_by_default_matches_old_formula():
+    rng = np.random.default_rng(0)
+    z = tf.constant(rng.normal(size=(64, 16), scale=5.0).astype("float32"))  # std ~= 5, well past 1.0
+    default = float(variance_loss(z, gamma=1.0))
+    explicit_zero = float(variance_loss(z, gamma=1.0, gamma_hi=0.0))
+    assert default == explicit_zero == 0.0  # old one-sided formula: no penalty for std > gamma
+
+
+def test_variance_loss_gamma_hi_penalizes_std_above_the_ceiling():
+    rng = np.random.default_rng(0)
+    z = tf.constant(rng.normal(size=(4096, 16), scale=5.0).astype("float32"))  # std ~= 5.0
+    loss = variance_loss(z, gamma=1.0, gamma_hi=2.0)
+    assert float(loss) > 0.0  # std (~5) is past the ceiling (2.0), unlike the one-sided formula
+
+
+def test_variance_loss_gamma_hi_leaves_the_healthy_middle_alone():
+    rng = np.random.default_rng(0)
+    z = tf.constant(rng.normal(size=(4096, 16), scale=1.5).astype("float32"))  # std ~= 1.5
+    loss = variance_loss(z, gamma=1.0, gamma_hi=3.0)  # between the floor and the ceiling
+    assert float(loss) == 0.0
+
+
+def test_variance_loss_gamma_hi_gives_a_nonzero_gradient_past_the_ceiling():
+    # The motivating case (EXPERIMENTS.md finding 24): the one-sided floor has zero gradient once
+    # std >= gamma, so nothing in the loss resists std growing without bound from there. A soft
+    # ceiling should restore a nonzero, finite gradient once std grows past it.
+    z = tf.Variable(tf.random.normal([64, 16], mean=0.0, stddev=20.0, seed=0))  # std far past any ceiling
+    with tf.GradientTape() as tape:
+        loss = variance_loss(z, gamma=1.0, gamma_hi=2.0)
+    grad = tape.gradient(loss, z)
+    assert bool(tf.reduce_all(tf.math.is_finite(grad)))
+    assert float(tf.reduce_sum(tf.abs(grad))) > 0.0
+
+
 def test_variance_loss_default_eps_matches_reduce_std_exactly():
     rng = np.random.default_rng(0)
     z = tf.constant(rng.normal(size=(64, 16)).astype("float32"))
@@ -123,3 +157,13 @@ def test_vicreg_total_accepts_dict_weights():
     total_dc, _ = vicreg_total(z1, z2, w=VICRegWeights(sim=2.0, var=3.0, cov=4.0), gamma=1.0, nu=0.0)
     total_dict, _ = vicreg_total(z1, z2, w={"sim": 2.0, "var": 3.0, "cov": 4.0}, gamma=1.0, nu=0.0)
     assert abs(float(total_dc) - float(total_dict)) < 1e-6
+
+
+def test_vicreg_total_var_gamma_hi_raises_l_var_for_an_exploded_embedding():
+    z1 = tf.random.normal([64, 16], mean=0.0, stddev=20.0, seed=9)
+    z2 = tf.random.normal([64, 16], mean=0.0, stddev=20.0, seed=10)
+    w = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
+    _, off = vicreg_total(z1, z2, w=w, gamma=1.0, nu=0.0, var_gamma_hi=0.0)
+    _, on = vicreg_total(z1, z2, w=w, gamma=1.0, nu=0.0, var_gamma_hi=2.0)
+    assert float(off["l_var"]) == 0.0  # old formula: no penalty for std far above gamma
+    assert float(on["l_var"]) > 0.0

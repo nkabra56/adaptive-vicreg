@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
                    help="Epsilon added under the square root in the variance loss (std = sqrt(var + eps)), "
                         "as in reference VICReg. 0 keeps the original tf.math.reduce_std formula, which has "
                         "an undefined gradient at var == 0.")
+    p.add_argument("--var-gamma-hi", type=float, default=0.0,
+                   help="Soft ceiling on the variance loss: relu(std - gamma-hi) added on top of the usual "
+                        "relu(gamma - std) floor, so a dimension's std growing past this value is penalized "
+                        "too. 0 disables it, matching the original one-sided formula. The one-sided floor has "
+                        "zero gradient once std >= gamma, so nothing in the loss otherwise resists std growing "
+                        "arbitrarily large once the floor is satisfied.")
     p.add_argument("--adaptive", action="store_true",
                    help="Reweight the loss terms every step (Adaptive VICReg). Omit for constant weights.")
     p.add_argument("--adaptive-targets", action="store_true",
@@ -168,6 +174,7 @@ def main() -> None:
                 "w_var": args.w_var,
                 "w_cov": args.w_cov,
                 "var_eps": args.var_eps,
+                "var_gamma_hi": args.var_gamma_hi,
                 "adaptive": args.adaptive,
                 "adaptive_targets": args.adaptive_targets,
                 "ema_decay": args.ema_decay,
@@ -214,6 +221,7 @@ def main() -> None:
                 "k_cov": args.cov_boost_k,
             },
             var_eps=args.var_eps,
+            var_gamma_hi=args.var_gamma_hi,
             track_batch_diagnostics=args.per_batch_diagnostics,
         )
         trainer.compile(optimizer=opt)
