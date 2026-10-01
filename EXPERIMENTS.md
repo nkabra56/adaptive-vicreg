@@ -291,6 +291,41 @@ Verified in two synthetic regime tests in `tests/test_schedules.py` that reprodu
 
 This is a mechanism-level fix verified only in a synthetic, CPU-only test; no real training run has used it yet. The next step is a full `--adaptive` run (or two, matching findings 11/15's seeds) with the new default `trend_decay` to see whether it actually recovers baseline-level accuracy, not just avoids the specific failure signature findings 11 and 15 described.
 
+### Finding 21: the trend-relative fix holds up in real training, seed 1 lands within 2 points of clean baseline
+
+Two full 100-epoch `--adaptive` runs at seeds 0 and 1 (matching findings 11 and 15's seeds), with the new trend-relative reweighter and its default `trend_decay=0.995`, at `checkpoints_tf/adaptive-trend-s0_20261001-0623` and `checkpoints_tf/adaptive-trend-s1_20261001-0716`.
+
+| Method | Seed | Linear (best) | kNN (best) | Linear (last) | kNN (last) |
+|---|---|---|---|---|---|
+| AdaptiveVICReg, trend-relative | 0 | 53.58% | 47.43% | 52.89% | 47.43% |
+| AdaptiveVICReg, trend-relative | 1 | **59.75%** | **52.98%** | **60.11%** | **53.07%** |
+
+Both beat the old floor-only fix (finding 15: 46.4%/45.2% and 41.8%/38.8%). Seed 1 in particular lands within about 2 points of a clean baseline run (56-60% kNN) and within about 1.5 points on linear, a real recovery, not just an improvement over a broken baseline. Seed 0 improved less (53.6%/47.4%, still meaningfully short of baseline's 61-62%/56-60%), so the fix helps but doesn't fully close the gap in every seed; `--trend-decay`'s default (0.995) is a reasoned choice, not a tuned one, and the two seeds' different outcomes suggest it may not be equally well-matched to every run's loss trajectory. Not yet tried: `--adaptive-targets` combined with the new reweighter, or tuning `trend_decay` itself.
+
+### Finding 22: `--per-batch-diagnostics` caught a spike directly, and it's an explosion, not a collapse
+
+Ran the baseline recipe at seed 1 (the exact recipe that spiked at epoch 14 in finding 12) with `--per-batch-diagnostics --per-batch-diagnostics-every 5`. This run spiked at **epoch 11** instead of epoch 14, the same seed and recipe producing yet another different spike epoch, consistent with finding 19's conclusion that epoch number itself isn't the signal. `checkpoints_tf/diag-s1recipe_20261001-0809/metrics/history_batches.jsonl` has the event at batch-level resolution:
+
+| global_batch | batch (of 195) | `avg_std` | `min_std` | `corr_sq` | `grad_norm` (var+cov, probe) | `align` (running mean) |
+|---|---|---|---|---|---|---|
+| 2020 | 69 | 1.57 | 0.74 | 0.10 | 0.27 | 0.87 |
+| 2025 | 74 | 2.48 | 1.19 | 0.08 | 0.15 | 0.90 |
+| 2030 | 79 | 7.54 | 3.21 | 0.11 | 0.07 | 0.94 |
+| 2035 | 84 | 161.8 | 10.08 | 0.75 | 0.15 | 1.92 |
+| 2040 | 89 | 3,108.9 | 264.6 | 0.70 | 0.17 | 4.39 |
+| **2045** | **94** | **14,198.3** | **206.2** | **0.83** | **0.09** | **10.55** |
+| 2050 | 99 | 9,289.8 | 38.6 | 0.95 | 0.04 | 12.56 |
+
+Three things this localizes that per-epoch logging couldn't:
+
+1. **It's gradual at batch resolution, not instantaneous.** The blowup builds over about 30 batches (roughly 15% of one epoch), growing by somewhere between 2x and 20x per 5-batch window at its worst, not a single bad batch. By the next epoch (12), it's already most of the way back down.
+2. **`min_std` explodes in lockstep with `avg_std`** (0.74 to 264.6, the same order of magnitude move). Every dimension is blowing up together, not one dimension collapsing while others stay healthy. "Collapse" is the wrong word for this event: for this ~30-batch window the embedding is exploding outward, the opposite direction from the `avg_std`-near-zero collapse the `--adaptive` failures (findings 11, 15) describe. (The eventual *undershoot* after the correction, where `l_var` stays elevated for the rest of the run in findings 13/17/19, is a collapse, just a later and smaller one than this initial explosion.)
+3. **The variance+covariance gradient on the probe batch is not what's driving it.** `probe/grad_norm_last_layer` (gradient of `variance_loss + covariance_loss` on the fixed probe, w.r.t. the encoder's last layer) is actually falling during the worst of the blowup (0.27 down to 0.09), not rising. Whatever is pushing the embedding outward this fast isn't visible in this particular gradient. Two real gaps in what this diagnostic measures: it never captures the invariance loss's gradient (not computed at all), and it measures the probe batch's gradient, not the actual training batch's at each step, which could be behaving very differently in the moment the explosion starts.
+
+One more thing noticed in passing: `train_vicreg.py`'s callback list does not include `LossExplosionGuard` (the LR-cutting callback `resume_pretrain.py` does use). Every spike documented in this file so far, including this one, happened with no such guard active. Whether adding one would help or just mask the event differently hasn't been tested.
+
+Root cause is still not identified. What this run adds: the event is a within-epoch explosion lasting on the order of 30 batches, affects the whole embedding rather than a single dimension, and isn't explained by the one gradient signal measured so far. A tighter follow-up (`--per-batch-diagnostics-every 1` over just the suspect epoch via `--stop-epoch`, plus a gradient-norm measurement on the real training batch rather than only the fixed probe, and on the invariance loss too) would be needed to go further.
+
 ## Comparison report
 
 `src/vicreg_tf/report_metrics.py` was run over all 12 tracked runs above (five baseline seeds, the original broken `--adaptive` seed, the two fixed-reweighter seeds, both `--adaptive-targets` seeds, both batch-128 seeds), writing overlaid loss and embedding-stats plots plus summary tables to `reports/full_comparison/` (gitignored). The `stats/avg_std` overlay makes findings 11, 13, 15 and 17 visible on one plot: the broken `--adaptive` run flat at 0.1, the spiked seeds' sharp jump before settling near 0.45-0.5, and the clean and fixed-reweighter runs all converging near 1.0-1.15.
@@ -339,9 +374,9 @@ python3 src/vicreg_tf/report_metrics.py --out-dir reports/full_comparison \
 7. **Done: `--adaptive-targets` ablation.** Its apparent underperformance was mostly a checkpoint-selection artifact: the decaying `nu` makes loss rise as the representation genuinely improves, so best-loss picks a nearly redundant early epoch. Read from the last epoch, it performs close to baseline (finding 16).
 8. **Done: `--var-eps 1e-4` against two recipes known to spike.** It did not prevent either spike (finding 18). The epsilon fixes finding 10's NaN cases, not the large-but-finite spikes; their cause is still open.
 9. **Partially done: batch size 128 as an instability variable.** One of two seeds failed; finding 19 corrects finding 17 to say it was a sharp spike after all (overlapping with a separate gradual decline), not purely gradual. Two seeds isn't enough to compare failure rates against batch 256's five-seed sample.
-10. **Open, hypotheses narrowed: the instability's root cause.** Finding 19 rules out any per-epoch threshold, step-count clustering, and a weighted-covariance anomaly as leading indicators; the trigger almost certainly fires within a single epoch's batches, which per-epoch logging can't resolve. `PerBatchDiagnosticsLogger` (`--per-batch-diagnostics`) is built and ready; no GPU run has used it yet.
-11. **Done, pending GPU validation: redesign `AdaptiveReweighter`'s magnitude balancing.** Switched from competitor-relative to trend-relative (fast/slow EMA) balancing, which fixes finding 15's regime in a synthetic test without reopening finding 11's (finding 20). No real training run has confirmed it yet.
+10. **Open, localized further: the instability's root cause.** Finding 19 ruled out per-epoch thresholds, step-count clustering and a weighted-covariance anomaly as leading indicators. A `--per-batch-diagnostics` run (finding 22) then caught a real event directly: it's a whole-embedding explosion (not a single-dimension collapse) building over about 30 batches, not explained by the variance+covariance gradient on the probe batch, which actually falls during the blowup. Root cause still unknown; the two gaps in the diagnostic itself (no invariance-loss gradient, probe batch instead of the real training batch) are the natural next thing to close.
+11. **Done, validated on GPU: redesign `AdaptiveReweighter`'s magnitude balancing.** Trend-relative (fast/slow EMA) balancing (finding 20) was confirmed on two real 100-epoch `--adaptive` runs (finding 21): seed 1 lands within about 2 points of clean baseline, seed 0 improves substantially but not all the way. A real fix, not fully closing the gap in every seed.
 12. **Decide the default for `--w-cov`.** It defaults to 1, which finding 6 shows is about D times weaker than the paper's scale. Changing the default improves results but changes what "baseline" means for anyone already using this repo.
 13. **Done: fed all 12 tracked runs into `report_metrics.py`.** See the "Comparison report" section above for the command and what the plots show.
-14. **Pending: a GPU run with `--per-batch-diagnostics`** against seed 1's or seed 3's recipe (both spiked at epoch 14), to try to catch the trigger in the act.
-15. **Pending: a full `--adaptive` run (or two) with the new trend-relative reweighter**, to see whether finding 20's synthetic-test fix holds up and actually recovers baseline-level accuracy.
+14. **Open: close the two gaps in `--per-batch-diagnostics`** (finding 22): measure the invariance loss's gradient too, and the real training batch's gradient, not just the fixed probe's, for a follow-up run targeting the same ~30-batch window.
+15. **Open: tune or seed-sweep `--trend-decay`.** Finding 21's two seeds landed at different distances from baseline; whether that's seed noise or a tuning issue for the new flag's default (0.995) isn't known yet.
