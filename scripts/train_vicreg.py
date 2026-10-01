@@ -214,6 +214,7 @@ def main() -> None:
                 "k_cov": args.cov_boost_k,
             },
             var_eps=args.var_eps,
+            track_batch_diagnostics=args.per_batch_diagnostics,
         )
         trainer.compile(optimizer=opt)
 

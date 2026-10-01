@@ -61,6 +61,25 @@ def test_fit_logs_finite_metrics_for_every_flag_combination(flags):
         assert history["w_cov"] == pytest.approx([1.0])
 
 
+def test_batch_diagnostics_are_absent_by_default():
+    trainer, _ = _trainer()
+    history = trainer.fit(_pairs(), epochs=1, steps_per_epoch=2, verbose=0).history
+    assert "batch_grad_norm_total_last_layer" not in history
+
+
+def test_batch_diagnostics_present_and_finite_when_enabled():
+    trainer, _ = _trainer(track_batch_diagnostics=True)
+    history = trainer.fit(_pairs(), epochs=1, steps_per_epoch=2, verbose=0).history
+    for key in (
+        "batch_grad_norm_total_last_layer", "batch_grad_norm_align_last_layer",
+        "batch_grad_norm_varcov_last_layer", "batch_z1_avg_std", "batch_z1_min_std",
+    ):
+        assert key in history
+        assert np.isfinite(history[key]).all(), key
+    assert all(g >= 0 for g in history["batch_grad_norm_total_last_layer"])
+    assert all(a <= s for a, s in zip(history["batch_z1_min_std"], history["batch_z1_avg_std"]))
+
+
 def test_get_config_is_json_serializable_and_reports_settings():
     trainer, _ = _trainer(adaptive_weights=True)
     cfg = trainer.get_config()

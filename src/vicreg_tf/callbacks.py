@@ -358,9 +358,11 @@ class PerBatchDiagnosticsLogger(keras.callbacks.Callback):
                 z = tf.cast(z, tf.float32)
             probe_loss = variance_loss(z, self.gamma, self.var_eps) + covariance_loss(z, self.nu)
         grads = tape.gradient(probe_loss, last_vars)
+        # A None entry is a zero gradient (for example a ReLU's dead zone), not a missing value;
+        # 0.0 when every entry is None.
         sq_norms = [tf.reduce_sum(tf.square(g)) for g in grads if g is not None]
         if not sq_norms:
-            return tf.constant(float("nan"))
+            return tf.constant(0.0)
         return tf.sqrt(tf.add_n(sq_norms))
 
     def on_epoch_begin(self, epoch: int, logs=None):
@@ -382,6 +384,20 @@ class PerBatchDiagnosticsLogger(keras.callbacks.Callback):
             if logs.get(key) is not None:
                 try:
                     rec[f"loss/{pretty}_running_mean"] = float(logs[key])
+                except Exception:
+                    pass
+
+        # Present only when the trainer was built with track_batch_diagnostics=True. These come
+        # from the real training batch, not the fixed probe below, so they can be compared against
+        # it directly, and close the two gaps the probe-only numbers have: no invariance-loss
+        # gradient, and a probe batch instead of whatever batch actually caused an event.
+        for key in (
+            "batch_grad_norm_total_last_layer", "batch_grad_norm_align_last_layer",
+            "batch_grad_norm_varcov_last_layer", "batch_z1_avg_std", "batch_z1_min_std",
+        ):
+            if logs.get(key) is not None:
+                try:
+                    rec[key] = float(logs[key])
                 except Exception:
                     pass
 

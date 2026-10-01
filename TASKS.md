@@ -14,7 +14,7 @@
 
 ## Experiments
 
-- Close the two gaps in `--per-batch-diagnostics` (finding 22): measure the invariance loss's gradient too, and the real training batch's gradient, not just the fixed probe's. Then target the same ~30-batch window with `--per-batch-diagnostics-every 1` and `--stop-epoch` around the known event.
+- Run with the real-batch diagnostics now built (`VICRegTrainer.track_batch_diagnostics`, auto-enabled by `--per-batch-diagnostics`) at `--per-batch-diagnostics-every 1` and a `--stop-epoch` bounding the run, to catch the same kind of event with the invariance-loss gradient and the real training batch visible, not just the probe.
 - Tune or seed-sweep `--trend-decay`. Finding 21's two seeds landed at different distances from baseline; unclear if that's seed noise or the untuned 0.995 default.
 - **Done: fed all 12 tracked runs into `report_metrics.py`**, output at `reports/full_comparison/` (gitignored, regenerate with the command in EXPERIMENTS.md's "Comparison report" section).
 

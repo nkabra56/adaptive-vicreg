@@ -88,6 +88,11 @@ class VICRegTrainer(keras.Model):
         base_lr: Base learning rate.
         base_wd: Base weight decay.
         reweighter_kwargs: Overrides passed to `AdaptiveReweighter`.
+        track_batch_diagnostics: Compute extra per-step diagnostics on the real training batch
+            (not a fixed probe): the gradient norm of the total loss, the invariance loss alone,
+            and the variance+covariance loss alone, each w.r.t. the encoder's last layer, plus that
+            layer's own embedding std. Off by default; needs a persistent `GradientTape` and two
+            extra backward passes per step when on, so it costs real training throughput.
     """
 
     def __init__(
@@ -105,12 +110,14 @@ class VICRegTrainer(keras.Model):
         base_wd: float,
         reweighter_kwargs: Optional[dict] = None,
         var_eps: float = 0.0,
+        track_batch_diagnostics: bool = False,
     ):
         super().__init__(name="vicreg_trainer")
         self.encoder = encoder
         self.projector = projector
         self.w0 = w0
         self.var_eps = float(var_eps)
+        self.track_batch_diagnostics = bool(track_batch_diagnostics)
 
         self.adaptive_weights = bool(adaptive_weights)
         self.adaptive_targets = bool(adaptive_targets)
@@ -159,13 +166,29 @@ class VICRegTrainer(keras.Model):
         super().compile(**kwargs)
         self.optimizer = optimizer
 
+    def _last_encoder_layer_vars(self) -> list:
+        """Trainable variables of the encoder's last layer that has any, walking backward so a
+        trailing layer with no weights of its own (pooling, activation, ...) is skipped."""
+        for layer in reversed(list(getattr(self.encoder, "layers", []))):
+            tv = list(layer.trainable_variables)
+            if tv:
+                return tv
+        return list(self.encoder.trainable_variables[-1:])
+
+    @staticmethod
+    def _grad_norm(grads: list) -> tf.Tensor:
+        """L2 norm of `grads`, treating a `None` entry as a zero gradient (for example a ReLU's
+        dead zone), not a missing or undefined value. 0.0 when every entry is `None`."""
+        sq = [tf.reduce_sum(tf.square(g)) for g in grads if g is not None]
+        return tf.sqrt(tf.add_n(sq)) if sq else tf.constant(0.0)
+
     def train_step(self, data) -> dict:
         """One step on a batch of paired views, `data = (x1, x2)`, each [B, H, W, 3]."""
         x1, x2 = data[0], data[1]
 
         frac = tf.cast(self.curr_step, tf.float32) / tf.cast(self.total_steps, tf.float32)
 
-        with tf.GradientTape() as tape:
+        with tf.GradientTape(persistent=self.track_batch_diagnostics) as tape:
             h1 = self.encoder(x1, training=True)
             h2 = self.encoder(x2, training=True)
             z1 = self.projector(h1, training=True)
@@ -199,6 +222,25 @@ class VICRegTrainer(keras.Model):
         grads = tape.gradient(total, variables)
         self.optimizer.apply_gradients(zip(grads, variables))
 
+        diagnostics = {}
+        if self.track_batch_diagnostics:
+            # Reuses the gradients already computed for the real optimizer step above (free);
+            # align and var+cov need their own backward passes, since the optimizer only ever
+            # needed their weighted combination, not each alone.
+            last_vars = self._last_encoder_layer_vars()
+            last_ids = {id(v) for v in last_vars}
+            total_last_grads = [g for v, g in zip(variables, grads) if id(v) in last_ids]
+            align_last_grads = tape.gradient(parts["l_align"], last_vars)
+            varcov_last_grads = tape.gradient(parts["l_var"] + parts["l_cov"], last_vars)
+            diagnostics = {
+                "batch_grad_norm_total_last_layer": self._grad_norm(total_last_grads),
+                "batch_grad_norm_align_last_layer": self._grad_norm(align_last_grads),
+                "batch_grad_norm_varcov_last_layer": self._grad_norm(varcov_last_grads),
+                "batch_z1_avg_std": tf.reduce_mean(tf.math.reduce_std(z1, axis=0)),
+                "batch_z1_min_std": tf.reduce_min(tf.math.reduce_std(z1, axis=0)),
+            }
+            del tape
+
         self.loss_tracker.update_state(total)
         self.align_tracker.update_state(parts["l_align"])
         self.var_tracker.update_state(parts["l_var"])
@@ -209,7 +251,7 @@ class VICRegTrainer(keras.Model):
 
         self.curr_step.assign_add(1)
 
-        return {
+        result = {
             "loss": self.loss_tracker.result(),
             "l_align": self.align_tracker.result(),
             "l_var": self.var_tracker.result(),
@@ -218,6 +260,8 @@ class VICRegTrainer(keras.Model):
             "w_var": self.w_var_tracker.result(),
             "w_cov": self.w_cov_tracker.result(),
         }
+        result.update(diagnostics)
+        return result
 
     def get_config(self):
         """Serializable summary of the construction settings.

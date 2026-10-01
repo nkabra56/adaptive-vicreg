@@ -178,6 +178,25 @@ def test_batch_diagnostics_logger_logs_every_n_batches_with_finer_stats(tmp_path
     assert rec["probe/grad_norm_last_layer"] >= 0
 
 
+def test_batch_diagnostics_logger_reads_real_batch_keys_from_logs_when_present(tmp_path):
+    cb = PerBatchDiagnosticsLogger(str(tmp_path), build_encoder(8, feat_dim=16), None, None, log_every=1)
+    cb.on_epoch_begin(0)
+    cb.on_train_batch_end(0, {
+        "loss": 1.0,
+        "batch_grad_norm_total_last_layer": 0.5,
+        "batch_grad_norm_align_last_layer": 0.3,
+        "batch_grad_norm_varcov_last_layer": 0.2,
+        "batch_z1_avg_std": 0.9,
+        "batch_z1_min_std": 0.4,
+    })
+    rec = json.loads((tmp_path / "metrics" / "history_batches.jsonl").read_text())
+    assert rec["batch_grad_norm_total_last_layer"] == pytest.approx(0.5)
+    assert rec["batch_grad_norm_align_last_layer"] == pytest.approx(0.3)
+    assert rec["batch_grad_norm_varcov_last_layer"] == pytest.approx(0.2)
+    assert rec["batch_z1_avg_std"] == pytest.approx(0.9)
+    assert rec["batch_z1_min_std"] == pytest.approx(0.4)
+
+
 def test_batch_diagnostics_logger_without_a_probe_logs_only_running_mean_losses(tmp_path):
     cb = PerBatchDiagnosticsLogger(str(tmp_path), build_encoder(8, feat_dim=16), None, None, log_every=1)
     cb.on_epoch_begin(3)
