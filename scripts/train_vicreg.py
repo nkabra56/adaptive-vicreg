@@ -28,6 +28,7 @@ from tensorflow import keras
 
 from vicreg_tf import (
     CosineScheduleCallback,
+    PerBatchDiagnosticsLogger,
     VicRegMetricsLogger,
     VICRegTrainer,
     VICRegWeights,
@@ -74,7 +75,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adaptive-targets", action="store_true",
                    help="Ramp the variance floor gamma and correlation target nu during training instead of "
                         "using 1.0 and 0.0. Can be combined with --adaptive.")
-    p.add_argument("--ema-decay", type=float, default=0.98, help="EMA decay used by --adaptive.")
+    p.add_argument("--ema-decay", type=float, default=0.98, help="Fast EMA decay used by --adaptive.")
+    p.add_argument("--trend-decay", type=float, default=0.995,
+                   help="Slow EMA decay used by --adaptive's trend balancing. Should be slower than "
+                        "--ema-decay (closer to 1); the fast/slow ratio decides whether a term is "
+                        "trending up and needs more weight, not its raw size.")
     p.add_argument("--var-boost-k", type=float, default=2.0,
                    help="Boost strength for the variance weight when the std drops below target (--adaptive only).")
     p.add_argument("--cov-boost-k", type=float, default=2.0,
@@ -96,6 +101,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--metrics-compute-on", choices=["projector", "encoder"], default="projector",
                    help="Where to compute embedding stats.")
     p.add_argument("--record-every", type=int, default=1, help="Record metrics every N epochs.")
+    p.add_argument("--per-batch-diagnostics", action="store_true",
+                   help="Log finer-grained, per-batch diagnostics (probe avg/min std, corr^2, and the "
+                        "gradient norm of the variance+covariance loss w.r.t. the encoder's last layer) "
+                        "to metrics/history_batches.jsonl. For catching an instability trigger that "
+                        "per-epoch logging (record-every) is too coarse to see. Off by default; adds an "
+                        "extra forward+backward pass on the probe batch every --per-batch-diagnostics-every "
+                        "training batches. See EXPERIMENTS_instability_investigation.md.")
+    p.add_argument("--per-batch-diagnostics-every", type=int, default=10,
+                   help="Log per-batch diagnostics every N training batches. Needs --per-batch-diagnostics.")
     p.add_argument("--seed", type=int, default=None,
                    help="Seed Python, NumPy and TF. Omit for a nondeterministic run.")
     add_device_arg(p)
@@ -104,6 +118,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--warmup-epochs needs --use-schedules")
     if args.stop_epoch is not None and not 1 <= args.stop_epoch <= args.epochs:
         p.error("--stop-epoch must be between 1 and --epochs")
+    if args.per_batch_diagnostics_every < 1:
+        p.error("--per-batch-diagnostics-every must be >= 1")
     return args
 
 
@@ -155,6 +171,7 @@ def main() -> None:
                 "adaptive": args.adaptive,
                 "adaptive_targets": args.adaptive_targets,
                 "ema_decay": args.ema_decay,
+                "trend_decay": args.trend_decay,
                 "var_boost_k": args.var_boost_k,
                 "cov_boost_k": args.cov_boost_k,
                 "use_schedules": args.use_schedules,
@@ -192,6 +209,7 @@ def main() -> None:
             base_wd=args.wd,
             reweighter_kwargs={
                 "decay": args.ema_decay,
+                "trend_decay": args.trend_decay,
                 "k_std": args.var_boost_k,
                 "k_cov": args.cov_boost_k,
             },
@@ -223,6 +241,18 @@ def main() -> None:
                 record_every=args.record_every,
             ),
         ]
+        if args.per_batch_diagnostics:
+            cbs.append(
+                PerBatchDiagnosticsLogger(
+                    run_dir=out_dir,
+                    encoder=encoder,
+                    projector=projector,
+                    sample_images=sample_images,
+                    compute_on=args.metrics_compute_on,
+                    var_eps=args.var_eps,
+                    log_every=args.per_batch_diagnostics_every,
+                )
+            )
         if args.use_schedules:
             cbs.insert(
                 0,
@@ -251,13 +281,16 @@ def main() -> None:
         safe_load_trainer_weights(trainer, full_ckpt)
         encoder.save_weights(enc_ckpt)
 
+    metrics_msg = f"  Metrics -> {os.path.join(out_dir, 'metrics', 'history.jsonl')}"
+    if args.per_batch_diagnostics:
+        metrics_msg += f"\n  Diagnostics -> {os.path.join(out_dir, 'metrics', 'history_batches.jsonl')}"
     print(
         f"[train] Done.\n"
         f"  Encoder -> {enc_ckpt}\n"
         f"  Full    -> {full_ckpt}\n"
         f"  Last    -> {last_enc_ckpt}, {last_full_ckpt}\n"
         f"  Config  -> {os.path.join(out_dir, 'train_config.json')}\n"
-        f"  Metrics -> {os.path.join(out_dir, 'metrics', 'history.jsonl')}"
+        f"{metrics_msg}"
     )
 
 

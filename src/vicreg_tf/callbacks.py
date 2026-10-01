@@ -9,6 +9,7 @@ from typing import Optional
 import tensorflow as tf
 from tensorflow import keras
 
+from .losses import covariance_loss, variance_loss
 from .schedules import cosine_scaler
 
 _DEFAULT_LOSS_KEYS = {
@@ -237,6 +238,170 @@ class VicRegMetricsLogger(keras.callbacks.Callback):
                 # Keep the row but mark the stats as missing.
                 rec["stats/avg_std"] = float("nan")
                 rec["stats/avg_offdiag_corr_sq"] = float("nan")
+
+        with open(self.history_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+
+class PerBatchDiagnosticsLogger(keras.callbacks.Callback):
+    """Append one JSON record every `log_every` training batches to `<run_dir>/metrics/history_batches.jsonl`.
+
+    `VicRegMetricsLogger` logs once per epoch, which is too coarse to catch a trigger that fires
+    inside a handful of batches of a single epoch (see `EXPERIMENTS_instability_investigation.md`).
+    This callback runs the same fixed probe batch through the encoder (and projector) far more often,
+    and adds two signals `VicRegMetricsLogger` doesn't compute: the single smallest per-dimension std
+    in the probe batch (not just the mean), and the gradient norm of `variance_loss + covariance_loss`
+    on the probe batch with respect to the encoder's last layer. It also copies the loss-term keys
+    straight out of Keras' per-batch logs, labeled as running means since that's what Keras' per-epoch
+    `keras.metrics.Mean` trackers hold mid-epoch, not instantaneous per-batch values.
+
+    Args:
+        run_dir: Run directory; the log goes in its `metrics/` subfolder.
+        encoder: Backbone used to embed the probe batch, and whose last layer's gradient is measured.
+        projector: Projector head, used when `compute_on="projector"`.
+        sample_images: Fixed single-view probe batch. If None, only the running-mean losses are logged.
+        compute_on: Where to compute embedding stats, "projector" or "encoder".
+        gamma: Variance floor used for the gradient-norm probe loss. Matches the recipe's constant
+            gamma; not read live off `AdaptiveTargets`, so this is approximate for `--adaptive-targets`.
+        nu: Correlation target used for the gradient-norm probe loss, same caveat as `gamma`.
+        var_eps: Passed through to `variance_loss`, should match `--var-eps`.
+        loss_keys: Maps record names to Keras log keys. Defaults to all loss terms and weights.
+        log_every: Log every this many training batches. Smaller values give finer resolution at the
+            cost of an extra forward+backward pass on the probe batch each time.
+    """
+
+    def __init__(
+        self,
+        run_dir: str,
+        encoder: keras.Model,
+        projector: Optional[keras.Model],
+        sample_images: Optional[tf.Tensor],
+        compute_on: str = "projector",
+        gamma: float = 1.0,
+        nu: float = 0.0,
+        var_eps: float = 0.0,
+        loss_keys: Optional[dict] = None,
+        log_every: int = 10,
+    ) -> None:
+        super().__init__()
+        self.run_dir = run_dir
+        self.encoder = encoder
+        self.projector = projector
+        self.sample_images = sample_images
+        self.compute_on = compute_on
+        self.gamma = float(gamma)
+        self.nu = float(nu)
+        self.var_eps = float(var_eps)
+        self.loss_keys = loss_keys or dict(_DEFAULT_LOSS_KEYS)
+        self.log_every = max(1, int(log_every))
+        self.metrics_dir = os.path.join(self.run_dir, "metrics")
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        self.history_path = os.path.join(self.metrics_dir, "history_batches.jsonl")
+        self._epoch = 0
+        self._global_batch = 0
+
+    def _get_embeddings(self, x: tf.Tensor) -> tf.Tensor:
+        z = self.encoder(x, training=False)
+        if self.compute_on == "projector" and self.projector is not None:
+            z = self.projector(z, training=False)
+        return z
+
+    @staticmethod
+    def _tf_avg_std(z: tf.Tensor) -> tf.Tensor:
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])
+        return tf.reduce_mean(tf.math.reduce_std(z2, axis=0))
+
+    @staticmethod
+    def _tf_min_std(z: tf.Tensor) -> tf.Tensor:
+        """Smallest per-dimension std in the batch. The dimension `variance_loss` penalizes hardest,
+        and the one most likely to be near the non-finite-gradient regime finding 14 identified."""
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])
+        return tf.reduce_min(tf.math.reduce_std(z2, axis=0))
+
+    @staticmethod
+    def _tf_avg_offdiag_corr_sq(z: tf.Tensor, eps: float = 1e-12) -> tf.Tensor:
+        z2 = tf.reshape(z, [tf.shape(z)[0], -1])
+        n = tf.shape(z2)[0]
+        d = tf.shape(z2)[1]
+        mean = tf.reduce_mean(z2, axis=0, keepdims=True)
+        zc = z2 - mean
+        std = tf.math.reduce_std(zc, axis=0, keepdims=True)
+        std = tf.where(std < eps, tf.ones_like(std), std)
+        zn = zc / std
+        corr = tf.matmul(zn, zn, transpose_a=True) / tf.cast(n, zn.dtype)
+        eye = tf.eye(d, dtype=tf.bool)
+        off = tf.boolean_mask(corr, ~eye)
+        return tf.reduce_mean(tf.square(off))
+
+    def _last_layer_vars(self) -> list:
+        """Trainable variables of the encoder's last layer that has any, walking backward so a
+        trailing layer with no weights of its own (pooling, activation, ...) is skipped."""
+        for layer in reversed(list(getattr(self.encoder, "layers", []))):
+            tv = list(layer.trainable_variables)
+            if tv:
+                return tv
+        return list(self.encoder.trainable_variables[-1:])
+
+    def _probe_grad_norm_last_layer(self, x: tf.Tensor) -> tf.Tensor:
+        """Gradient norm of (variance_loss + covariance_loss) on the probe embedding, with respect to
+        the encoder's last layer. Computed with its own GradientTape, independent of the real training
+        step, so this never changes what the optimizer actually does."""
+        last_vars = self._last_layer_vars()
+        with tf.GradientTape() as tape:
+            # Trainable keras.Variables are auto-watched when read during the forward pass below;
+            # explicit tape.watch() doesn't accept Keras' Variable wrapper, only tf.Tensor/tf.Variable.
+            h = self.encoder(x, training=False)
+            z = h
+            if self.compute_on == "projector" and self.projector is not None:
+                z = self.projector(h, training=False)
+            if z.dtype not in (tf.float32, tf.float64):
+                z = tf.cast(z, tf.float32)
+            probe_loss = variance_loss(z, self.gamma, self.var_eps) + covariance_loss(z, self.nu)
+        grads = tape.gradient(probe_loss, last_vars)
+        sq_norms = [tf.reduce_sum(tf.square(g)) for g in grads if g is not None]
+        if not sq_norms:
+            return tf.constant(float("nan"))
+        return tf.sqrt(tf.add_n(sq_norms))
+
+    def on_epoch_begin(self, epoch: int, logs=None):
+        self._epoch = epoch
+
+    def on_train_batch_end(self, batch: int, logs=None):
+        self._global_batch += 1
+        if self._global_batch % self.log_every != 0:
+            return
+
+        logs = logs or {}
+        rec = {
+            "epoch": int(self._epoch + 1),
+            "batch": int(batch),
+            "global_batch": int(self._global_batch),
+        }
+
+        for pretty, key in self.loss_keys.items():
+            if logs.get(key) is not None:
+                try:
+                    rec[f"loss/{pretty}_running_mean"] = float(logs[key])
+                except Exception:
+                    pass
+
+        if self.sample_images is not None:
+            x = tf.cast(tf.convert_to_tensor(self.sample_images), tf.float32)
+            z = self._get_embeddings(x)
+            if z.dtype not in (tf.float32, tf.float64):
+                z = tf.cast(z, tf.float32)
+            try:
+                rec["probe/avg_std"] = float(self._tf_avg_std(z))
+                rec["probe/min_std"] = float(self._tf_min_std(z))
+                rec["probe/avg_offdiag_corr_sq"] = float(self._tf_avg_offdiag_corr_sq(z))
+            except Exception:
+                rec["probe/avg_std"] = float("nan")
+                rec["probe/min_std"] = float("nan")
+                rec["probe/avg_offdiag_corr_sq"] = float("nan")
+            try:
+                rec["probe/grad_norm_last_layer"] = float(self._probe_grad_norm_last_layer(x))
+            except Exception:
+                rec["probe/grad_norm_last_layer"] = float("nan")
 
         with open(self.history_path, "a") as f:
             f.write(json.dumps(rec) + "\n")

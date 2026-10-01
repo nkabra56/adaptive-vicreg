@@ -9,6 +9,7 @@ from tensorflow import keras
 from vicreg_tf import (
     CosineScheduleCallback,
     LossExplosionGuard,
+    PerBatchDiagnosticsLogger,
     VicRegMetricsLogger,
     WarmupLR,
     build_encoder,
@@ -150,3 +151,36 @@ def test_metrics_logger_without_a_probe_logs_only_losses(tmp_path):
     cb.on_epoch_end(0, {"loss": 2.0})
     rec = json.loads((tmp_path / "metrics" / "history.jsonl").read_text())
     assert rec == {"epoch": 1, "loss/total": 2.0}
+
+
+def test_batch_diagnostics_logger_logs_every_n_batches_with_finer_stats(tmp_path):
+    encoder = build_encoder(8, feat_dim=16)
+    probe = tf.random.uniform([16, 8, 8, 3], seed=0)
+    cb = PerBatchDiagnosticsLogger(str(tmp_path), encoder, None, probe, compute_on="encoder", log_every=2)
+
+    cb.on_epoch_begin(0)
+    cb.on_train_batch_end(0, {"loss": 1.0})  # 1st logged batch globally, not a multiple of 2: skipped
+    cb.on_train_batch_end(1, {"loss": 1.0, "l_var": 0.2, "l_cov": 0.05})  # 2nd: logged
+
+    lines = (tmp_path / "metrics" / "history_batches.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["epoch"] == 1
+    assert rec["batch"] == 1
+    assert rec["global_batch"] == 2
+    assert rec["loss/total_running_mean"] == 1.0
+    assert rec["loss/var_running_mean"] == pytest.approx(0.2)
+    assert rec["loss/cov_running_mean"] == pytest.approx(0.05)
+    assert rec["probe/avg_std"] > 0
+    assert rec["probe/min_std"] >= 0
+    assert rec["probe/min_std"] <= rec["probe/avg_std"]
+    assert 0.0 <= rec["probe/avg_offdiag_corr_sq"] <= 1.0
+    assert rec["probe/grad_norm_last_layer"] >= 0
+
+
+def test_batch_diagnostics_logger_without_a_probe_logs_only_running_mean_losses(tmp_path):
+    cb = PerBatchDiagnosticsLogger(str(tmp_path), build_encoder(8, feat_dim=16), None, None, log_every=1)
+    cb.on_epoch_begin(3)
+    cb.on_train_batch_end(0, {"loss": 2.0})
+    rec = json.loads((tmp_path / "metrics" / "history_batches.jsonl").read_text())
+    assert rec == {"epoch": 4, "batch": 0, "global_batch": 1, "loss/total_running_mean": 2.0}

@@ -144,15 +144,28 @@ class AdaptiveReweighter:
 
     Two signals are combined:
 
-    * Loss-magnitude balancing. A bias-corrected EMA of each raw loss term gives a multiplier of
-      mean(EMA) / EMA(term), so no term dominates only because of its scale. Sim and cov are clipped
-      to `mag_clip`; var is clipped to `var_mag_clip`, which floors at 1.0 by default so magnitude
-      balancing can only raise the variance weight above `w0.var`, never lower it. A collapsed
-      embedding makes `l_var` the largest raw term, and lowering its weight in that state is exactly
-      the wrong direction: it removes pressure from the one term that needs it, with no way back.
-    * Embedding-health boost (var and cov only). EMAs of the probe embedding's mean per-dimension std
-      and mean squared off-diagonal correlation raise the var weight when std falls below `std_target`
-      and the cov weight when correlation rises above `corr_target`, by at most `boost_clip`.
+    * Loss-trend balancing. Each raw loss term gets a fast EMA (`decay`) and a slow EMA
+      (`trend_decay`, meant to move several times slower than `decay`). The multiplier is
+      fast / slow, clipped to `mag_clip` (var uses `var_mag_clip` if given). This asks "is this
+      term getting worse lately, relative to its own recent history," not "is this term bigger
+      than the other two right now."
+      The old design (mean of all three EMAs, divided by this term's EMA) compared terms against
+      each other: whichever was biggest got punished, even if it was only biggest because its
+      competitors had converged toward zero. That caused two real failures: a collapsed embedding
+      makes `l_var` huge and gets its weight cut exactly when it needs more (finding 11), and once
+      that path was patched, a healthy-but-still-converging `l_align` became the new biggest term
+      and got the same treatment (finding 15). Comparing a term only to its own slower-moving
+      average sidesteps the zero-sum dynamic entirely: a term that is shrinking (fast EMA below
+      slow EMA, the healthy-convergence case) never gets a multiplier below `mag_lo`, which
+      defaults to 1.0, so no term is ever pushed below its base weight by this signal. A term that
+      is trending up (fast EMA above slow EMA, whether from collapse or from being starved of
+      weight) gets boosted instead, for as long as the trend lasts. Once a term's loss plateaus,
+      fast and slow converge and the multiplier relaxes back to 1.0, even if that term's raw loss
+      is still the largest of the three. Size alone is no longer a reason to move the weight.
+    * Embedding-health boost (var and cov only). EMAs of the probe embedding's mean per-dimension
+      std and mean squared off-diagonal correlation raise the var weight when std falls below
+      `std_target` and the cov weight when correlation rises above `corr_target`, by at most
+      `boost_clip`. Unrelated to the trend signal above, kept as-is.
 
     EMA inputs are passed through `tf.stop_gradient`, so gradients flow through weight * loss but not
     through the weight computation.
@@ -165,7 +178,8 @@ class AdaptiveReweighter:
         self,
         w0: VICRegWeights,
         decay: float = 0.98,
-        mag_clip: tuple[float, float] = (0.2, 5.0),
+        trend_decay: float = 0.995,
+        mag_clip: tuple[float, float] = (1.0, 5.0),
         var_mag_clip: Optional[tuple[float, float]] = None,
         std_target: float = 1.0,
         corr_target: float = 0.0,
@@ -177,8 +191,9 @@ class AdaptiveReweighter:
             w0 = VICRegWeights(**w0)
         self.w0 = w0
         self.decay = float(decay)
+        self.trend_decay = float(trend_decay)
         self.mag_lo, self.mag_hi = mag_clip
-        self.var_mag_lo, self.var_mag_hi = var_mag_clip if var_mag_clip is not None else (1.0, self.mag_hi)
+        self.var_mag_lo, self.var_mag_hi = var_mag_clip if var_mag_clip is not None else (self.mag_lo, self.mag_hi)
         self.std_target = float(std_target)
         self.corr_target = float(corr_target)
         self.k_std = float(k_std)
@@ -188,28 +203,42 @@ class AdaptiveReweighter:
         self.ema_align = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_align")
         self.ema_var = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_var")
         self.ema_cov = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_cov")
+        self.ema_align_slow = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_align_slow")
+        self.ema_var_slow = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_var_slow")
+        self.ema_cov_slow = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="ema_l_cov_slow")
         self.ema_std = tf.Variable(float(std_target), trainable=False, dtype=tf.float32, name="ema_std")
         self.ema_corr = tf.Variable(float(corr_target), trainable=False, dtype=tf.float32, name="ema_corr")
         self.step_count = tf.Variable(0, trainable=False, dtype=tf.int64, name="reweighter_step")
 
-    def _update_ema(self, var: tf.Variable, x: tf.Tensor) -> tf.Tensor:
-        """Update `var` and return its bias-corrected value."""
-        decay = tf.cast(self.decay, tf.float32)
-        var.assign(decay * var + (1.0 - decay) * tf.cast(x, tf.float32))
+    def _update_ema(self, var: tf.Variable, x: tf.Tensor, decay: float) -> tf.Tensor:
+        """Update `var` with the given decay and return its bias-corrected value."""
+        decay_t = tf.cast(decay, tf.float32)
+        var.assign(decay_t * var + (1.0 - decay_t) * tf.cast(x, tf.float32))
         t = tf.cast(self.step_count + 1, tf.float32)
-        return var / (1.0 - tf.pow(decay, t))
+        return var / (1.0 - tf.pow(decay_t, t))
 
     def __call__(self, raw_losses: dict, z_probe: tf.Tensor) -> dict:
         eps = tf.constant(1e-8, tf.float32)
 
-        ema_align = self._update_ema(self.ema_align, tf.stop_gradient(raw_losses["l_align"]))
-        ema_var = self._update_ema(self.ema_var, tf.stop_gradient(raw_losses["l_var"]))
-        ema_cov = self._update_ema(self.ema_cov, tf.stop_gradient(raw_losses["l_cov"]))
+        raw_align = tf.stop_gradient(raw_losses["l_align"])
+        raw_var = tf.stop_gradient(raw_losses["l_var"])
+        raw_cov = tf.stop_gradient(raw_losses["l_cov"])
 
-        mean_ema = (ema_align + ema_var + ema_cov) / 3.0
-        mag_sim = tf.clip_by_value(mean_ema / (ema_align + eps), self.mag_lo, self.mag_hi)
-        mag_var = tf.clip_by_value(mean_ema / (ema_var + eps), self.var_mag_lo, self.var_mag_hi)
-        mag_cov = tf.clip_by_value(mean_ema / (ema_cov + eps), self.mag_lo, self.mag_hi)
+        ema_align = self._update_ema(self.ema_align, raw_align, self.decay)
+        ema_var = self._update_ema(self.ema_var, raw_var, self.decay)
+        ema_cov = self._update_ema(self.ema_cov, raw_cov, self.decay)
+
+        ema_align_slow = self._update_ema(self.ema_align_slow, raw_align, self.trend_decay)
+        ema_var_slow = self._update_ema(self.ema_var_slow, raw_var, self.trend_decay)
+        ema_cov_slow = self._update_ema(self.ema_cov_slow, raw_cov, self.trend_decay)
+
+        trend_align = ema_align / (ema_align_slow + eps)
+        trend_var = ema_var / (ema_var_slow + eps)
+        trend_cov = ema_cov / (ema_cov_slow + eps)
+
+        mag_sim = tf.clip_by_value(trend_align, self.mag_lo, self.mag_hi)
+        mag_var = tf.clip_by_value(trend_var, self.var_mag_lo, self.var_mag_hi)
+        mag_cov = tf.clip_by_value(trend_cov, self.mag_lo, self.mag_hi)
 
         z = tf.convert_to_tensor(z_probe)
         if z.shape.rank is not None and z.shape.rank > 2:
@@ -226,8 +255,8 @@ class AdaptiveReweighter:
         off = tf.boolean_mask(corr, ~tf.eye(d, dtype=tf.bool))
         avg_offdiag = tf.reduce_mean(tf.square(off))
 
-        ema_std = self._update_ema(self.ema_std, tf.stop_gradient(avg_std))
-        ema_corr = self._update_ema(self.ema_corr, tf.stop_gradient(avg_offdiag))
+        ema_std = self._update_ema(self.ema_std, tf.stop_gradient(avg_std), self.decay)
+        ema_corr = self._update_ema(self.ema_corr, tf.stop_gradient(avg_offdiag), self.decay)
 
         std_deficit = tf.nn.relu(self.std_target - ema_std) / max(self.std_target, 1e-8)
         corr_excess = tf.nn.relu(ema_corr - self.corr_target)

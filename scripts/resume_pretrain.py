@@ -66,7 +66,9 @@ def parse_args() -> argparse.Namespace:
                    help="Adaptive loss weighting. Must match the run being resumed.")
     p.add_argument("--adaptive-targets", action="store_true",
                    help="Gamma/nu target schedule. Must match the run being resumed.")
-    p.add_argument("--ema-decay", type=float, default=0.98, help="EMA decay used by --adaptive.")
+    p.add_argument("--ema-decay", type=float, default=0.98, help="Fast EMA decay used by --adaptive.")
+    p.add_argument("--trend-decay", type=float, default=0.995,
+                   help="Slow EMA decay used by --adaptive's trend balancing. Must match the run being resumed.")
     p.add_argument("--var-boost-k", type=float, default=2.0, help="Variance-weight boost strength (--adaptive only).")
     p.add_argument("--cov-boost-k", type=float, default=2.0, help="Covariance-weight boost strength (--adaptive only).")
     p.add_argument("--use-schedules", action="store_true",
@@ -128,6 +130,7 @@ def main() -> None:
             base_wd=args.wd,
             reweighter_kwargs={
                 "decay": args.ema_decay,
+                "trend_decay": args.trend_decay,
                 "k_std": args.var_boost_k,
                 "k_cov": args.cov_boost_k,
             },

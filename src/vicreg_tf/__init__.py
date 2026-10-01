@@ -1,7 +1,13 @@
 """Public API of the package, so scripts can `from vicreg_tf import ...`."""
 
 from .augment import color_jitter, random_augment, two_view_map
-from .callbacks import CosineScheduleCallback, LossExplosionGuard, VicRegMetricsLogger, WarmupLR
+from .callbacks import (
+    CosineScheduleCallback,
+    LossExplosionGuard,
+    PerBatchDiagnosticsLogger,
+    VicRegMetricsLogger,
+    WarmupLR,
+)
 from .data import build_cifar10, build_cifar100, build_dataset, steps_for_dataset, take_probe_batch
 from .losses import VICRegWeights, covariance_loss, invariance_loss, variance_loss, vicreg_total
 from .model import VICRegTrainer, build_encoder, build_projector
@@ -24,6 +30,7 @@ __all__ = [
     "AdaptiveTargets",
     "CosineScheduleCallback",
     "LossExplosionGuard",
+    "PerBatchDiagnosticsLogger",
     "VICRegTrainer",
     "VICRegWeights",
     "VicRegMetricsLogger",

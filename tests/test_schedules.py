@@ -90,6 +90,34 @@ def _run_steps(rw, n, **kwargs):
     return weights
 
 
+def _ramp(start, end, n):
+    return list(np.linspace(start, end, n))
+
+
+def _run_ramp(rw, l_align, l_var, l_cov, z_probe):
+    weights = None
+    n = len(l_var)
+    for i in range(n):
+        a = l_align[i] if isinstance(l_align, list) else l_align
+        v = l_var[i] if isinstance(l_var, list) else l_var
+        c = l_cov[i] if isinstance(l_cov, list) else l_cov
+        weights = rw({
+            "l_align": tf.constant(a, tf.float32),
+            "l_var": tf.constant(v, tf.float32),
+            "l_cov": tf.constant(c, tf.float32),
+        }, z_probe=z_probe)
+    return weights
+
+
+def _old_style_multiplier(ema_align, ema_var, ema_cov, which, mag_lo=0.2, mag_hi=5.0, var_mag_lo=1.0):
+    """The pre-fix (finding 11/15) magnitude balancing formula, kept here only so the new tests can
+    show the exact before/after numbers. Not used by production code."""
+    mean_ema = (ema_align + ema_var + ema_cov) / 3.0
+    ema = {"sim": ema_align, "var": ema_var, "cov": ema_cov}[which]
+    lo = var_mag_lo if which == "var" else mag_lo
+    return max(lo, min(mag_hi, mean_ema / (ema + 1e-8)))
+
+
 def _healthy_probe(std=1.0, seed=0):
     rng = np.random.default_rng(seed)
     z = rng.normal(scale=std, size=(256, 16)).astype("float32")
@@ -106,7 +134,13 @@ def _redundant_probe():
     return tf.constant(np.tile(base, (1, 16)))  # every dim identical -> corr == 1
 
 
-def test_reweighter_downweights_dominant_loss_term():
+def test_reweighter_does_not_downweight_a_stable_dominant_term():
+    # The old competitor-relative design ("whoever's EMA is biggest gets the smallest multiplier")
+    # punished l_var here just for being 10x the others, even though it is perfectly stable, not
+    # regressing. That is the mechanism behind findings 11 and 15: a term can be the largest raw
+    # loss purely because its competitors converged, not because it needs more pressure. The new
+    # trend-relative design only reacts to a term moving relative to its own recent history, so a
+    # constant (however large) loss settles at its own baseline multiplier for every term alike.
     w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
     rw = AdaptiveReweighter(w0=w0, decay=0.9)
     weights = _run_steps(
@@ -115,8 +149,9 @@ def test_reweighter_downweights_dominant_loss_term():
     var_ratio = float(weights["var"]) / w0.var
     sim_ratio = float(weights["sim"]) / w0.sim
     cov_ratio = float(weights["cov"]) / w0.cov
-    assert var_ratio < sim_ratio
-    assert var_ratio < cov_ratio
+    assert abs(var_ratio - 1.0) < 0.05
+    assert abs(sim_ratio - 1.0) < 0.05
+    assert abs(cov_ratio - 1.0) < 0.05
 
 
 def test_reweighter_converges_to_w0_when_balanced_and_healthy():
@@ -169,13 +204,27 @@ def test_reweighter_var_multiplier_never_drops_below_w0_even_when_dominant():
     assert float(weights["var"]) >= w0.var - 1e-4
 
 
-def test_reweighter_var_mag_clip_override_restores_old_floor():
+def test_reweighter_var_mag_clip_caps_the_trend_boost():
+    # var_mag_clip no longer carries a sub-1.0 floor to restore (the trend ratio can't drop below
+    # its own baseline the way the old competitor ratio could), but it still bounds how far the
+    # var multiplier can rise during a genuine upward trend. k_std=0 isolates the trend mechanism
+    # from the separate embedding-health boost, so the cap here is exact. A tight hi of 1.5 should
+    # visibly cap the boost an uncapped (default hi=5.0) run would get from the same ramp.
     w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
-    rw = AdaptiveReweighter(w0=w0, decay=0.9, var_mag_clip=(0.2, 5.0))
-    weights = _run_steps(
-        rw, 200, l_align=0.03, l_var=1.9, l_cov=0.02, z_probe=_healthy_probe()
-    )
-    assert float(weights["var"]) < w0.var
+    ramp = _ramp(0.1, 10.0, 300)
+
+    probe = _healthy_probe()
+    align = [0.03] * 300
+    cov = [0.02] * 300
+
+    rw_capped = AdaptiveReweighter(w0=w0, decay=0.9, trend_decay=0.995, var_mag_clip=(1.0, 1.5), k_std=0.0)
+    weights_capped = _run_ramp(rw_capped, l_align=align, l_var=ramp, l_cov=cov, z_probe=probe)
+
+    rw_default = AdaptiveReweighter(w0=w0, decay=0.9, trend_decay=0.995, k_std=0.0)
+    weights_default = _run_ramp(rw_default, l_align=align, l_var=ramp, l_cov=cov, z_probe=probe)
+
+    assert float(weights_capped["var"]) <= 1.5 * w0.var + 1e-4
+    assert float(weights_default["var"]) > float(weights_capped["var"])
 
 
 def test_reweighter_works_inside_tf_function():
@@ -191,3 +240,69 @@ def test_reweighter_works_inside_tf_function():
     for _ in range(5):
         weights = one_step(tf.constant(1.0), tf.constant(1.0), tf.constant(1.0), z)
     assert set(weights.keys()) == {"sim", "var", "cov"}
+
+
+def test_reweighter_regime_finding11_boosts_var_during_collapse_not_suppresses():
+    # Finding 11: embedding collapse makes l_var the largest raw term. The broken reweighter read
+    # "largest raw term" as "needs less weight" and cut w_var exactly when the embedding most
+    # needed more pressure to re-expand, a fixed point with no way back. Reproduce the regime with
+    # a healthy warmup phase (gives l_var a low recent-history baseline) followed by a collapse
+    # phase where l_var ramps toward its ceiling of about 2 while l_align/l_cov stay small and the
+    # probe embedding collapses (matches the magnitudes finding 11 cites). The new mechanism should
+    # boost w_var here because its trend is rising, not shrink it because its size is biggest.
+    w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
+    rw = AdaptiveReweighter(w0=w0)
+
+    healthy_steps, collapse_steps = 300, 300
+    l_align = [0.05] * healthy_steps + [0.03] * collapse_steps
+    l_var = [0.3] * healthy_steps + list(np.linspace(0.3, 1.9, collapse_steps))
+    l_cov = [0.05] * healthy_steps + [0.02] * collapse_steps
+    healthy_probe = _healthy_probe()
+
+    weights = None
+    for i in range(healthy_steps + collapse_steps):
+        z = healthy_probe if i < healthy_steps else _collapsed_probe()
+        weights = rw({
+            "l_align": tf.constant(l_align[i], tf.float32),
+            "l_var": tf.constant(l_var[i], tf.float32),
+            "l_cov": tf.constant(l_cov[i], tf.float32),
+        }, z_probe=z)
+
+    assert float(weights["var"]) > w0.var
+    assert float(weights["sim"]) <= 1.05 * w0.sim
+    assert float(weights["cov"]) <= 1.05 * w0.cov
+
+
+def test_reweighter_regime_finding15_does_not_suppress_align_as_others_converge():
+    # Finding 15: once the variance floor was patched, l_var and l_cov converged toward zero through
+    # genuine training progress while l_align (never literally "solved," just small by comparison)
+    # grew to become the largest raw term. The old mean(EMA)/EMA(term) formula read that as "align is
+    # dominant, shrink its weight," pushing w_sim to about 0.34x w0.sim for most of training (see
+    # EXPERIMENTS.md finding 15). l_align's rise here is real (it gets worse in absolute terms as the
+    # weight that was supposed to push it keeps getting cut, not merely relatively bigger), so the
+    # new design should boost it; l_var/l_cov's fall is real progress, so they should stay at
+    # baseline rather than get boosted just for being small.
+    w0 = VICRegWeights(sim=25.0, var=25.0, cov=1.0)
+    rw = AdaptiveReweighter(w0=w0)
+
+    n = 600
+    l_align = list(np.linspace(0.0003, 1.5, n))
+    l_var = list(np.linspace(1.0, 0.01, n))
+    l_cov = list(np.linspace(1.0, 0.01, n))
+    weights = _run_ramp(rw, l_align=l_align, l_var=l_var, l_cov=l_cov, z_probe=_healthy_probe())
+
+    sim_ratio = float(weights["sim"]) / w0.sim
+    var_ratio = float(weights["var"]) / w0.var
+    cov_ratio = float(weights["cov"]) / w0.cov
+
+    assert sim_ratio > 1.0
+    assert var_ratio >= 1.0 - 1e-4
+    assert cov_ratio >= 1.0 - 1e-4
+
+    t = float(rw.step_count.numpy())
+    ema_align_old = rw.ema_align.numpy() / (1.0 - rw.decay ** t)
+    ema_var_old = rw.ema_var.numpy() / (1.0 - rw.decay ** t)
+    ema_cov_old = rw.ema_cov.numpy() / (1.0 - rw.decay ** t)
+    old_sim_mult = _old_style_multiplier(ema_align_old, ema_var_old, ema_cov_old, "sim")
+    assert old_sim_mult < 1.0  # the failure this regime is reproducing: old design shrinks w_sim here
+    assert sim_ratio > old_sim_mult
